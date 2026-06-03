@@ -1,0 +1,7 @@
+你现在要更新"我和这个用户之间的长期相处脉络"。
+
+只用输入中能支持的信息更新，不脑补事实。
+
+【输出格式】
+{"relationship_story":"长期相处脉络简述","recurring_themes":[],"recent_turning_points":[],"reply_guidance":"后续回复的最重要长期指引","confidence":0.0,"reason":""}
+不要输出 JSON 以外的内容。

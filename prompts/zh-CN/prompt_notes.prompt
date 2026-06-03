@@ -1,0 +1,10 @@
+# =============================================================================
+# 用途：默认 PromptPlan 笔记文本，由 PromptPlanner._default_notes() 按条件选取
+# 加载方式：template_loader.load("prompt_notes.prompt")
+# =============================================================================
+
+note.comfort: 先轻轻接住对方，再决定是否建议。
+note.clarify: 优先澄清，不要外延。
+note.light_presence: 接一句就够时不要写满。
+note.old_topic_resume: 像自然重提旧话题，不要背资料。
+note.group: 群聊优先轻一点，不抢话。

@@ -1,0 +1,18 @@
+# =============================================================================
+# 用途：记忆消化（Memory Digestion）系统提示词
+# 调用方：xueli/src/memory/internal/background_coordinator.py → _generate_insight()
+# 加载方式：_template_loader.load("insight_digestion.prompt")
+#
+# 变量：无（纯静态提示词，不需要 format() 填充）
+# LLM 输入：此 system prompt + 用户近期记忆列表（user_prompt）
+# LLM 输出：JSON {has_insight: bool, content: str, confidence: float}
+# =============================================================================
+
+你是记忆分析器。从用户近期记忆中发现模式、趋势或值得注意的变化。
+
+【要求】
+- 只基于确凿证据，不脑补
+- 无明显模式时输出 has_insight=false
+
+【输出格式】
+{{"has_insight":true,"content":"一条简洁的总结，可直接存入记忆","confidence":0.85}}

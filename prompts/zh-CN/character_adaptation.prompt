@@ -1,0 +1,69 @@
+# =============================================================================
+# 用途：根据累积互动信号生成角色成长指引
+# 调用方：signal_orchestrator.compute_character_adaptation_signal()
+# 加载方式：template_loader.render("character_adaptation.prompt")
+#
+# 输入 JSON：
+#   - user_id: string
+#   - explicit_feedback: object[] (最近 50 条)
+#     - category: string (如 "more_brief", "more_gentle")
+#     - created_at: ISO datetime (可判断时效性)
+#   - stable_signals: object[]
+#     - signal: string (如 "reply_positive", "reply_negative")
+#     - weight: int
+#   - relationship_profile: object
+#     - intimacy_level, relationship_stage, friction_signals 等
+#     - friction_signals: 整数，累计摩擦次数。值较高时建议语气柔和、安抚
+#     - reply_positive/negative/repair_count: 整会话历史累计值，不代表近期
+#     - last_interaction_at: ISO datetime，最近交互时间
+#   - emotional_history: object[]
+#     - tone: string, created_at: ISO datetime
+#
+# 输出 JSON（必须严格遵循此格式）：
+# {
+#   "core_traits": ["更注重温和承接"],
+#   "tone_preferences": ["偏好更短一点", "偏好更柔和一点"],
+#   "behavior_habits": ["少一点主动追问"],
+#   "bot_persona_hints": ["这个用户喜欢简短精炼的回复"],
+#   "style_adaptation_summary": "用户偏好简短回复，近期反馈偏正向",
+#   "relationship_tone_hint": "朋友之间，可以稍亲切，但保持分寸",
+#   "emotional_trend": "用户近期情绪从开心转为焦虑",
+#   "feedback_summary": "用户最近反馈偏好：正向为主，最新一次为 negative",
+#   "confidence": 0.8,
+#   "reason": "3 条 more_brief 反馈 + 2 次正向回复效果"
+# }
+# =============================================================================
+
+你现在要根据累积的互动信号，生成针对该用户的角色成长指引。
+
+# 输入说明
+
+- explicit_feedback：LLM 反馈分流器标注的风格偏好标签（仅最近 50 条）。每条含 created_at，可判断反馈时效性
+- stable_signals：历史稳定行为信号
+- relationship_profile：已有关系轮廓。其中的 reply_positive/negative/repair_count 是整会话历史累计值，不代表近期。friction_signals 为累计摩擦次数，值较高时关系语气应偏向柔和安抚。last_interaction_at 可辅助判断信息时效性
+- emotional_history：用户近期情绪标签记录（每条含 tone + created_at）
+
+# 输出字段
+
+- core_traits：核心互动特质列表，每条一句话。示例："更注重温和承接"
+- tone_preferences：长期稳定的语气偏好列表。示例："偏好更短一点"
+- behavior_habits：行为习惯列表。示例："少一点主动追问"
+- bot_persona_hints：针对该用户的回复指引列表。示例："这个用户喜欢简短精炼的回复"
+- style_adaptation_summary：必填。一段自然语言总结，描述用户风格偏好和交互习惯
+- relationship_tone_hint（新增）：基于 relationship_profile 的关系阶段、friction_signals 等生成关系语气建议。自然语言段落，风格例如"朋友之间，可以稍亲切，但保持分寸"。信息不足时输出空字符串
+- emotional_trend（新增）：基于 emotional_history 的 tone 变化趋势生成的近期情绪走向描述。信息不足时输出空字符串
+- feedback_summary（新增）：基于累计反馈计数和 explicit_feedback 条目生成的反馈摘要，关注近期模式。信息不足时输出空字符串
+- confidence：0~1，表示判断确信度
+- reason：简短理由
+
+# 约束
+
+- 只有多次出现（>=2 次）的一致信号才值得生成指引
+- 最近出现的负向反馈优先级高于历史正向反馈
+- 如果信息不足，core_traits/tone_preferences/behavior_habits/bot_persona_hints 输出空数组
+- style_adaptation_summary / relationship_tone_hint / emotional_trend / feedback_summary 信息不足时输出空字符串
+- 禁止编造没有数据支持的指引
+- 语气用自然中文，每条指引一句话，简洁具体
+- relationship_tone_hint 与 feedback_summary 使用自然语言段落，不要使用标签式短语
+
+你只需输出 JSON，不要输出其他内容。
