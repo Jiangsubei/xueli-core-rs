@@ -5,8 +5,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::prelude::XueliResult;
 use crate::core::config::XueliConfig;
+use crate::core::errors::XueliError;
+use crate::prelude::XueliResult;
 use crate::traits::prompt_template::PromptTemplateLoader;
 
 /// 提供助手名称/别名和身份提示文本
@@ -150,7 +151,7 @@ mod tests {
                             .to_string(),
                     )
                 } else {
-                    Err("not found".to_string())
+                    Err(XueliError::Template("not found".to_string()))
                 }
             }
         }
