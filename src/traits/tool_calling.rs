@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 
+use crate::prelude::XueliResult;
+
 /// 工具调用定义
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
@@ -27,8 +29,8 @@ pub struct ToolResult {
 #[async_trait]
 pub trait ToolCallingStrategy: Send + Sync {
     /// 从 LLM 响应文本中解析工具调用
-    fn parse_tool_calls(&self, response_text: &str) -> Result<Vec<ToolCall>, String>;
+    fn parse_tool_calls(&self, response_text: &str) -> XueliResult<Vec<ToolCall>>;
 
     /// 将工具定义序列化为协议特有的格式
-    fn serialize_tools(&self, tools: &[ToolDefinition]) -> Result<serde_json::Value, String>;
+    fn serialize_tools(&self, tools: &[ToolDefinition]) -> XueliResult<serde_json::Value>;
 }

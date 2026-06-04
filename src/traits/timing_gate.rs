@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 
+use crate::prelude::XueliResult;
 use crate::core::platform_types::InboundEvent;
 
 /// 时机判断决策
@@ -27,5 +28,5 @@ pub struct TimingContext {
 #[async_trait]
 pub trait TimingGateStrategy: Send + Sync {
     /// 判断是否应该在此时回复
-    async fn should_reply(&self, context: &TimingContext) -> Result<TimingDecision, String>;
+    async fn should_reply(&self, context: &TimingContext) -> XueliResult<TimingDecision>;
 }
