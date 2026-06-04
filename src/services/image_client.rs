@@ -1,10 +1,12 @@
+use crate::prelude::XueliResult;
+
 /// 图片下载与编码服务
 pub struct ImageClient {
     client: reqwest::Client,
 }
 
 impl ImageClient {
-    pub fn new() -> Result<Self, String> {
+    pub fn new() -> XueliResult<Self> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -13,7 +15,7 @@ impl ImageClient {
     }
 
     /// 下载图片并返回字节
-    pub async fn download(&self, url: &str) -> Result<Vec<u8>, String> {
+    pub async fn download(&self, url: &str) -> XueliResult<Vec<u8>> {
         let response = self
             .client
             .get(url)
@@ -25,11 +27,11 @@ impl ImageClient {
             .bytes()
             .await
             .map(|b| b.to_vec())
-            .map_err(|e| format!("读取图片数据失败: {}", e))
+            .map_err(|e| format!("读取图片数据失败: {}", e).into())
     }
 
     /// 下载图片并编码为 base64
-    pub async fn download_as_base64(&self, url: &str) -> Result<String, String> {
+    pub async fn download_as_base64(&self, url: &str) -> XueliResult<String> {
         use base64::Engine;
         let bytes = self.download(url).await?;
         Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))

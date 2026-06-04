@@ -21,9 +21,9 @@ impl ModelInvocationRouter {
     /// 根据任务类型选择模型
     pub fn route(&self, task: &InvocationTask) -> InvocationTarget {
         match task {
-            InvocationTask::TimingGate
-            | InvocationTask::SimpleReply
-            | InvocationTask::Rerank => InvocationTarget::Light,
+            InvocationTask::TimingGate | InvocationTask::SimpleReply | InvocationTask::Rerank => {
+                InvocationTarget::Light
+            }
             InvocationTask::ImageAnalysis => {
                 if self.config.vision_model.is_some() {
                     InvocationTarget::Vision
@@ -40,9 +40,11 @@ impl ModelInvocationRouter {
         match target {
             InvocationTarget::Primary => &self.config.primary_model,
             InvocationTarget::Light => &self.config.light_model,
-            InvocationTarget::Vision => {
-                self.config.vision_model.as_deref().unwrap_or(&self.config.primary_model)
-            }
+            InvocationTarget::Vision => self
+                .config
+                .vision_model
+                .as_deref()
+                .unwrap_or(&self.config.primary_model),
         }
     }
 }

@@ -1,8 +1,8 @@
-use async_trait::async_trait;
 use std::sync::Arc;
 
+use crate::prelude::XueliResult;
 use crate::core::config::ModelConfig;
-use crate::traits::ai_client::{AIClient, ChatCompletionRequest, ChatCompletionResponse, ChatMessage};
+use crate::traits::ai_client::{AIClient, ChatCompletionRequest, ChatMessage};
 
 /// VLM 视觉客户端 — 图片理解
 pub struct VisionClient {
@@ -18,10 +18,10 @@ impl VisionClient {
     /// 分析图片内容
     pub async fn analyze_image(
         &self,
-        image_base64: &str,
+        _image_base64: &str,
         prompt: &str,
         mime_type: &str,
-    ) -> Result<String, String> {
+    ) -> XueliResult<String> {
         let model = self
             .config
             .vision_model
@@ -29,16 +29,18 @@ impl VisionClient {
             .ok_or("未配置 VLM 模型")?
             .clone();
 
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: format!("[image:{}] {}", mime_type, prompt),
-        }];
+        let messages = vec![ChatMessage::text(
+            "user",
+            format!("[image:{}] {}", mime_type, prompt),
+        )];
 
         let request = ChatCompletionRequest {
             model,
             messages,
             temperature: Some(0.3),
             max_tokens: Some(1024),
+            stream: false,
+            extra_params: Default::default(),
         };
 
         let response = self.client.chat_completion(&request).await?;
