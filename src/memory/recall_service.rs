@@ -1,3 +1,4 @@
+use crate::prelude::XueliResult;
 use crate::core::types::MemoryItem;
 
 /// 会话记忆回忆服务
@@ -14,7 +15,7 @@ impl ConversationRecallService {
         _user_id: &str,
         _session_id: &str,
         _query: &str,
-    ) -> Result<Vec<MemoryItem>, String> {
+    ) -> XueliResult<Vec<MemoryItem>> {
         // TODO: 实现记忆召回（BM25 + 向量混合检索）
         Ok(Vec::new())
     }
