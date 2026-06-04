@@ -1,3 +1,4 @@
+use crate::prelude::XueliResult;
 use crate::core::platform_types::InboundEvent;
 
 /// 会话计划协调器 — 协调多个并发的回复计划
@@ -8,10 +9,7 @@ impl ConversationPlanCoordinator {
         Self
     }
 
-    pub async fn coordinate(
-        &self,
-        _event: &InboundEvent,
-    ) -> Result<(), String> {
+    pub async fn coordinate(&self, _event: &InboundEvent) -> XueliResult<()> {
         // TODO: 实现计划协调逻辑
         Ok(())
     }
