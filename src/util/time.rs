@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 
 /// 获取当前 UTC 时间
 pub fn now_utc() -> DateTime<Utc> {

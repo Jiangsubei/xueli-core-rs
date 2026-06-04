@@ -1,4 +1,4 @@
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 /// SHA256 哈希
 pub fn sha256(input: &str) -> String {

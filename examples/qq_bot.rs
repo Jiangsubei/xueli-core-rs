@@ -19,7 +19,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 创建运行时
     let runtime = BotRuntime::new(config);
-    runtime.init().await.map_err(|e| format!("初始化失败: {}", e))?;
+    runtime
+        .init()
+        .await
+        .map_err(|e| format!("初始化失败: {}", e))?;
 
     tracing::info!("xueli-core QQ Bot 示例已启动");
 
