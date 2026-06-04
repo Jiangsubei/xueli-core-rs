@@ -8,9 +8,7 @@ pub struct LifecycleManager {
 
 impl LifecycleManager {
     pub fn new() -> Self {
-        Self {
-            tasks: Vec::new(),
-        }
+        Self { tasks: Vec::new() }
     }
 
     /// 注册后台任务

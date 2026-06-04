@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::prelude::XueliResult;
 use crate::core::platform_types::ReplyAction;
 use crate::traits::platform_adapter::PlatformAdapter;
 
@@ -14,12 +15,12 @@ impl<P: PlatformAdapter> ReplySender<P> {
     }
 
     /// 发送回复
-    pub async fn send(&self, action: &ReplyAction) -> Result<(), String> {
+    pub async fn send(&self, action: &ReplyAction) -> XueliResult<()> {
         self.adapter.send_action(action).await
     }
 
     /// 发送多条回复
-    pub async fn send_batch(&self, actions: &[ReplyAction]) -> Result<(), String> {
+    pub async fn send_batch(&self, actions: &[ReplyAction]) -> XueliResult<()> {
         for action in actions {
             self.adapter.send_action(action).await?;
         }
