@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use jieba_rs::Jieba;
+use std::collections::HashMap;
 
 /// BM25 文本检索索引
 pub struct BM25Index {
@@ -85,7 +85,8 @@ impl BM25Index {
 
                 let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln().max(0.0);
                 let numerator = tf * (self.k1 + 1.0);
-                let denominator = tf + self.k1 * (1.0 - self.b + self.b * doc_len / self.avg_doc_len);
+                let denominator =
+                    tf + self.k1 * (1.0 - self.b + self.b * doc_len / self.avg_doc_len);
 
                 idf * numerator / denominator
             })

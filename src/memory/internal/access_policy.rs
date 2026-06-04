@@ -1,5 +1,5 @@
-use crate::core::types::{MemoryItem, MemoryType};
 use crate::core::scope::ChatScope;
+use crate::core::types::{MemoryItem, MemoryType};
 
 /// 记忆访问策略 — 决定哪些记忆对当前上下文可见
 pub struct MemoryAccessPolicy {
@@ -19,10 +19,7 @@ impl MemoryAccessPolicy {
                 MemoryType::Opinion,
                 MemoryType::Relationship,
             ],
-            group_allowed_types: vec![
-                MemoryType::Fact,
-                MemoryType::Event,
-            ],
+            group_allowed_types: vec![MemoryType::Fact, MemoryType::Event],
         }
     }
 
@@ -36,11 +33,7 @@ impl MemoryAccessPolicy {
     }
 
     /// 过滤可访问的记忆
-    pub fn filter_accessible(
-        &self,
-        memories: &[MemoryItem],
-        scope: &ChatScope,
-    ) -> Vec<MemoryItem> {
+    pub fn filter_accessible(&self, memories: &[MemoryItem], scope: &ChatScope) -> Vec<MemoryItem> {
         memories
             .iter()
             .filter(|m| self.is_accessible(m, scope))

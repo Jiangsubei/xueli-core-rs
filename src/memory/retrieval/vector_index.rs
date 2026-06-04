@@ -43,16 +43,12 @@ impl VectorIndex {
     fn text_to_vector(&self, text: &str) -> Vec<f64> {
         let chars: Vec<char> = text.chars().collect();
         let mut vec = vec![0.0; self.vocab_size];
-        let n_grams: Vec<String> = chars
-            .windows(self.n)
-            .map(|w| w.iter().collect())
-            .collect();
+        let n_grams: Vec<String> = chars.windows(self.n).map(|w| w.iter().collect()).collect();
 
         for ng in &n_grams {
-            let idx = ng
-                .chars()
-                .fold(0usize, |acc, c| acc.wrapping_mul(31).wrapping_add(c as usize))
-                % self.vocab_size;
+            let idx = ng.chars().fold(0usize, |acc, c| {
+                acc.wrapping_mul(31).wrapping_add(c as usize)
+            }) % self.vocab_size;
             vec[idx] += 1.0;
         }
 
