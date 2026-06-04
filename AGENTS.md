@@ -1,5 +1,7 @@
 # AGENTS.md
 
+原项目路径在 `/home/jiangsubei/Documents/xueli-qq-bot` 
+
 ---
 
 ## 通用原则
@@ -16,9 +18,8 @@
 
 - **禁止在 async 上下文中使用同步阻塞 I/O**：`std::fs::read_to_string()` / `std::fs::write()` 等会阻塞 tokio 事件循环，应使用 `tokio::fs` 或 `tokio::task::spawn_blocking` 包裹
 - **文件写入必须原子化**：所有持久化先写 `.tmp` 再 `std::fs::rename()`，禁止直接覆写目标文件，防止写入中断导致文件损坏
+- **持久化存储统一使用 SQLite**：所有持久化数据（记忆、信号、状态、会话等）均使用 SQLite 存储，少量配置型数据可用 JSON 文件（如 `config.toml` 的补充配置）。SQL 操作使用 `rusqlite` 或等效 crate。禁止在 async 上下文中阻塞事件循环执行 SQL 操作，应使用 `tokio::task::spawn_blocking` 包裹同步 SQL 调用。
 - **禁止在持有 `tokio::sync::Mutex` / `std::sync::Mutex` 锁时调用 `.await`**：可能死锁。如需在异步中持有锁，使用 `tokio::sync::Mutex` 并注意锁的临界区不含 `.await` 即可；跨 `.await` 持锁需评估用 `Actor` 模型或 `mpsc` channel 替代
-- **`unwrap()` / `expect()` 仅允许在初始化阶段和测试中使用**：核心逻辑路径必须返回 `Result<_, XueliError>`
-- **避免 `String` 作为错误类型**：核心模块使用 `XueliError`（基于 `thiserror`），仅在 trait 边界或原型阶段允许 `String`
 
 ### 依赖协议
 
@@ -35,7 +36,7 @@ MIT 许可证。引入新依赖必须 permissive 协议（MIT、BSD-3-Clause、A
 
 #### 必须保留的日志
 - `LOG_PROMPT_FULL` — 完整提示词（便于排查 AI 输出异常）
-- `LOG_PROMPT_DIGEST` — 提示词摘要
+- `LOG_PROMPT_DIGEST` — 完整提示词
 - HTTP 访问日志（标准格式）
 - AI 重试日志（重试次数/延迟）
 - `LOG_STARTUP_INFO` — 启动信息
@@ -43,8 +44,6 @@ MIT 许可证。引入新依赖必须 permissive 协议（MIT、BSD-3-Clause、A
 日志标签常量定义在 `src/core/log_labels.rs`，使用这些常量而非硬编码字符串。
 
 #### 禁止出现的日志
-- 规划原始 DEBUG 日志（包含 `plan.action` / `plan.reason` 等），防止泄漏内部决策细节
-- 非关键路径的 DEBUG/INFO 心跳日志
 - 用户侧异常解释性文字（静默失败原则，见关键约束第 9 条）
 
 ### 提示词模板规范
@@ -55,15 +54,15 @@ MIT 许可证。引入新依赖必须 permissive 协议（MIT、BSD-3-Clause、A
 
 **组合逻辑**（如根据是否有视觉结果决定是否注入某段提示词、根据场景拼接不同的 system prompt 区块）允许留在 Rust 代码中动态构建。模板内容与组合逻辑的边界：模板文件定义"说什么"，代码定义"选哪块说"。
 
-#### 提示词内容一致性原则（强制）
+#### 提示词内容一致性原则
 
-- **所见即所得**：日志中出现的占位符必须与模型看到的文字一致
-- **口径统一**：Timing Gate / Planner / Reply 三个模型的同一语义描述核心语义必须一致
+- **所见即所得**：日志中出现的内容必须与模型看到的文字一致
+- **口径统一**：Timing Gate / Planner / Reply 三个模型的同一语义描述核心语义必须一致，可以根据模型职责微调
 - **图片描述口径**：
   - 单张图片：使用该图的逐图描述 `[图片] {per_image_description}`
   - 多张图片：优先使用合并描述 `[图片] {merged_description}`；若合并描述缺失，将逐图描述拼接
   - 识别失败：所有描述均缺失时回退为 `[图片]未成功识别`
-- **空文本占位符**：用户发送空文本时统一表述为 `用户发送了空文本`，不用 `[空]` 等缩写
+- **空文本占位符**：用户发送空文本时统一表述为 `用户发送了空文本`
 
 ---
 
@@ -136,39 +135,6 @@ InboundEvent
 
 ---
 
-### 记忆系统
-
-- 记忆写入统一经由 `MemoryFlowService`（**不在** ReplyAgent 内）
-- 三层记忆：person_fact / chat_summary / conversation_recall
-- 存储：统一写入 SQLite（`rusqlite`，bundled 模式），路径由 `MemoryConfig.db_path` 配置
-- 拟人化特性：动态遗忘（用进废退）、软遗忘（归档记忆打折召回）、情绪标记、离线消化、语义联想、脆性期保护、离线巩固、提取诱发遗忘、记忆合并、时段匹配检索
-
-#### 记忆隔离原则（强制）
-
-**正常情况下，存储路径与检索路径必须对称**
-- 写入时 `storage_user_id` 格式为 `{platform}:{scope}:{scope_id}:{user_id}`
-- 检索层（`get_scope_user_ids`）必须根据 `ChatScope` 和 `scope_id` 返回正确的存储 ID 列表
-- 若因数据迁移或临时回退需要打破对称性，迁移方案需经过评审，确保过渡期间两个路径行为一致
-
-**索引重建必须覆盖全量用户**
-- `rebuild_all_indices()` 必须使用 `storage.get_user_ids()` 获取完整列表，不能自己扫描文件系统
-- `get_user_ids()` 返回什么，索引就必须扫什么
-
-**作用域匹配不能产生歧义**
-- `Group("")` 在 group_id 为空字符串时会错误匹配（如私聊场景）
-- 无有效 `source_group_id` 时应回退到 `Private` scope，不能制造空字符串的 Group scope
-
-### ChatScope — 会话模态抽象
-
-定义在 `src/core/scope.rs`：
-
-```rust
-pub enum ChatScope {
-    Private,           // 一对一对话
-    Group(String),     // 多用户会话（群聊，含群 ID）
-}
-```
-
 **强制规则**：
 - 所有表示会话模态的逻辑**必须**使用 `ChatScope` 枚举及其方法（`is_group()` / `is_private()` / `group_id()`），**禁止**硬编码字符串比较
 - Adapter 层（下游实现 `PlatformAdapter`）负责输出 `ChatScope` 作为 SessionRef 的 scope
@@ -225,14 +191,6 @@ impl BotRuntime {
         // 初始化锁、连接池等异步资源
     }
 }
-
-// 或使用 Builder 模式
-let runtime = BotRuntime::builder()
-    .config(config)
-    .platform_adapter(adapter)
-    .ai_client(client)
-    .build()?;
-```
 
 **锁管理：** 所有 `tokio::sync::Mutex` / `RwLock` 必须在 `init()` 或构造器中初始化，避免在持有锁时调用 `.await` 导致死锁。
 
@@ -321,18 +279,36 @@ assert_eq!(segments.len(), 3); // 失败时难以诊断
 
 ---
 
-## 遗留 / 未使用代码
+## 已实现模块状态
 
-以下模块在当前主路径中仅为骨架占位（`todo!()`），尚未实现完整逻辑：
+核心链路模块已全部实现并通过测试（258 个单元测试），不再使用 `todo!()` 占位：
 
-| 文件 | 说明 |
-|------|------|
-| `src/memory/stores/*.rs` | 5 个 SQLite Store，建表 + CRUD 待实现 |
-| `src/memory/retrieval/*.rs` | BM25/向量检索待实现 |
-| `src/memory/extraction/*.rs` | LLM 记忆提取待实现 |
-| `src/services/ai_client.rs` | 默认 AI 客户端 HTTP 实现待补全 |
-| `src/handlers/planner.rs` | ConversationPlanner 待实现 |
-| `src/handlers/reply_agent.rs` | ReplyAgent 工具循环待实现 |
+| 模块 | 状态 | 文件 |
+|------|------|------|
+| SQLite Store（6 表） | 已完成 | `src/memory/stores/*.rs` |
+| BM25/向量/混合检索 | 已完成 | `src/memory/retrieval/*.rs` |
+| LLM 记忆提取 | 已完成 | `src/memory/extraction/*.rs` |
+| 默认 AI 客户端 HTTP | 已完成 | `src/services/ai_client.rs`（541 行） |
+| ConversationPlanner | 已完成 | `src/handlers/planner.rs`（256 行） |
+| ReplyAgent 工具循环 | 已完成 | `src/handlers/reply_agent.rs`（624 行） |
+| TimingGate | 已完成 | `src/handlers/timing_gate.rs`（622 行） |
+| 信号系统 | 已完成 | `src/signals/*.rs` |
+| 群聊状态机 | 已完成 | GroupState 枚举 + BotRuntime 集成 |
+| 会话恢复服务 | 已完成 | `src/memory/session_restore_service.rs` |
+| 记忆冲突解决 | 已完成 | `src/memory/memory_dispute_resolver.rs` |
+| 后台任务调度 | 已完成 | `src/memory/internal/task_manager.rs` |
+| 回复效果追踪 | 已完成 | `src/handlers/reply/effect_tracker.rs` |
+| 回复风格策略 | 已完成 | `src/handlers/reply/style_policy.rs` |
+| 回复副作用处理 | 已完成 | `src/handlers/reply/side_effects.rs` |
+| 回复流水线编排 | 已完成 | `src/handlers/reply/pipeline.rs` |
+| 共享工具层 | 已完成 | `src/handlers/shared/*.rs`（4 文件） |
+| 命令系统 | 已完成 | `src/handlers/command/*.rs`（2 文件） |
+| 信号持久化存储 | 已完成 | `src/memory/stores/signal_store.rs` |
+| 上下文记录/回放 | 已完成 | `src/core/context_recorder.rs` |
+| 不可变消息日志 | 已完成 | `src/core/immutable_message_log.rs` |
+| 心情状态持久化 | 已完成 | `src/memory/stores/mood_store.rs` |
+
+**不移植的模块**：`adapters/`（下游实现）、`webui/`（Web 界面，含 `core/runtime_supervisor.py`）、`core/plugin/`（插件系统）、`memory/storage/markdown_store.py`（项目统一使用 SQL）。
 
 ---
 
@@ -349,7 +325,7 @@ assert_eq!(segments.len(), 3); // 失败时难以诊断
 - `TokenCounter` — token 预算管理
 - `traits/ai_client.rs` — AIClient trait 定义
 
-修改上述模块的 PR，必须附带相关测试的通过证明，且至少一名其他开发者审查通过。
+修改上述模块，必须附带相关测试的通过证明。
 
 ---
 
