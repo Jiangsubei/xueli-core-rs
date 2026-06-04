@@ -39,15 +39,34 @@ pub struct Conversation {
     pub message_count: u64,
 }
 
-/// 情绪状态
+/// 情绪状态 — 多维连续值模型
+///
+/// - `valence`: 愉悦度，-1.0（负面）到 1.0（正面）
+/// - `energy`: 精力，0.0（枯竭）到 1.0（充沛）
+/// - `arousal`: 唤醒度，0.0（平静）到 1.0（激动）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum MoodState {
-    Happy,
-    Neutral,
-    Sad,
-    Excited,
-    Thoughtful,
-    Playful,
+pub struct MoodState {
+    pub valence: f64,
+    pub energy: f64,
+    pub arousal: f64,
+    pub updated_at: String,
+}
+
+impl MoodState {
+    pub fn new() -> Self {
+        Self {
+            valence: 0.0,
+            energy: 0.8,
+            arousal: 0.5,
+            updated_at: String::new(),
+        }
+    }
+}
+
+impl Default for MoodState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// 关系亲密度档案
@@ -141,4 +160,35 @@ pub struct MemoryPatch {
     pub update: Vec<MemoryItem>,
     /// 删除记忆 ID
     pub remove: Vec<String>,
+}
+
+/// 不可变消息 — 消息一旦创建，内容和时间均不可变
+///
+/// 对应 Python 版 `src.core.models.ImmutableMessage`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImmutableMessage {
+    pub message_id: String,
+    pub user_id: String,
+    pub content: String,
+    /// 事件时间（Unix 时间戳，秒）
+    pub event_time: f64,
+    /// 接收时间（Unix 时间戳，秒）
+    pub received_time: f64,
+    /// 原始数据（JSON）
+    pub raw_data: serde_json::Value,
+    /// 显示名称
+    pub display_name: String,
+    /// 原始事件文本
+    pub event_text: String,
+}
+
+/// 会话快照 — 基于时间点的静态群聊上下文视图
+///
+/// 对应 Python 版 `src.core.models.ConversationSnapshot`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationSnapshot {
+    pub conversation_id: String,
+    pub messages: Vec<ImmutableMessage>,
+    pub snapshot_time: f64,
+    pub created_at: f64,
 }

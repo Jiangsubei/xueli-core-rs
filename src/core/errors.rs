@@ -54,3 +54,41 @@ pub enum XueliError {
 
 /// 便捷类型别名
 pub type XueliResult<T> = Result<T, XueliError>;
+
+// ── From 转换实现 ────────────────────────────────────────
+
+impl From<String> for XueliError {
+    fn from(e: String) -> Self {
+        XueliError::Internal(e)
+    }
+}
+
+impl From<&str> for XueliError {
+    fn from(e: &str) -> Self {
+        XueliError::Internal(e.to_string())
+    }
+}
+
+impl From<rusqlite::Error> for XueliError {
+    fn from(e: rusqlite::Error) -> Self {
+        XueliError::Database(e.to_string())
+    }
+}
+
+impl From<serde_json::Error> for XueliError {
+    fn from(e: serde_json::Error) -> Self {
+        XueliError::Serialization(e.to_string())
+    }
+}
+
+impl From<reqwest::Error> for XueliError {
+    fn from(e: reqwest::Error) -> Self {
+        XueliError::AIService(e.to_string())
+    }
+}
+
+impl From<std::io::Error> for XueliError {
+    fn from(e: std::io::Error) -> Self {
+        XueliError::Internal(e.to_string())
+    }
+}

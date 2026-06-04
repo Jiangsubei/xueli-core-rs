@@ -68,3 +68,26 @@ pub enum SendAction {
     /// 标记消息已读
     MarkRead(SessionRef),
 }
+
+/// 群聊状态机状态
+///
+/// 对应 Python 版 `GroupState`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GroupState {
+    /// 正常运行，处理消息
+    Running,
+    /// 等待更多上下文，消息仅缓冲
+    Waiting,
+    /// 已停止，忽略消息直到重新唤醒
+    Stopped,
+}
+
+impl GroupState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GroupState::Running => "running",
+            GroupState::Waiting => "waiting",
+            GroupState::Stopped => "stopped",
+        }
+    }
+}
