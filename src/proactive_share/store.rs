@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::prelude::XueliResult;
+
 /// 分享记录
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareRecord {
@@ -31,12 +33,12 @@ impl ProactiveShareStore {
         }
     }
 
-    pub fn save(&self, _record: ShareRecord) -> Result<String, String> {
+    pub fn save(&self, _record: ShareRecord) -> XueliResult<String> {
         // TODO: SQLite 存储
         Ok(String::new())
     }
 
-    pub fn get_recent(&self, _user_id: &str, _limit: usize) -> Result<Vec<ShareRecord>, String> {
+    pub fn get_recent(&self, _user_id: &str, _limit: usize) -> XueliResult<Vec<ShareRecord>> {
         // TODO: 查询最近分享
         Ok(Vec::new())
     }

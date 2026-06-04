@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::prelude::XueliResult;
+
 /// 表情条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmojiEntry {
@@ -23,17 +25,17 @@ impl EmojiDB {
         }
     }
 
-    pub fn add_emoji(&self, _entry: EmojiEntry) -> Result<String, String> {
+    pub fn add_emoji(&self, _entry: EmojiEntry) -> XueliResult<String> {
         // TODO: SQLite 存储
         Ok(String::new())
     }
 
-    pub fn find_by_tags(&self, _tags: &[&str]) -> Result<Vec<EmojiEntry>, String> {
+    pub fn find_by_tags(&self, _tags: &[&str]) -> XueliResult<Vec<EmojiEntry>> {
         // TODO: 按标签搜索
         Ok(Vec::new())
     }
 
-    pub fn get_random(&self, _category: Option<&str>) -> Result<Option<EmojiEntry>, String> {
+    pub fn get_random(&self, _category: Option<&str>) -> XueliResult<Option<EmojiEntry>> {
         // TODO: 随机获取
         Ok(None)
     }

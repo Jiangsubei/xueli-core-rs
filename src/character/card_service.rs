@@ -34,11 +34,7 @@ impl CharacterCardService {
             name: "小理".to_string(),
             age: None,
             gender: None,
-            personality: vec![
-                "友好".to_string(),
-                "耐心".to_string(),
-                "幽默".to_string(),
-            ],
+            personality: vec!["友好".to_string(), "耐心".to_string(), "幽默".to_string()],
             interests: vec![
                 "聊天".to_string(),
                 "学习".to_string(),
