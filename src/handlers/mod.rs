@@ -3,6 +3,7 @@ pub mod context_builder;
 pub mod group_collector;
 pub mod image_pipeline;
 pub mod message_handler;
+pub mod message_text;
 pub mod plan_coordinator;
 pub mod planner;
 pub mod prompt_builder;
