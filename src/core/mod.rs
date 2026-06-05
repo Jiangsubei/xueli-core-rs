@@ -5,6 +5,7 @@ pub mod errors;
 pub mod immutable_message_log;
 pub mod lifecycle;
 pub mod log_labels;
+pub mod log_text;
 pub mod message_trace;
 pub mod metrics;
 pub mod mood_engine;
