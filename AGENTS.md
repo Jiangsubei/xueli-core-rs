@@ -279,15 +279,15 @@ assert_eq!(segments.len(), 3); // 失败时难以诊断
 
 ---
 
-## 已实现模块状态
+## 模块实现状态
 
-核心链路模块已全部实现并通过测试（258 个单元测试），不再使用 `todo!()` 占位：
+### 已完成（通过测试，生产质量）
 
 | 模块 | 状态 | 文件 |
 |------|------|------|
 | SQLite Store（6 表） | 已完成 | `src/memory/stores/*.rs` |
 | BM25/向量/混合检索 | 已完成 | `src/memory/retrieval/*.rs` |
-| LLM 记忆提取 | 已完成 | `src/memory/extraction/*.rs` |
+| LLM 记忆提取（extractor/reflection/person_fact/chat_summary/patch_merger） | 已完成 | `src/memory/extraction/*.rs` |
 | 默认 AI 客户端 HTTP | 已完成 | `src/services/ai_client.rs`（541 行） |
 | ConversationPlanner | 已完成 | `src/handlers/planner.rs`（256 行） |
 | ReplyAgent 工具循环 | 已完成 | `src/handlers/reply_agent.rs`（624 行） |
@@ -307,6 +307,23 @@ assert_eq!(segments.len(), 3); // 失败时难以诊断
 | 上下文记录/回放 | 已完成 | `src/core/context_recorder.rs` |
 | 不可变消息日志 | 已完成 | `src/core/immutable_message_log.rs` |
 | 心情状态持久化 | 已完成 | `src/memory/stores/mood_store.rs` |
+| 视觉客户端（VisionClient + ImageClient + ImagePipeline） | 已完成 | `src/services/vision_client.rs` / `image_client.rs` / `src/handlers/image_pipeline.rs` |
+| 模型调用路由（ModelInvocationRouter） | 已完成 | `src/services/invocation_router.rs` |
+
+### 骨架/待实现（仅有类型定义或 `// TODO` 占位）
+
+| 模块 | 状态 | 文件 |
+|------|------|------|
+| 表情系统（EmojiDB + Manager + ReplyService） | 骨架（3 个 `// TODO` 字段为 0%） | `src/emoji/database.rs` / `manager.rs` / `reply_service.rs` |
+| 主动分享存储（ShareRecord CRUD） | 骨架（`// TODO` 字段） | `src/proactive_share/store.rs` |
+| 主动分享调度器 | 骨架（`// TODO` 字段） | `src/proactive_share/scheduler.rs` |
+| 记忆召回服务（BM25 + 向量混合编排） | 骨架（`// TODO` 字段） | `src/memory/recall_service.rs` |
+| 索引协调器（增量更新/重建） | 骨架（`// TODO` 字段） | `src/memory/internal/index_coordinator.rs` |
+| 计划协调器 | 骨架（`// TODO` 字段） | `src/handlers/plan_coordinator.rs` |
+| 角色卡服务（CharacterCardService） | 骨架（仅有数据结构和默认卡） | `src/character/card_service.rs` |
+| 叙事服务（NarrativeThread/Event） | 骨架（仅有数据结构） | `src/character/narrative.rs` |
+
+**计划**：`recall_service`、`index_coordinator`、`emoji` 系统、`proactive_share`、`character` 服务、`plan_coordinator` 仍需实现；其余模块已完成。
 
 **不移植的模块**：`adapters/`（下游实现）、`webui/`（Web 界面，含 `core/runtime_supervisor.py`）、`core/plugin/`（插件系统）、`memory/storage/markdown_store.py`（项目统一使用 SQL）。
 
