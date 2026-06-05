@@ -1,3 +1,4 @@
+pub mod bootstrap;
 pub mod config;
 pub mod context_recorder;
 pub mod dispatcher;
