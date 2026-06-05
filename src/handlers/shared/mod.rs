@@ -4,4 +4,5 @@
 pub mod display_utils;
 pub mod identity_provider;
 pub mod identity_utils;
+pub mod prompt_planner;
 pub mod unified_history_renderer;

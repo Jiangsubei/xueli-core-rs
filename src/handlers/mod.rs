@@ -8,5 +8,6 @@ pub mod planner;
 pub mod prompt_builder;
 pub mod reply;
 pub mod reply_agent;
+pub mod session_manager;
 pub mod shared;
 pub mod timing_gate;
