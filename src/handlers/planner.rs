@@ -1,46 +1,91 @@
 use std::sync::Arc;
 
-use crate::prelude::XueliResult;
 use crate::core::platform_types::InboundEvent;
 use crate::core::types::ReplyPlan;
 use crate::handlers::context_builder::ConversationContext;
+use crate::handlers::shared::prompt_planner::PromptPlanner;
+use crate::prelude::XueliResult;
 use crate::traits::ai_client::{AIClient, ChatCompletionRequest, ChatMessage};
 
 /// 会话规划器 — 调用 LLM 规划回复策略
 pub struct ConversationPlanner<A: AIClient> {
     ai_client: Arc<A>,
-    /// 使用的模型名称
     model: String,
+    prompt_planner: PromptPlanner,
 }
 
 /// 规划结果
 #[derive(Debug, Clone)]
 pub struct PlanResult {
-    /// 回复计划
     pub reply_plan: ReplyPlan,
-    /// 提示词计划（下游 ReplyAgent 使用）
     pub prompt_plan: Option<PromptPlan>,
-    /// 回复参考文本
     pub reply_reference: String,
-    /// 是否应该回复
     pub should_reply: bool,
-    /// 置信度
     pub confidence: f64,
 }
 
-/// 提示词计划 — 指导 ReplyAgent 如何构建回复
+/// 提示词区段编译开关 — 对应 Python 版 `PromptSectionPolicy`
+#[derive(Debug, Clone)]
+pub struct PromptSectionPolicy {
+    pub include_recent_history: bool,
+    pub include_person_facts: bool,
+    pub include_session_restore: bool,
+    pub include_precise_recall: bool,
+    pub include_dynamic_memory: bool,
+    pub include_vision_context: bool,
+    pub include_reply_scope: bool,
+    pub include_style_guide: bool,
+}
+
+impl Default for PromptSectionPolicy {
+    fn default() -> Self {
+        Self {
+            include_recent_history: true,
+            include_person_facts: true,
+            include_session_restore: true,
+            include_precise_recall: true,
+            include_dynamic_memory: true,
+            include_vision_context: true,
+            include_reply_scope: true,
+            include_style_guide: true,
+        }
+    }
+}
+
+/// 提示词计划 — 对应 Python 版 `PromptPlan`，指导 ReplyAgent 如何构建回复
 #[derive(Debug, Clone)]
 pub struct PromptPlan {
-    /// 回复风格
-    pub tone_profile: Option<String>,
-    /// 回复长度偏好
-    pub length_preference: Option<String>,
-    /// 主动性
-    pub initiative: Option<String>,
-    /// 上下文焦点
-    pub context_focus: Option<String>,
-    /// 需避免的话题
-    pub avoid_topics: Vec<String>,
+    pub reply_goal: String,
+    pub continuity_mode: String,
+    pub timeline_detail: String,
+    pub context_profile: String,
+    pub memory_profile: String,
+    pub tone_profile: String,
+    pub initiative: String,
+    pub expression_profile: String,
+    pub policy: PromptSectionPolicy,
+    pub notes: String,
+    pub emoji_should_send: bool,
+    pub emoji_intent_reference: String,
+}
+
+impl Default for PromptPlan {
+    fn default() -> Self {
+        Self {
+            reply_goal: "continue".into(),
+            continuity_mode: "direct_continue".into(),
+            timeline_detail: "summary".into(),
+            context_profile: "standard".into(),
+            memory_profile: "relevant".into(),
+            tone_profile: "balanced".into(),
+            initiative: "gentle_follow".into(),
+            expression_profile: "plain".into(),
+            policy: PromptSectionPolicy::default(),
+            notes: String::new(),
+            emoji_should_send: false,
+            emoji_intent_reference: String::new(),
+        }
+    }
 }
 
 impl<A: AIClient> ConversationPlanner<A> {
@@ -48,6 +93,7 @@ impl<A: AIClient> ConversationPlanner<A> {
         Self {
             ai_client,
             model: model.to_string(),
+            prompt_planner: PromptPlanner::default(),
         }
     }
 
@@ -62,7 +108,6 @@ impl<A: AIClient> ConversationPlanner<A> {
 
         let system_prompt = self.build_system_prompt(is_group);
 
-        // 构建近期对话历史文本
         let history_text = if context.recent_messages.is_empty() {
             "（无近期对话记录）".to_string()
         } else {
@@ -92,7 +137,6 @@ impl<A: AIClient> ConversationPlanner<A> {
         let response = self.ai_client.chat_completion(&request).await?;
         let content = response.content.clone();
 
-        // 尝试解析 JSON 响应
         match serde_json::from_str::<serde_json::Value>(&content) {
             Ok(json) => {
                 let reply_plan = ReplyPlan {
@@ -115,8 +159,13 @@ impl<A: AIClient> ConversationPlanner<A> {
                     priority: 0,
                 };
 
-                let prompt_plan = parse_prompt_plan(&json);
-                let reply_reference = extract_str(&json, "/reply_reference").unwrap_or_default();
+                let prompt_plan = self.prompt_planner.parse_prompt_plan(
+                    json.as_object(),
+                    event,
+                    context.is_group,
+                    context.is_first_turn,
+                );
+                let reply_reference = parse_reply_reference_from_json(json.as_object());
 
                 Ok(PlanResult {
                     reply_plan,
@@ -126,29 +175,25 @@ impl<A: AIClient> ConversationPlanner<A> {
                     confidence: 0.8,
                 })
             }
-            Err(_) => {
-                // JSON 解析失败，回退为默认计划
-                let fallback_content = content.clone();
-                Ok(PlanResult {
-                    reply_plan: ReplyPlan {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        target_message_id: event
-                            .message
-                            .as_ref()
-                            .map(|m| m.id.clone())
-                            .unwrap_or_default(),
-                        topic: Some(content),
-                        style: None,
-                        memory_recall_needed: false,
-                        use_emoji: true,
-                        priority: 0,
-                    },
-                    prompt_plan: None,
-                    reply_reference: fallback_content,
-                    should_reply: true,
-                    confidence: 0.5,
-                })
-            }
+            Err(_) => Ok(PlanResult {
+                reply_plan: ReplyPlan {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    target_message_id: event
+                        .message
+                        .as_ref()
+                        .map(|m| m.id.clone())
+                        .unwrap_or_default(),
+                    topic: Some(content.clone()),
+                    style: None,
+                    memory_recall_needed: false,
+                    use_emoji: true,
+                    priority: 0,
+                },
+                prompt_plan: None,
+                reply_reference: content,
+                should_reply: true,
+                confidence: 0.5,
+            }),
         }
     }
 
@@ -187,41 +232,14 @@ impl<A: AIClient> ConversationPlanner<A> {
     }
 }
 
-fn parse_prompt_plan(json: &serde_json::Value) -> Option<PromptPlan> {
-    let pp = json.get("prompt_plan")?;
-    Some(PromptPlan {
-        tone_profile: pp
-            .get("tone_profile")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        length_preference: pp
-            .get("length_preference")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        initiative: pp
-            .get("initiative")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        context_focus: pp
-            .get("context_focus")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        avoid_topics: pp
-            .get("avoid_topics")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default(),
-    })
-}
-
-fn extract_str(json: &serde_json::Value, pointer: &str) -> Option<String> {
-    json.pointer(pointer)
+fn parse_reply_reference_from_json(
+    obj: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> String {
+    obj.and_then(|m| m.get("reply_reference"))
+        .or_else(|| obj.and_then(|m| m.get("reply_guidance")))
         .and_then(|v| v.as_str())
-        .map(String::from)
+        .map(|s| s.to_string())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -229,39 +247,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_prompt_plan_full() {
-        let json = serde_json::json!({
-            "reply_reference": "简短回复用户问好",
-            "prompt_plan": {
-                "tone_profile": "轻松亲切",
-                "length_preference": "短",
-                "initiative": "接话",
-                "context_focus": "当前消息",
-                "avoid_topics": ["政治", "隐私"]
-            }
-        });
-
-        let plan = parse_prompt_plan(&json).expect("解析失败");
-        assert_eq!(plan.tone_profile.unwrap(), "轻松亲切");
-        assert_eq!(plan.length_preference.unwrap(), "短");
-        assert_eq!(plan.avoid_topics.len(), 2);
-    }
-
-    #[test]
-    fn test_parse_prompt_plan_minimal() {
-        let json = serde_json::json!({
-            "reply_reference": "简单回复",
-            "prompt_plan": {}
-        });
-
-        let plan = parse_prompt_plan(&json).expect("解析失败");
-        assert!(plan.tone_profile.is_none());
-        assert!(plan.avoid_topics.is_empty());
-    }
-
-    #[test]
     fn test_build_system_prompt() {
-        // 使用一个 mock client 来测试构建
         let prompt = "你是会话控制中枢，负责在群聊场景下处理本轮对话。";
         assert!(prompt.contains("群聊"));
     }

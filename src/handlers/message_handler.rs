@@ -1,21 +1,27 @@
 use std::sync::Arc;
 
-use crate::prelude::XueliResult;
 use crate::core::config::XueliConfig;
+use crate::core::message_trace::{build_trace_id, get_execution_key};
 use crate::core::platform_types::{InboundEvent, ReplyAction};
-use crate::handlers::context_builder::ConversationContextBuilder;
+use crate::handlers::context_builder::{ConversationContext, ConversationContextBuilder};
+use crate::handlers::plan_coordinator::ConversationPlanCoordinator;
 use crate::handlers::planner::ConversationPlanner;
+use crate::handlers::prompt_builder::ReplyPromptBuilder;
 use crate::handlers::reply_agent::ReplyAgent;
+use crate::handlers::session_manager::ConversationSessionManager;
 use crate::handlers::timing_gate::DefaultTimingGate;
 use crate::memory::manager::MemoryManager;
 use crate::memory::stores::person_fact::SqlitePersonFactStore;
+use crate::prelude::XueliResult;
 use crate::services::prompt_loader::NoopPromptTemplateLoader;
 use crate::traits::ai_client::AIClient;
 use crate::traits::platform_adapter::PlatformAdapter;
 use crate::traits::prompt_template::PromptTemplateLoader;
-use crate::traits::timing_gate::TimingGateStrategy;
+use crate::traits::timing_gate::{TimingContext, TimingDecision, TimingGateStrategy};
 
-/// 消息处理器 — 编排整个回复管线
+/// 消息处理器 — 编排完整的消息处理管线。
+///
+/// 执行链：TimingGate → PlanCoordinator → ContextBuilder → Planner → ReplyAgent → ReplyAction
 pub struct MessageHandler<
     A: AIClient,
     P: PlatformAdapter,
@@ -23,9 +29,10 @@ pub struct MessageHandler<
 > {
     config: Arc<XueliConfig>,
     timing_gate: DefaultTimingGate<A, L>,
-    planner: ConversationPlanner<A>,
-    context_builder: ConversationContextBuilder,
+    plan_coordinator: Arc<ConversationPlanCoordinator<A>>,
+    planner: Arc<ConversationPlanner<A>>,
     reply_agent: ReplyAgent<A, L>,
+    session_manager: Arc<ConversationSessionManager>,
     platform: Arc<P>,
 }
 
@@ -37,7 +44,7 @@ impl<A: AIClient, P: PlatformAdapter, L: PromptTemplateLoader> MessageHandler<A,
         memory_manager: Arc<MemoryManager>,
         person_fact_store: Arc<SqlitePersonFactStore>,
         template_loader: Arc<L>,
-        prompt_builder: crate::handlers::prompt_builder::ReplyPromptBuilder<L>,
+        prompt_builder: ReplyPromptBuilder<L>,
     ) -> Self {
         let timing_gate = DefaultTimingGate::new(
             ai_client.clone(),
@@ -47,25 +54,47 @@ impl<A: AIClient, P: PlatformAdapter, L: PromptTemplateLoader> MessageHandler<A,
             "zh-CN",
         );
         let planner_model = config.model.primary_model.clone();
+        let planner = Arc::new(ConversationPlanner::new(ai_client.clone(), &planner_model));
+        let session_mgr = Arc::new(ConversationSessionManager::new());
+        let context_builder = Arc::new(ConversationContextBuilder::default());
+        let plan_coord = Arc::new(ConversationPlanCoordinator::new(
+            planner.clone(),
+            session_mgr.clone(),
+            context_builder,
+            config.identity.name.clone(),
+        ));
+
         Self {
             config,
             timing_gate,
-            planner: ConversationPlanner::new(ai_client.clone(), &planner_model),
-            context_builder: ConversationContextBuilder::default(),
+            plan_coordinator: plan_coord,
+            planner,
             reply_agent: ReplyAgent::new(
                 ai_client,
                 memory_manager,
                 person_fact_store,
                 prompt_builder,
             ),
+            session_manager: session_mgr,
             platform,
         }
     }
 
-    /// 处理入站事件
+    /// 处理入站事件，返回最终回复（若无回复则返回 None）
     pub async fn handle(&self, event: &InboundEvent) -> XueliResult<Option<ReplyAction>> {
-        // 1. Timing Gate
-        use crate::traits::timing_gate::TimingContext;
+        let trace_id =
+            build_trace_id(&event.message.as_ref().map(|m| m.id.as_str()).unwrap_or("0"));
+        let execution_key = get_execution_key(event);
+        let _session_lock = self.session_manager.get_session_lock(&execution_key).await;
+        let _guard = _session_lock.lock().await;
+
+        tracing::info!(
+            trace_id = %trace_id,
+            execution_key = %execution_key,
+            "消息处理开始"
+        );
+
+        // 1. Timing Gate — 决定是否回复
         let ctx = TimingContext {
             event: event.clone(),
             is_mentioned: event
@@ -79,35 +108,44 @@ impl<A: AIClient, P: PlatformAdapter, L: PromptTemplateLoader> MessageHandler<A,
         };
 
         let decision = self.timing_gate.should_reply(&ctx).await?;
-        if !matches!(decision, crate::traits::timing_gate::TimingDecision::Reply) {
+        if !matches!(decision, TimingDecision::Reply) {
+            tracing::debug!(trace_id = %trace_id, "TimingGate 决定不回复");
             return Ok(None);
         }
 
-        // 2. Context Builder — 加载近期对话上下文
+        // 2. PlanCoordinator — 构建上下文并调用规划器
+        let plan_result = self.plan_coordinator.coordinate(event).await?;
+        if !plan_result.should_reply {
+            tracing::debug!(trace_id = %trace_id, "规划器决定不回复");
+            return Ok(None);
+        }
+
+        // 3. ContextBuilder — 为 ReplyAgent 准备上下文
         let context = self
+            .plan_coordinator
             .context_builder
-            .build(
-                event,
-                &crate::core::types::ReplyPlan {
-                    id: String::new(),
-                    target_message_id: String::new(),
-                    topic: None,
-                    style: None,
-                    memory_recall_needed: false,
-                    use_emoji: true,
-                    priority: 0,
-                },
-            )
+            .build(event, &plan_result.reply_plan)
             .await?;
 
-        // 3. Planner — 规划回复策略
-        let plan = self.planner.plan(event, &context).await?;
-
-        // 4. Reply Agent — 生成回复
+        // 4. ReplyAgent — 生成回复文本
         let reply = self
             .reply_agent
-            .generate_reply(event, &context, &plan.reply_reference)
+            .generate_reply(event, &context, &plan_result.reply_reference)
             .await?;
+
+        // 5. 记录到会话管理器
+        let conversation_key = self.session_manager.get_key_for_event(event);
+        self.session_manager
+            .add_message(
+                &conversation_key,
+                "assistant",
+                &reply.reply_text,
+                None,
+                "",
+                "",
+                false,
+            )
+            .await;
 
         let action = ReplyAction {
             scope: event
