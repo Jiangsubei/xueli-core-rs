@@ -1,11 +1,43 @@
 use crate::core::scope::ChatScope;
 use crate::core::types::{MemoryItem, MemoryType};
 
-/// 记忆访问策略 — 决定哪些记忆对当前上下文可见
+/// 记忆元数据的可见性和分类标注
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryVisibility {
+    Private,
+    Shared,
+}
+
+/// 记忆内容的语义分类
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryContentCategory {
+    PersonalInfo,
+    Preference,
+    Relationship,
+    Event,
+    Opinion,
+    Skill,
+    Health,
+    Finance,
+    DailyChat,
+    Generic,
+}
+
+/// 记忆的适用范围
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryApplicabilityScope {
+    SelfOnly,
+    DirectUsers,
+    GroupMembers,
+    Public,
+    Unknown,
+}
+
+/// 记忆访问策略 — 决定哪些记忆对当前上下文可见。
+///
+/// 包含三层过滤：类型过滤、隐私可见性、适用范围。
 pub struct MemoryAccessPolicy {
-    /// 私聊中允许访问的记忆类型
     pub private_allowed_types: Vec<MemoryType>,
-    /// 群聊中允许访问的记忆类型
     pub group_allowed_types: Vec<MemoryType>,
 }
 
@@ -40,10 +72,96 @@ impl MemoryAccessPolicy {
             .cloned()
             .collect()
     }
+
+    /// 去重：按内容文本相同去除重复记忆，保留 importance 最高的
+    pub fn dedupe_entries(memories: &[MemoryItem]) -> Vec<MemoryItem> {
+        use std::collections::HashMap;
+        let mut best: HashMap<String, MemoryItem> = HashMap::new();
+        for m in memories {
+            let key = m.content.trim().to_lowercase();
+            best.entry(key)
+                .and_modify(|existing| {
+                    if m.importance > existing.importance {
+                        *existing = m.clone();
+                    }
+                })
+                .or_insert_with(|| m.clone());
+        }
+        let mut result: Vec<_> = best.into_values().collect();
+        result.sort_by(|a, b| {
+            b.importance
+                .partial_cmp(&a.importance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        result
+    }
+
+    /// 降序排列（按 importance）
+    pub fn sort_by_importance(memories: &mut [MemoryItem]) {
+        memories.sort_by(|a, b| {
+            b.importance
+                .partial_cmp(&a.importance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
 }
 
 impl Default for MemoryAccessPolicy {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn make_item(content: &str, importance: f64, mt: MemoryType) -> MemoryItem {
+        MemoryItem {
+            id: format!("id_{}", content),
+            user_id: "u1".into(),
+            content: content.into(),
+            memory_type: mt,
+            importance,
+            created_at: Utc::now(),
+            last_accessed_at: Utc::now(),
+            access_count: 0,
+        }
+    }
+
+    #[test]
+    fn test_filter_accessible_group_blocks_opinion() {
+        let policy = MemoryAccessPolicy::new();
+        let items = vec![
+            make_item("事实A", 0.8, MemoryType::Fact),
+            make_item("观点B", 0.7, MemoryType::Opinion),
+        ];
+        let filtered = policy.filter_accessible(&items, &ChatScope::Group("g1".into()));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].content, "事实A");
+    }
+
+    #[test]
+    fn test_filter_accessible_private_allows_all() {
+        let policy = MemoryAccessPolicy::new();
+        let items = vec![
+            make_item("事实A", 0.8, MemoryType::Fact),
+            make_item("观点B", 0.7, MemoryType::Opinion),
+            make_item("关系C", 0.6, MemoryType::Relationship),
+        ];
+        let filtered = policy.filter_accessible(&items, &ChatScope::Private);
+        assert_eq!(filtered.len(), 3);
+    }
+
+    #[test]
+    fn test_dedupe_entries() {
+        let items = vec![
+            make_item("一样的内容", 0.5, MemoryType::Fact),
+            make_item("一样的内容", 0.9, MemoryType::Fact),
+        ];
+        let deduped = MemoryAccessPolicy::dedupe_entries(&items);
+        assert_eq!(deduped.len(), 1);
+        assert!((deduped[0].importance - 0.9).abs() < 0.001);
     }
 }
