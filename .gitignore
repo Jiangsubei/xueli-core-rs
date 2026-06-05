@@ -2,3 +2,7 @@
 config.toml
 data/
 *.db
+
+# 忽略ai编程工具配置目录
+.trae/
+.claude/
