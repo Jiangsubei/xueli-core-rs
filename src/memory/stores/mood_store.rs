@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::prelude::XueliResult;
 use crate::core::types::MoodState;
+use crate::prelude::XueliResult;
 
 /// 心情状态持久化存储（SQLite）
 ///

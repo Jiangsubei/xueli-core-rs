@@ -3,9 +3,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
 
-use crate::prelude::XueliResult;
 use crate::core::types::{MemoryItem, MemoryType};
 use crate::memory::stores::traits::MemoryStore;
+use crate::prelude::XueliResult;
 
 /// SQLite 记忆条目存储
 pub struct SqliteMemoryItemStore {

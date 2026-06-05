@@ -2,9 +2,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
-use crate::prelude::XueliResult;
 use crate::core::types::MemoryPatch;
 use crate::memory::manager::MemoryManager;
+use crate::prelude::XueliResult;
 
 /// 记忆流服务 — 异步队列处理记忆提取与持久化
 pub struct MemoryFlowService {

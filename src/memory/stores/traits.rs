@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
-use crate::prelude::XueliResult;
 use crate::core::types::MemoryItem;
+use crate::prelude::XueliResult;
 
 /// 记忆存储 trait — 抽象底层存储实现
 #[async_trait]

@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::warn;
 
-use crate::prelude::XueliResult;
 use crate::memory::extraction::chat_summary::ChatSummaryService;
 use crate::memory::stores::conversation::{ConversationRecord, SqliteConversationStore};
+use crate::prelude::XueliResult;
 use crate::traits::ai_client::AIClient;
 
 /// 会话恢复条目（用于提示词注入）

@@ -141,6 +141,7 @@ mod tests {
             }),
             raw_payload: None,
             received_at: Utc::now(),
+            session: None,
         }
     }
 

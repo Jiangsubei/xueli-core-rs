@@ -2,8 +2,8 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
-use crate::prelude::XueliResult;
 use crate::core::platform_types::InboundEvent;
+use crate::prelude::XueliResult;
 
 /// 每会话串行 worker — 保证同一会话消息串行处理
 pub struct SessionPipeline {

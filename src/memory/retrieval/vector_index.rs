@@ -17,6 +17,14 @@ impl VectorIndex {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.documents.clear();
+    }
+
+    pub fn remove_document(&mut self, doc_id: &str) {
+        self.documents.retain(|(id, _)| id != doc_id);
+    }
+
     /// 添加文档
     pub fn add(&mut self, doc_id: String, text: &str) {
         let vec = self.text_to_vector(text);

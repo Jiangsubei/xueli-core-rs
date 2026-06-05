@@ -25,6 +25,16 @@ impl BM25Index {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.documents.clear();
+        self.avg_doc_len = 0.0;
+    }
+
+    pub fn remove_document(&mut self, doc_id: &str) {
+        self.documents.retain(|(id, _)| id != doc_id);
+        self.update_avg_len();
+    }
+
     /// 添加文档到索引
     pub fn add(&mut self, doc_id: String, text: &str) {
         let tokens: Vec<String> = self

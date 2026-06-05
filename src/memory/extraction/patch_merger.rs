@@ -1,5 +1,5 @@
-use crate::prelude::XueliResult;
 use crate::core::types::MemoryPatch;
+use crate::prelude::XueliResult;
 
 /// 记忆 Patch 合并器 — 将新提取的记忆合并到已有记忆
 ///

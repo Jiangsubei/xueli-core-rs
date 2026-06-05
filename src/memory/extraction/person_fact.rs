@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::prelude::XueliResult;
 use crate::memory::stores::person_fact::PersonFact;
+use crate::prelude::XueliResult;
 use crate::traits::ai_client::{
     AIClient, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
 };

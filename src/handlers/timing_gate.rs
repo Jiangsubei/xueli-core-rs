@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 
-use crate::prelude::XueliResult;
 use crate::core::log_labels::{LOG_PROMPT_DIGEST, LOG_RETRY};
+use crate::prelude::XueliResult;
 use crate::traits::ai_client::{AIClient, ChatCompletionRequest, ChatMessage};
 use crate::traits::prompt_template::PromptTemplateLoader;
 use crate::traits::timing_gate::{TimingContext, TimingDecision, TimingGateStrategy};
@@ -503,6 +503,7 @@ mod tests {
                 }),
                 raw_payload: None,
                 received_at: Utc::now(),
+                session: None,
             },
             is_mentioned: mentioned,
             conversation_active: true,

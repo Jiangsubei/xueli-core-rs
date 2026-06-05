@@ -1,6 +1,6 @@
-use crate::prelude::XueliResult;
 use crate::core::immutable_message_log::{ImmutableMessageLog, PersistentImmutableMessageLog};
 use crate::core::types::{ConversationSnapshot, ImmutableMessage};
+use crate::prelude::XueliResult;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};

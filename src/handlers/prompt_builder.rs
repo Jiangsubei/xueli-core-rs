@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use crate::prelude::XueliResult;
 use crate::core::scope::ChatScope;
+use crate::prelude::XueliResult;
 use crate::traits::prompt_template::PromptTemplateLoader;
 
 /// ReplyAgent 提示词构建器

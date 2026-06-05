@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::prelude::XueliResult;
 use crate::core::types::MemoryItem;
 use crate::memory::retrieval::bm25_index::BM25Index;
 use crate::memory::stores::traits::MemoryStore;
+use crate::prelude::XueliResult;
 
 /// 检索协调器 — 统一编排 BM25 + 向量混合检索
 pub struct RetrievalCoordinator {

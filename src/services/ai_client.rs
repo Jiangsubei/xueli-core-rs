@@ -4,8 +4,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::Semaphore;
 
-use crate::prelude::XueliResult;
 use crate::core::config::ModelConfig;
+use crate::prelude::XueliResult;
 use crate::traits::ai_client::{
     AIClient, ChatCompletionRequest, ChatCompletionResponse, FunctionCall, TokenUsage, ToolCall,
 };
@@ -278,7 +278,8 @@ impl AIClient for DefaultAIClient {
                 return Err(format!(
                     "AI API 请求失败（{} 次重试后）: HTTP {}",
                     max_retries, status
-                ).into());
+                )
+                .into());
             }
 
             // 非 200 → 不重试
@@ -300,10 +301,9 @@ impl AIClient for DefaultAIClient {
                         tokio::time::sleep(Duration::from_secs(delay)).await;
                         continue;
                     }
-                    return Err(format!(
-                        "无法解析 AI 响应（{} 次重试后）: {}",
-                        max_retries, e
-                    ).into());
+                    return Err(
+                        format!("无法解析 AI 响应（{} 次重试后）: {}", max_retries, e).into(),
+                    );
                 }
             };
 

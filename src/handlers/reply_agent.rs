@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::prelude::XueliResult;
 use crate::core::log_labels::{LOG_PROMPT_DIGEST, LOG_RETRY};
 use crate::core::platform_types::InboundEvent;
 use crate::core::scope::ChatScope;
@@ -11,6 +10,7 @@ use crate::handlers::context_builder::ConversationContext;
 use crate::handlers::prompt_builder::ReplyPromptBuilder;
 use crate::memory::manager::MemoryManager;
 use crate::memory::stores::person_fact::SqlitePersonFactStore;
+use crate::prelude::XueliResult;
 use crate::traits::ai_client::{AIClient, ChatCompletionRequest, ChatMessage, MessageContent};
 use crate::traits::prompt_template::PromptTemplateLoader;
 

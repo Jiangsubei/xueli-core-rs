@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::prelude::XueliResult;
 use crate::core::types::MemoryItem;
+use crate::prelude::XueliResult;
 use crate::traits::ai_client::{
     AIClient, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
 };
@@ -132,10 +132,7 @@ impl<A: AIClient> MemoryReflection<A> {
         )
     }
 
-    fn parse_response(
-        &self,
-        response: &ChatCompletionResponse,
-    ) -> XueliResult<ReflectionResult> {
+    fn parse_response(&self, response: &ChatCompletionResponse) -> XueliResult<ReflectionResult> {
         let text = response.content.trim();
         if text.is_empty() {
             return Ok(ReflectionResult {

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use crate::prelude::XueliResult;
 use crate::core::config::ModelConfig;
+use crate::prelude::XueliResult;
 use crate::traits::ai_client::{AIClient, ChatCompletionRequest, ChatMessage};
 
 /// VLM 视觉客户端 — 图片理解

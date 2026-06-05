@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
-use crate::prelude::XueliResult;
 use crate::core::platform_types::{InboundEvent, ReplyAction};
+use crate::prelude::XueliResult;
 
 /// 平台适配器 trait — 下游实现各 IM 平台特有的消息收发
 #[async_trait]

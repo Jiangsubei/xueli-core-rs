@@ -218,6 +218,15 @@ pub struct ProactiveShareConfig {
     pub interval_secs: u64,
 }
 
+impl Default for ProactiveShareConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: 3600,
+        }
+    }
+}
+
 impl Default for XueliConfig {
     fn default() -> Self {
         Self {

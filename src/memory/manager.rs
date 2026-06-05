@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use crate::prelude::XueliResult;
 use crate::core::config::MemoryConfig;
 use crate::core::types::{MemoryItem, MemoryPatch};
 use crate::memory::stores::traits::MemoryStore;
+use crate::prelude::XueliResult;
 
 /// 记忆管理器 — 记忆系统的顶层入口
 pub struct MemoryManager {
