@@ -11,4 +11,5 @@ pub mod reply;
 pub mod reply_agent;
 pub mod session_manager;
 pub mod shared;
+pub mod timeline_formatter;
 pub mod timing_gate;
