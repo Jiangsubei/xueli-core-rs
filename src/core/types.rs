@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -191,4 +193,32 @@ pub struct ConversationSnapshot {
     pub messages: Vec<ImmutableMessage>,
     pub snapshot_time: f64,
     pub created_at: f64,
+}
+
+/// 跨时间线、记忆和引用层共享的结构化上下文条目。
+///
+/// 对应 Python 版 `src.core.models.ConversationContextItem`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationContextItem {
+    pub kind: String,
+    pub text: String,
+    pub role: String,
+    pub speaker_label: String,
+    pub timestamp: f64,
+    pub metadata: HashMap<String, serde_json::Value>,
+    pub count_in_context: bool,
+}
+
+impl ConversationContextItem {
+    pub fn new(kind: &str, text: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            text: text.to_string(),
+            role: "user".to_string(),
+            speaker_label: String::new(),
+            timestamp: 0.0,
+            metadata: HashMap::new(),
+            count_in_context: true,
+        }
+    }
 }
