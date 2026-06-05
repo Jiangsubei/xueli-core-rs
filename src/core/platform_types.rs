@@ -19,6 +19,35 @@ pub struct InboundEvent {
     pub raw_payload: Option<String>,
     /// 接收时间
     pub received_at: DateTime<Utc>,
+    /// 会话引用（由适配器填充，若缺失从 message 推导）
+    pub session: Option<SessionRef>,
+}
+
+impl InboundEvent {
+    /// 从事件信息构造或获取 SessionRef
+    pub fn get_session(&self) -> SessionRef {
+        if let Some(ref s) = self.session {
+            return s.clone();
+        }
+        let (scope, user_id) = if let Some(ref msg) = self.message {
+            (msg.scope.clone(), msg.sender_id.clone())
+        } else {
+            (ChatScope::Private, String::new())
+        };
+        let session_id = match &scope {
+            ChatScope::Private => format!("{}:private:{}", self.platform, user_id),
+            ChatScope::Group(gid) => format!("{}:group:{}", self.platform, gid),
+        };
+        SessionRef {
+            session_id,
+            scope,
+            user_id: if user_id.is_empty() {
+                None
+            } else {
+                Some(user_id)
+            },
+        }
+    }
 }
 
 /// 事件类型
