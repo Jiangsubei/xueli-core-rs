@@ -11,6 +11,7 @@ use crate::prelude::XueliResult;
 pub struct FactEvidence {
     pub id: String,
     pub fact_id: String,
+    pub source_memory_id: String,
     pub conversation_id: String,
     pub message_id: String,
     pub evidence_text: String,
@@ -26,6 +27,7 @@ const INIT_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS fact_evidences (
     id              TEXT PRIMARY KEY,
     fact_id         TEXT NOT NULL,
+    source_memory_id TEXT NOT NULL DEFAULT '',
     conversation_id TEXT NOT NULL,
     message_id      TEXT NOT NULL DEFAULT '',
     evidence_text   TEXT NOT NULL,
@@ -37,17 +39,21 @@ CREATE INDEX IF NOT EXISTS idx_fe_fact_id
 
 CREATE INDEX IF NOT EXISTS idx_fe_conversation
     ON fact_evidences(conversation_id);
+
+CREATE INDEX IF NOT EXISTS idx_fe_source_memory
+    ON fact_evidences(source_memory_id);
 ";
 
 fn row_to_fact_evidence(row: &rusqlite::Row) -> rusqlite::Result<FactEvidence> {
-    let created_at: String = row.get(5)?;
+    let created_at: String = row.get(6)?;
 
     Ok(FactEvidence {
         id: row.get(0)?,
         fact_id: row.get(1)?,
-        conversation_id: row.get(2)?,
-        message_id: row.get(3)?,
-        evidence_text: row.get(4)?,
+        source_memory_id: row.get(2)?,
+        conversation_id: row.get(3)?,
+        message_id: row.get(4)?,
+        evidence_text: row.get(5)?,
         created_at: created_at.parse().unwrap_or_default(),
     })
 }
@@ -78,11 +84,12 @@ impl SqliteFactEvidenceStore {
         let conn = self.conn.lock().map_err(|e| format!("锁错误: {e}"))?;
         conn.execute(
             "INSERT OR REPLACE INTO fact_evidences
-             (id, fact_id, conversation_id, message_id, evidence_text, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (id, fact_id, source_memory_id, conversation_id, message_id, evidence_text, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 evidence.id,
                 evidence.fact_id,
+                evidence.source_memory_id,
                 evidence.conversation_id,
                 evidence.message_id,
                 evidence.evidence_text,
@@ -98,13 +105,34 @@ impl SqliteFactEvidenceStore {
         let conn = self.conn.lock().map_err(|e| format!("锁错误: {e}"))?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, fact_id, conversation_id, message_id, evidence_text, created_at
+                "SELECT id, fact_id, source_memory_id, conversation_id, message_id, evidence_text, created_at
                  FROM fact_evidences WHERE fact_id = ?1 ORDER BY created_at DESC",
             )
             .map_err(|e| format!("准备查询失败: {e}"))?;
 
         let rows = stmt
             .query_map(params![fact_id], row_to_fact_evidence)
+            .map_err(|e| format!("查询失败: {e}"))?;
+
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row.map_err(|e| format!("读取行失败: {e}"))?);
+        }
+        Ok(items)
+    }
+
+    /// 按用户 ID 获取所有证据
+    pub async fn get_by_user(&self, user_id: &str) -> XueliResult<Vec<FactEvidence>> {
+        let conn = self.conn.lock().map_err(|e| format!("锁错误: {e}"))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, fact_id, source_memory_id, conversation_id, message_id, evidence_text, created_at
+                 FROM fact_evidences WHERE fact_id = ?1 ORDER BY created_at DESC",
+            )
+            .map_err(|e| format!("准备查询失败: {e}"))?;
+
+        let rows = stmt
+            .query_map(params![user_id], row_to_fact_evidence)
             .map_err(|e| format!("查询失败: {e}"))?;
 
         let mut items = Vec::new();
@@ -122,7 +150,7 @@ impl SqliteFactEvidenceStore {
         let conn = self.conn.lock().map_err(|e| format!("锁错误: {e}"))?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, fact_id, conversation_id, message_id, evidence_text, created_at
+                "SELECT id, fact_id, source_memory_id, conversation_id, message_id, evidence_text, created_at
                  FROM fact_evidences WHERE conversation_id = ?1 ORDER BY created_at DESC",
             )
             .map_err(|e| format!("准备查询失败: {e}"))?;
@@ -158,6 +186,7 @@ mod tests {
         FactEvidence {
             id: id.to_string(),
             fact_id: fact_id.to_string(),
+            source_memory_id: fact_id.to_string(),
             conversation_id: conv_id.to_string(),
             message_id: "msg1".to_string(),
             evidence_text: text.to_string(),

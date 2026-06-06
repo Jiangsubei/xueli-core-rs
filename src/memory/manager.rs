@@ -91,11 +91,19 @@ mod tests {
 
     fn test_config() -> MemoryConfig {
         MemoryConfig {
+            enabled: true,
             db_path: ":memory:".to_string(),
+            storage_backend: "sqlite".to_string(),
             extraction_min_messages: 5,
             bm25_top_k: 10,
             vector_top_k: 5,
+            rerank_top_k: 20,
+            dynamic_memory_limit: 8,
             dispute: Default::default(),
+            auto_extract: true,
+            extract_every_n_turns: 3,
+            decay: Default::default(),
+            retrieval_weights: Default::default(),
         }
     }
 

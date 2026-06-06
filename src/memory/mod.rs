@@ -1,8 +1,10 @@
+pub mod chat_summary_service;
 pub mod extraction;
 pub mod flow_service;
 pub mod internal;
 pub mod manager;
 pub mod memory_dispute_resolver;
+pub mod person_fact_service;
 pub mod recall_service;
 pub mod retrieval;
 pub mod session_restore_service;

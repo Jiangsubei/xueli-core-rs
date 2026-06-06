@@ -149,11 +149,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_background_coordinator_start_stop() {
         let config = Arc::new(MemoryConfig {
+            enabled: true,
             db_path: ":memory:".to_string(),
+            storage_backend: "sqlite".to_string(),
             extraction_min_messages: 5,
             bm25_top_k: 10,
             vector_top_k: 10,
+            rerank_top_k: 20,
+            dynamic_memory_limit: 8,
             dispute: Default::default(),
+            auto_extract: true,
+            extract_every_n_turns: 3,
+            decay: Default::default(),
+            retrieval_weights: Default::default(),
         });
         let coordinator = BackgroundCoordinator::new(config);
         assert!(!coordinator.is_running().await);
@@ -186,11 +194,19 @@ mod tests {
     #[tokio::test]
     async fn test_duplicate_start_prevented() {
         let config = Arc::new(MemoryConfig {
+            enabled: true,
             db_path: ":memory:".to_string(),
+            storage_backend: "sqlite".to_string(),
             extraction_min_messages: 5,
             bm25_top_k: 10,
             vector_top_k: 10,
+            rerank_top_k: 20,
+            dynamic_memory_limit: 8,
             dispute: Default::default(),
+            auto_extract: true,
+            extract_every_n_turns: 3,
+            decay: Default::default(),
+            retrieval_weights: Default::default(),
         });
         let coordinator = BackgroundCoordinator::new(config);
         coordinator.start(60).await;

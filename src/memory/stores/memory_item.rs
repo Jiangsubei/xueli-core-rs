@@ -91,6 +91,24 @@ impl SqliteMemoryItemStore {
             conn: Mutex::new(conn),
         })
     }
+
+    /// 按 ID 获取记忆（直接方法，无需通过 trait）
+    pub async fn get_by_id(&self, id: &str) -> XueliResult<Option<MemoryItem>> {
+        let conn = self.conn.lock().map_err(|e| format!("锁错误: {e}"))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, user_id, content, memory_type, importance, created_at, last_accessed_at, access_count
+                 FROM memory_items WHERE id = ?1",
+            )
+            .map_err(|e| format!("准备查询失败: {e}"))?;
+
+        let result = stmt
+            .query_row(params![id], row_to_memory_item)
+            .optional()
+            .map_err(|e| format!("查询失败: {e}"))?;
+
+        Ok(result)
+    }
 }
 
 #[async_trait]

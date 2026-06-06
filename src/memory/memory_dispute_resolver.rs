@@ -182,6 +182,7 @@ mod tests {
             enabled: true,
             high_confidence_threshold: 0.75,
             normal_confidence_threshold: 0.45,
+            signal_ttl_hours: 168.0,
         }
     }
 
