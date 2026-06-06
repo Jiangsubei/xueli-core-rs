@@ -151,7 +151,7 @@ mod tests {
                             .to_string(),
                     )
                 } else {
-                    Err(XueliError::Template("not found".to_string()))
+                    Err(XueliError::Template(crate::core::errors::TemplateError::NotFound("not found".to_string())))
                 }
             }
         }

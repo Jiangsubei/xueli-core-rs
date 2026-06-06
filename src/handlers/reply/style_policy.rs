@@ -6,7 +6,7 @@ use crate::traits::prompt_template::PromptTemplateLoader;
 /// 最终风格指引 — 注入 ReplyAgent 的 system prompt 动态部分
 ///
 /// 对应 Python 版 `FinalStyleGuide`
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct FinalStyleGuide {
     pub verbosity_guidance: String,
     pub warmth_guidance: String,
@@ -22,7 +22,7 @@ pub struct FinalStyleGuide {
 }
 
 /// 角色卡快照（用于风格策略）
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CharacterCardSnapshot {
     pub tone_preferences: Vec<String>,
     pub behavior_habits: Vec<String>,
@@ -31,7 +31,7 @@ pub struct CharacterCardSnapshot {
 }
 
 /// 软不确定性信号（记忆可靠性相关）
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SoftUncertaintySignal {
     pub reason: String,
 }

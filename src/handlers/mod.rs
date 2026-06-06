@@ -1,5 +1,6 @@
 pub mod command;
 pub mod context_builder;
+pub mod conversation;
 pub mod group_collector;
 pub mod image_pipeline;
 pub mod message_handler;

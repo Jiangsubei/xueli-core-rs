@@ -25,7 +25,7 @@ pub struct PlanResult {
 }
 
 /// 提示词区段编译开关 — 对应 Python 版 `PromptSectionPolicy`
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PromptSectionPolicy {
     pub include_recent_history: bool,
     pub include_person_facts: bool,
@@ -53,7 +53,7 @@ impl Default for PromptSectionPolicy {
 }
 
 /// 提示词计划 — 对应 Python 版 `PromptPlan`，指导 ReplyAgent 如何构建回复
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PromptPlan {
     pub reply_goal: String,
     pub continuity_mode: String,
