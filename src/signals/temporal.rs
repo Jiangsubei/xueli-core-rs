@@ -1,7 +1,7 @@
 // 时间上下文信号 — 规划和提示词编译使用的时间间隔信号
 ///
 /// 对应 Python 版 `xueli/src/handlers/signals/temporal_context.py`
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TemporalContext {
     pub current_event_time: f64,
     pub previous_message_time: f64,

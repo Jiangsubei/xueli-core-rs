@@ -24,4 +24,12 @@ impl ChatScope {
             ChatScope::Private => None,
         }
     }
+
+    /// 获取私聊场景下的用户 ID（仅 Private 有效）
+    pub fn user_id(&self) -> Option<&str> {
+        match self {
+            ChatScope::Private => None,
+            ChatScope::Group(_) => None,
+        }
+    }
 }

@@ -20,6 +20,9 @@ impl EventDispatcher {
     pub fn dispatch(&self, event: InboundEvent) -> XueliResult<()> {
         self.event_tx
             .send(event)
-            .map_err(|e| crate::core::errors::XueliError::Pipeline(format!("事件分发失败: {}", e)))
+            .map_err(|e| crate::core::errors::XueliError::pipeline(
+                crate::core::errors::PipelineErrorCategory::PipelineExecution,
+                format!("事件分发失败: {}", e)
+            ))
     }
 }
