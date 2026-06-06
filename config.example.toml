@@ -1,79 +1,157 @@
-# =============================================================================
-# xueli-core 配置文件示例
-# =============================================================================
-# 复制为 config.toml 并填写实际值后使用。
-# config.toml 包含敏感信息（api_key），已在 .gitignore 中排除。
-# =============================================================================
+# xueli-core 配置示例
+# 对应 Python 版 config/config.example.toml
 
-# -----------------------------------------------------------------------------
-# AI 模型配置
-# -----------------------------------------------------------------------------
 [model]
-primary_model = "gpt-4o"           # 主要模型（用于 ReplyAgent 主回复）
-light_model = "gpt-4o-mini"        # 轻量模型（用于 TimingGate / Planner / Rerank）
-vision_model = "gpt-4o"            # VLM 视觉模型（可选）
-api_base = "https://api.openai.com/v1"  # API 地址
-api_key = ""                       # API Key（必填）
-temperature = 0.7                  # 默认 temperature
-max_tokens = 4096                  # 最大输出 token
-context_window = 128000            # 上下文窗口（token）
-timeout = 120                      # 请求超时（秒）
-response_path = "choices.0.message.content"  # 响应 JSON path
-max_concurrency = 5                # 最大并发请求数
-max_retries = 3                    # 最大重试次数
+primary_model = "gpt-4o"
+light_model = "gpt-4o-mini"
+vision_model = "gpt-4o"
+api_base = "https://api.openai.com/v1"
+api_key = "YOUR_API_KEY"
+temperature = 0.7
+max_tokens = 4096
+context_window = 128000
+timeout = 120
+response_path = "choices.0.message.content"
+max_concurrency = 5
+max_retries = 3
 
-# -----------------------------------------------------------------------------
-# 回复行为配置
-# -----------------------------------------------------------------------------
+[vision]
+enabled = false
+# api_base = "https://api.openai.com/v1"  # 默认使用 model.api_base
+# api_key = "YOUR_API_KEY"                # 默认使用 model.api_key
+# model = "gpt-4o"                        # 默认使用 model.primary_model
+context_window = 32000
+# response_path = "choices.0.message.content"
+
 [reply]
-group_cooldown_secs = 10.0         # 群聊冷却间隔（秒）
-private_cooldown_secs = 3.0        # 私聊冷却间隔（秒）
-max_context_messages = 50          # 上下文窗口最大消息数
-max_reply_chars = 500              # 单次回复最大字符数
+group_cooldown_secs = 10.0
+private_cooldown_secs = 3.0
+max_context_messages = 50
+max_reply_chars = 500
 
-# -----------------------------------------------------------------------------
-# 记忆系统配置
-# -----------------------------------------------------------------------------
+[bot_behavior]
+context_token_budget_ratio = 0.7
+token_encoding = "cl100k_base"
+max_message_length = 4000
+response_timeout = 60
+rate_limit_interval = 1.0
+log_full_prompt = false
+private_quote_reply_enabled = false
+private_batch_window_seconds = 1.2
+segmented_reply_enabled = true
+max_segments = 3
+first_segment_delay_min_ms = 0
+first_segment_delay_max_ms = 0
+followup_delay_min_seconds = 2.0
+followup_delay_max_seconds = 5.0
+# purpose_timeouts = { extraction = 30, rerank = 20 }
+
 [memory]
-db_path = "data/xueli_memory.db"   # SQLite 数据库路径
-extraction_min_messages = 5        # 触发记忆提取的最小消息数
-bm25_top_k = 10                    # BM25 检索返回数
-vector_top_k = 5                   # 向量检索返回数
+enabled = false
+db_path = "data/xueli_memory.db"
+storage_backend = "sqlite"
+extraction_min_messages = 5
+bm25_top_k = 10
+vector_top_k = 5
+rerank_top_k = 20
+dynamic_memory_limit = 8
+auto_extract = true
+extract_every_n_turns = 3
 
-# -----------------------------------------------------------------------------
-# Timing Gate 配置
-# -----------------------------------------------------------------------------
+[memory.decay]
+ordinary_decay_enabled = true
+ordinary_half_life_days = 30.0
+ordinary_forget_threshold = 0.5
+cold_memory_threshold_days = 90.0
+cold_decay_multiplier = 1.5
+
+[memory.retrieval_weights]
+local_bm25_weight = 1.0
+local_importance_weight = 0.35
+local_mention_weight = 0.2
+local_recency_weight = 0.15
+local_scene_weight = 0.3
+vector_weight = 0.4
+
+[memory.dispute]
+enabled = true
+high_confidence_threshold = 0.75
+normal_confidence_threshold = 0.45
+signal_ttl_hours = 168.0
+
 [timing_gate]
-default_proactive_probability = 0.3    # 默认主动回复概率
-mention_reply_probability = 0.95       # 被 @ 时回复概率
+default_proactive_probability = 0.3
+mention_reply_probability = 0.95
 
-# -----------------------------------------------------------------------------
-# 会话配置
-# -----------------------------------------------------------------------------
+[planning_window]
+enabled = true
+private_window_seconds = 1.2
+group_proactive_window_seconds = 0.45
+queue_expire_seconds = 60.0
+
 [session]
-session_timeout_secs = 3600        # 会话超时（秒）
-max_concurrent_messages = 10       # 每会话最大并发消息
+session_timeout_secs = 3600
+max_concurrent_messages = 10
 
-# -----------------------------------------------------------------------------
-# 表情系统配置
-# -----------------------------------------------------------------------------
 [emoji]
-enabled = true                     # 是否启用表情系统
-# db_path = "data/emoji.db"        # 表情数据库路径（可选）
+enabled = true
+db_path = "data/emoji.db"
+capture_enabled = true
+classification_enabled = true
+idle_seconds_before_classify = 45.0
+classification_interval_seconds = 30.0
+reply_enabled = false
+reply_cooldown_seconds = 180.0
+max_stored_emojis = 100
+overflow_policy = "replace_oldest"
 
-# -----------------------------------------------------------------------------
-# 主动分享配置
-# -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
-# 身份配置
-# -----------------------------------------------------------------------------
-[identity]
-name = "雪梨"                       # 助手名称
-alias = "小梨"                      # 助手别名
-
-# -----------------------------------------------------------------------------
-# 主动分享配置
-# -----------------------------------------------------------------------------
 [proactive_share]
-enabled = false                    # 是否启用主动分享（默认关闭）
-interval_secs = 3600               # 分享间隔（秒）
+enabled = false
+idle_hours = 24.0
+cooldown_hours = 6.0
+max_per_day = 3
+time_range_start = "09:00"
+time_range_end = "22:00"
+trigger_sources = ["insight", "time_signal"]
+interval_secs = 3600
+
+[identity]
+name = "雪梨"
+alias = ""
+avatar_path = ""
+
+[character_growth]
+enabled = true
+mood_fluctuation_enabled = true
+mood_volatility = 0.3
+mood_independence_ratio = 0.7
+mood_energy_decay_per_turn = 0.05
+mood_energy_recovery_night = 0.2
+mood_valence_decay_rate = 0.15
+mood_recovery_rate = 0.4
+mood_cycle_length_days = 7
+mood_show_in_reply = true
+relationship_tracking_enabled = true
+
+[group_reply]
+only_reply_when_at = true
+interest_reply_enabled = true
+plan_request_interval = 3.0
+plan_request_max_parallel = 1
+at_user_when_proactive_reply = false
+group_wait_window_seconds = 5.0
+reply_probability = 1.0
+trigger_threshold = 1
+idle_grace_seconds = 300.0
+debounce_seconds = 1.0
+debounce_max_resets = 5
+base_frequency = 1.0
+saturation_log_factor = 1.2
+# time_rules = { "00:00-06:00" = 0.3 }
+# group_overrides = { "123456789" = 0.8 }
+
+[adapter_connection]
+adapter = "napcat"
+platform = "qq"
+ws_url = "ws://0.0.0.0:8095"
+http_url = "http://127.0.0.1:6700"
