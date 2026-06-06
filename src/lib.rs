@@ -1,8 +1,10 @@
+pub mod adapters;
 pub mod character;
 pub mod core;
 pub mod emoji;
 pub mod handlers;
 pub mod memory;
+pub mod plugins;
 pub mod proactive_share;
 pub mod services;
 pub mod signals;
