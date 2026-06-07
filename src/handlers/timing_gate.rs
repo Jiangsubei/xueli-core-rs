@@ -62,6 +62,7 @@ pub struct ConversationWindow {
 struct CachedDecision {
     action: TimingDecision,
     reason: String,
+    #[allow(dead_code)]
     planning_signals: PlanningSignals,
     cached_at: Instant,
     ttl: Duration,
@@ -410,6 +411,8 @@ impl<A: AIClient, L: PromptTemplateLoader> TimingGateStrategy for DefaultTimingG
                 temperature: Some(0.1),
                 max_tokens: Some(512),
                 stream: false,
+                tools: None,
+                tool_choice: None,
                 extra_params: HashMap::new(),
             };
 

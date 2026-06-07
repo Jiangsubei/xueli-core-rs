@@ -32,6 +32,7 @@ pub struct MemoryContextResult {
 
 /// Reply 流水线 — 负责在 ReplyAgent 执行前加载并格式化所有记忆上下文
 pub struct ReplyPipeline {
+    #[allow(dead_code)]
     config: Arc<XueliConfig>,
     memory_manager: Option<Arc<MemoryManager>>,
     conversation_store: Option<Arc<SqliteConversationStore>>,

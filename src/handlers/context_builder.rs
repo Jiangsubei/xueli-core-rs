@@ -1,9 +1,14 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::character::card_service::{CharacterCardService, CharacterCardSnapshot};
+use crate::character::narrative::NarrativeService;
 use crate::core::platform_types::InboundEvent;
 use crate::core::scope::ChatScope;
 use crate::core::types::ReplyPlan;
+use crate::handlers::reply::style_policy::{FinalStyleGuide, SoftUncertaintySignal};
 use crate::handlers::session_manager::ConversationSessionManager;
+use crate::memory::manager::MemoryManager;
 use crate::memory::stores::conversation::{ConversationRecord, SqliteConversationStore};
 use crate::prelude::XueliResult;
 
@@ -26,8 +31,8 @@ pub struct ConversationContext {
     pub is_first_turn: bool,
     /// 人物事实上下文
     pub person_facts: Option<Vec<String>>,
-    /// 长期记忆上下文
-    pub memories: Option<Vec<String>>,
+    /// 长期记忆上下文（持久记忆）
+    pub persistent_memory_context: Option<String>,
     /// 动态记忆（近期相关）
     pub dynamic_memory: Option<String>,
     /// 会话恢复上下文
@@ -42,12 +47,36 @@ pub struct ConversationContext {
     pub follows_assistant_recently: bool,
     /// 近期对话消息数（不含当前）
     pub recent_message_count: usize,
+    /// 角色卡快照（当前用户）
+    pub character_card_snapshot: Option<CharacterCardSnapshot>,
+    /// 叙事线摘要
+    pub narrative_thread_summary: Option<String>,
+    /// 叙事线标签
+    pub narrative_thread_label: Option<String>,
+    /// 长期相处脉络（叙事自我）
+    pub narrative_self: Option<HashMap<String, String>>,
+    /// 谨慎度信号
+    pub caution_signal: Option<HashMap<String, String>>,
+    /// 规划信号
+    pub planning_signals: Option<HashMap<String, String>>,
+    /// 用户情绪标签
+    pub user_emotion_label: Option<String>,
+    /// 风格指引（最终）
+    pub style_guide: Option<FinalStyleGuide>,
+    /// 软不确定性信号
+    pub soft_uncertainty_signals: Option<Vec<SoftUncertaintySignal>>,
 }
 
 /// 会话上下文构建器 — 从存储和会话管理器加载历史，构建完整上下文。
+///
+/// 集成 MemoryManager、CharacterCardService、NarrativeService、
+/// ReplyStylePolicy 等组件，对应 Python 版 `ConversationContextBuilder`。
 pub struct ConversationContextBuilder {
     store: Arc<SqliteConversationStore>,
     session_manager: Option<Arc<ConversationSessionManager>>,
+    memory_manager: Option<Arc<MemoryManager>>,
+    character_card_service: Option<Arc<CharacterCardService>>,
+    narrative_service: Option<Arc<NarrativeService>>,
 }
 
 impl ConversationContextBuilder {
@@ -55,12 +84,33 @@ impl ConversationContextBuilder {
         Self {
             store,
             session_manager: None,
+            memory_manager: None,
+            character_card_service: None,
+            narrative_service: None,
         }
     }
 
     /// 设置会话管理器（用于内存会话追踪）
     pub fn with_session_manager(mut self, mgr: Arc<ConversationSessionManager>) -> Self {
         self.session_manager = Some(mgr);
+        self
+    }
+
+    /// 设置记忆管理器（用于记忆上下文加载）
+    pub fn with_memory_manager(mut self, mgr: Arc<MemoryManager>) -> Self {
+        self.memory_manager = Some(mgr);
+        self
+    }
+
+    /// 设置角色卡服务（用于加载角色快照）
+    pub fn with_character_card_service(mut self, svc: Arc<CharacterCardService>) -> Self {
+        self.character_card_service = Some(svc);
+        self
+    }
+
+    /// 设置叙事服务（用于加载叙事线）
+    pub fn with_narrative_service(mut self, svc: Arc<NarrativeService>) -> Self {
+        self.narrative_service = Some(svc);
         self
     }
 
@@ -114,9 +164,7 @@ impl ConversationContextBuilder {
                 } else {
                     None
                 };
-                // 检查最近是否有助手发言
                 let follows = msgs.last().map(|m| m.role == "assistant").unwrap_or(false);
-                // 连续性判断
                 let cont = if msgs.len() >= 2 {
                     Some("soft_continuation".to_string())
                 } else {
@@ -138,6 +186,26 @@ impl ConversationContextBuilder {
             None
         };
 
+        // 加载记忆上下文（通过 MemoryManager）
+        let (person_facts, persistent_memory, precise_recall) =
+            self.load_memory_context(&user_id).await;
+
+        // 加载角色卡快照
+        let character_card_snapshot = self.load_character_card_snapshot(&user_id);
+
+        // 加载叙事线
+        let (narrative_thread_summary, narrative_thread_label, narrative_self) =
+            self.load_narrative_thread(&user_id);
+
+        // 构建谨慎度信号
+        let caution_signal = self.build_caution_signal(
+            &person_facts,
+            &persistent_memory,
+            &precise_recall,
+            &dynamic_memory,
+            None,
+        );
+
         Ok(ConversationContext {
             user_message,
             recent_messages,
@@ -146,16 +214,251 @@ impl ConversationContextBuilder {
             scope,
             is_group,
             is_first_turn,
-            person_facts: None,
-            memories: None,
+            person_facts,
+            persistent_memory_context: persistent_memory,
             dynamic_memory,
             session_restore,
-            precise_recall: None,
+            precise_recall,
             vision_description: None,
             continuity_hint: continuity,
             follows_assistant_recently: follows_assistant,
             recent_message_count,
+            character_card_snapshot,
+            narrative_thread_summary,
+            narrative_thread_label,
+            narrative_self,
+            caution_signal,
+            planning_signals: None,
+            user_emotion_label: None,
+            style_guide: None,
+            soft_uncertainty_signals: None,
         })
+    }
+
+    /// 通过 MemoryManager 加载记忆上下文
+    async fn load_memory_context(
+        &self,
+        user_id: &str,
+    ) -> (Option<Vec<String>>, Option<String>, Option<String>) {
+        let mm = match &self.memory_manager {
+            Some(m) => m,
+            None => return (None, None, None),
+        };
+
+        // 人物事实
+        let person_facts: Option<Vec<String>> = match mm.get_by_user(user_id).await {
+            Ok(items) => {
+                let facts: Vec<String> = items
+                    .iter()
+                    .filter(|item| {
+                        matches!(
+                            item.memory_type,
+                            crate::core::types::MemoryType::Fact
+                                | crate::core::types::MemoryType::Preference
+                                | crate::core::types::MemoryType::Relationship
+                        )
+                    })
+                    .take(6)
+                    .map(|item| item.content.clone())
+                    .collect();
+                if facts.is_empty() {
+                    None
+                } else {
+                    Some(facts)
+                }
+            }
+            Err(_) => None,
+        };
+
+        // 持久记忆（按重要度排序）
+        let persistent_memory: Option<String> = match mm.get_by_user(user_id).await {
+            Ok(items) => {
+                let mut important: Vec<_> = items
+                    .iter()
+                    .filter(|item| item.importance > 0.5)
+                    .cloned()
+                    .collect();
+                important.sort_by(|a, b| {
+                    b.importance
+                        .partial_cmp(&a.importance)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let lines: Vec<String> = important
+                    .iter()
+                    .take(5)
+                    .map(|item| item.content.clone())
+                    .collect();
+                if lines.is_empty() {
+                    None
+                } else {
+                    Some(
+                        crate::handlers::reply::pipeline::ReplyPipeline::format_memory_context(
+                            &lines,
+                        ),
+                    )
+                }
+            }
+            Err(_) => None,
+        };
+
+        // 精确回忆（搜索与当前用户消息相关的记忆）
+        let precise_recall: Option<String> = None; // 由调用方按需注入
+
+        (person_facts, persistent_memory, precise_recall)
+    }
+
+    /// 通过 CharacterCardService 加载角色卡快照
+    fn load_character_card_snapshot(&self, user_id: &str) -> Option<CharacterCardSnapshot> {
+        let svc = self.character_card_service.as_ref()?;
+        let snap = svc.get_snapshot(user_id);
+        // 仅当有实际内容时返回
+        if snap.core_traits.is_empty()
+            && snap.tone_preferences.is_empty()
+            && snap.bot_persona_hints.is_empty()
+            && snap.emotional_trend.is_empty()
+        {
+            None
+        } else {
+            Some(snap)
+        }
+    }
+
+    /// 通过 NarrativeService 加载叙事线程
+    fn load_narrative_thread(
+        &self,
+        user_id: &str,
+    ) -> (
+        Option<String>,
+        Option<String>,
+        Option<HashMap<String, String>>,
+    ) {
+        let svc = match &self.narrative_service {
+            Some(s) => s,
+            None => return (None, None, None),
+        };
+
+        let thread = svc.get_thread(user_id);
+        let summary = if thread.summary.is_empty() {
+            None
+        } else {
+            Some(thread.summary.clone())
+        };
+        let label = if thread.theme.is_empty() || thread.theme == "default" {
+            None
+        } else {
+            Some(thread.theme.clone())
+        };
+
+        // 构建叙事自我（narrative_self）
+        let narrative_self: Option<HashMap<String, String>> = {
+            let story: String = thread
+                .events
+                .iter()
+                .rev()
+                .take(5)
+                .map(|e| e.description.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if story.is_empty() {
+                None
+            } else {
+                let mut map = HashMap::new();
+                map.insert("relationship_story".to_string(), story);
+                map.insert(
+                    "turn_count".to_string(),
+                    thread.turn_count_since_last_update.to_string(),
+                );
+                Some(map)
+            }
+        };
+
+        (summary, label, narrative_self)
+    }
+
+    /// 构建谨慎度信号 — 基于记忆可用性、不确定性等条件
+    ///
+    /// 返回 {caution_level, caution_reasons, reply_guidance} 的映射
+    fn build_caution_signal(
+        &self,
+        person_facts: &Option<Vec<String>>,
+        persistent_memory: &Option<String>,
+        precise_recall: &Option<String>,
+        dynamic_memory: &Option<String>,
+        _soft_uncertainty_signals: Option<&[SoftUncertaintySignal]>,
+    ) -> Option<HashMap<String, String>> {
+        let mut reasons: Vec<String> = Vec::new();
+        let mut guidance: Vec<String> = Vec::new();
+
+        // 检查记忆上下文是否全部为空
+        let has_person_facts = person_facts
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        let has_persistent = persistent_memory
+            .as_ref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let has_precise = precise_recall
+            .as_ref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let has_dynamic = dynamic_memory
+            .as_ref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+
+        let memory_available = has_person_facts || has_persistent || has_precise || has_dynamic;
+
+        if !memory_available {
+            reasons.push("memory_context_empty".to_string());
+            guidance.push("没有可靠记忆依据时，避免假装记得细节。".to_string());
+        }
+
+        // 无原因则返回低谨慎度
+        let unique_reasons: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            reasons
+                .into_iter()
+                .filter(|r| seen.insert(r.clone()))
+                .collect()
+        };
+
+        if unique_reasons.is_empty() {
+            return None;
+        }
+
+        let high_reasons: std::collections::HashSet<&str> = [
+            "soft_uncertainty",
+            "low_emotional_safety",
+            "high_interruption_risk",
+            "negative_feedback_history",
+        ]
+        .iter()
+        .cloned()
+        .collect();
+
+        let level = if unique_reasons
+            .iter()
+            .any(|r| high_reasons.contains(r.as_str()))
+        {
+            "high"
+        } else {
+            "medium"
+        };
+
+        let mut map = HashMap::new();
+        map.insert("caution_level".to_string(), level.to_string());
+        map.insert("caution_reasons".to_string(), unique_reasons.join(","));
+        let deduped_guidance: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            guidance
+                .into_iter()
+                .filter(|g| seen.insert(g.clone()))
+                .collect()
+        };
+        map.insert("reply_guidance".to_string(), deduped_guidance.join("；"));
+
+        Some(map)
     }
 }
 

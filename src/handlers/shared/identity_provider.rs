@@ -6,8 +6,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::core::config::XueliConfig;
-use crate::core::errors::XueliError;
-use crate::prelude::XueliResult;
 use crate::traits::prompt_template::PromptTemplateLoader;
 
 /// 提供助手名称/别名和身份提示文本
@@ -126,6 +124,7 @@ impl<L: PromptTemplateLoader> IdentityProvider<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prelude::{XueliError, XueliResult};
     use crate::traits::prompt_template::PromptTemplateMap;
     use std::collections::HashMap;
     use std::future::Future;
@@ -151,7 +150,9 @@ mod tests {
                             .to_string(),
                     )
                 } else {
-                    Err(XueliError::Template(crate::core::errors::TemplateError::NotFound("not found".to_string())))
+                    Err(XueliError::Template(
+                        crate::core::errors::TemplateError::NotFound("not found".to_string()),
+                    ))
                 }
             }
         }

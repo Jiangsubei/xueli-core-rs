@@ -39,6 +39,7 @@ pub struct ReplyEffectScore {
 #[derive(Debug, Clone)]
 pub struct ReplyEffectTracker {
     observation_window_seconds: f64,
+    #[allow(dead_code)]
     followup_limit: usize,
     pending: HashMap<String, PendingEvaluation>,
 }

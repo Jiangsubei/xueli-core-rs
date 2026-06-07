@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::core::config::XueliConfig;
 use crate::core::message_trace::{build_trace_id, get_execution_key};
 use crate::core::platform_types::{InboundEvent, ReplyAction};
-use crate::handlers::context_builder::{ConversationContext, ConversationContextBuilder};
+use crate::handlers::context_builder::ConversationContextBuilder;
 use crate::handlers::plan_coordinator::ConversationPlanCoordinator;
 use crate::handlers::planner::ConversationPlanner;
 use crate::handlers::prompt_builder::ReplyPromptBuilder;
@@ -27,12 +27,15 @@ pub struct MessageHandler<
     P: PlatformAdapter,
     L: PromptTemplateLoader = NoopPromptTemplateLoader,
 > {
+    #[allow(dead_code)]
     config: Arc<XueliConfig>,
     timing_gate: DefaultTimingGate<A, L>,
     plan_coordinator: Arc<ConversationPlanCoordinator<A>>,
+    #[allow(dead_code)]
     planner: Arc<ConversationPlanner<A>>,
     reply_agent: ReplyAgent<A, L>,
     session_manager: Arc<ConversationSessionManager>,
+    #[allow(dead_code)]
     platform: Arc<P>,
 }
 
@@ -55,7 +58,7 @@ impl<A: AIClient, P: PlatformAdapter, L: PromptTemplateLoader> MessageHandler<A,
         );
         let planner_model = config.model.primary_model.clone();
         let planner = Arc::new(ConversationPlanner::new(ai_client.clone(), &planner_model));
-        let session_mgr = Arc::new(ConversationSessionManager::new());
+        let session_mgr = Arc::new(ConversationSessionManager::new(None));
         let context_builder = Arc::new(ConversationContextBuilder::default());
         let plan_coord = Arc::new(ConversationPlanCoordinator::new(
             planner.clone(),
@@ -65,11 +68,12 @@ impl<A: AIClient, P: PlatformAdapter, L: PromptTemplateLoader> MessageHandler<A,
         ));
 
         Self {
-            config,
+            config: config.clone(),
             timing_gate,
             plan_coordinator: plan_coord,
             planner,
             reply_agent: ReplyAgent::new(
+                config,
                 ai_client,
                 memory_manager,
                 person_fact_store,
