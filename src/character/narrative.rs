@@ -141,6 +141,7 @@ impl NarrativeService {
         NarrativeThread::new(user_id, "default")
     }
 
+    #[allow(dead_code)]
     fn save_one(&self, user_id: &str) {
         let data_str = {
             let threads = self.threads.lock().unwrap();

@@ -43,7 +43,7 @@ impl EmojiReplyService {
 impl Default for EmojiReplyService {
     fn default() -> Self {
         // 默认构造（不含数据）
-        let db = crate::emoji::database::EmojiDB::new("data/emojis.json");
+        let db = crate::emoji::database::EmojiDB::new("data/emojis");
         Self::new(EmojiManager::new(db))
     }
 }
