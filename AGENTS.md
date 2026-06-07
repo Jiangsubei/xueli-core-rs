@@ -199,7 +199,7 @@ InboundEvent
 > - **骨架**：仅有数据结构和空方法/`// TODO` 占位
 > - **未移植**：尚无对应 Rust 文件（分"意图性不移植"和"待移植"）
 >
-> 完整对照分析见 [对照分析报告](#对照分析报告) 节。
+> 最后更新：2026-06-08（大规模移植补全后）
 
 ### 完整（功能对等，有测试覆盖）
 
@@ -210,77 +210,91 @@ InboundEvent
 | 元认知监控（MetacognitionMonitor） | `src/signals/metacognition.rs` | 滑动窗口趋势分析，有测试 |
 | 临时上下文（TemporalContext） | `src/signals/temporal.rs` | 事件时间归一化/间隔划分/连续性提示，有测试 |
 | 消息观察（EngagementSignals） | `src/signals/engagement.rs` | 消息长度/快速回复/延续检测，有测试 |
+| 信号编排（SignalOrchestrator） | `src/signals/orchestrator.rs` | L1/L2 双层缓存 + LLM 信号计算（narrative_self/character_adaptation/feedback_triage），有测试 |
 | SQLite 存储层（8 个 Store） | `src/memory/stores/*.rs` | 对话/事实证据/人物事实/心情/信号/重要记忆/记忆项 |
 | BM25 索引 | `src/memory/retrieval/bm25_index.rs` | jieba 中文分词 BM25 |
 | 向量索引 | `src/memory/retrieval/vector_index.rs` | 字符 n-gram 向量索引 |
+| 两阶段检索（TwoStageRetriever） | `src/memory/retrieval/two_stage_retriever.rs` | BM25+向量融合 + 多因素本地排序，有测试 |
+| 检索协调器（RetrievalCoordinator） | `src/memory/retrieval/coordinator.rs` | prompt 上下文组装/预算管理/重要记忆检索/动态排序/情绪增强，有测试 |
+| 回溯渲染器（RecallRenderer） | `src/memory/retrieval/recall_renderer.rs` | 模糊回忆渲染 |
+| 访问策略（AccessPolicy） | `src/memory/internal/access_policy.rs` | 内容分类/Scope 匹配/可见性/共享检测/去重 |
+| 索引协调器（IndexCoordinator） | `src/memory/internal/index_coordinator.rs` | 全局索引重建/更新 |
+| 后台任务管理 | `src/memory/internal/task_manager.rs` | 异步任务创建/取消/统计，有测试 |
 | Patch 合并（PatchMerger） | `src/memory/extraction/patch_merger.rs` | 记忆冲突合并 |
 | 记忆反思（MemoryReflection） | `src/memory/extraction/reflection.rs` | 记忆冲突分析，有测试 |
-| 对话摘要（ChatSummaryExtractor） | `src/memory/extraction/chat_summary.rs` | 会话摘要构建 |
-| 记忆冲突解决 | `src/memory/memory_dispute_resolver.rs` | 阈值置信度分析，有测试 |
+| 提取缓冲区（ExtractionBuffer） | `src/memory/extraction/buffer.rs` | 每会话 200 轮追踪 |
+| 对话摘要（ChatSummaryService） | `src/memory/extraction/chat_summary.rs` + `src/memory/chat_summary_service.rs` | LLM + 规则双模式摘要 |
+| 记忆冲突解决 | `src/memory/memory_dispute_resolver.rs` | 阈值置信度分析 + ReflectionPayload，有测试 |
 | 会话恢复服务 | `src/memory/session_restore_service.rs` | 构建恢复条目，有测试 |
-| 后台任务管理 | `src/memory/internal/task_manager.rs` | 异步任务创建/取消/统计，有测试 |
-| TimingGate | `src/handlers/timing_gate.rs` | LLM 决策 + TTL 缓存 + 重试，比 Python 更完善 |
-| ReplyAgent 工具循环 | `src/handlers/reply_agent.rs` | Tool trait 系统、4 内置工具、重试 |
-| 回复风格策略 | `src/handlers/reply/style_policy.rs` | 11 维度 + 反模式检测，比 Python 更完善 |
+| 对话回溯服务 | `src/memory/recall_service.rs` | 按轮评分 + 对话键解析 |
+| 人物事实提取 | `src/memory/extraction/person_fact.rs` | LLM 从对话提取人物事实 |
+| 人物事实服务 | `src/memory/person_fact_service.rs` | 从记忆同步人物事实，有测试 |
+| TimingGate | `src/handlers/timing_gate.rs` | LLM 决策 + TTL 缓存 + 重试 + 规则回退 |
+| ReplyAgent 工具循环 | `src/handlers/reply_agent.rs` | Tool trait 系统、5 内置工具、重试、分段提取、config 驱动模型名 |
+| 回复风格策略 | `src/handlers/reply/style_policy.rs` | 11 维度 + 反模式检测 |
 | 回复效果追踪 | `src/handlers/reply/effect_tracker.rs` | 待评估记录 + 过期，有测试 |
 | 回复副作用处理 | `src/handlers/reply/side_effects.rs` | LLM 反馈评分 + 构建信号 |
 | 命令系统 | `src/handlers/command/*.rs` | 注册/匹配/帮助，有测试 |
-| 共享工具层 | `src/handlers/shared/*.rs`（4 文件） | 显示工具/身份/历史渲染，有测试 |
+| 共享工具层 | `src/handlers/shared/*.rs`（6 文件） | 显示工具/身份/历史渲染/PromptPlanner，有测试 |
+| 规划器（ConversationPlanner） | `src/handlers/planner.rs` | LLM 规划 + JSON 解析 + PromptPlanner schema |
+| 规划协调器（PlanCoordinator） | `src/handlers/plan_coordinator.rs` | 完整上下文构建 + 窗口消息格式化 + 统一历史 + 关系摘要，有测试 |
+| 上下文构建器（ContextBuilder） | `src/handlers/context_builder.rs` | 记忆层/角色卡/叙事/警示信号加载 |
+| 提示词构建器（PromptBuilder） | `src/handlers/prompt_builder.rs` | 15 个动态上下文块注入 |
+| 会话管理器（SessionManager） | `src/handlers/session_manager.rs` | 会话恢复 + 双重检查锁 + 消息管理 |
+| 时间线格式化 | `src/handlers/timeline_formatter.rs` | LRU 缓存时间线渲染 |
+| 消息文本工具 | `src/handlers/message_text.rs` | 消息提取/分割/格式化 |
+| 图像管线（ImagePipeline） | `src/handlers/image_pipeline.rs` | 泛型 VisionClient 集成 + 图片分析 |
+| 角色卡服务（CharacterCardService） | `src/character/card_service.rs` | 反馈分类/交互信号/情感历史/亲密度/效果包，有测试 |
+| 叙事服务（NarrativeService） | `src/character/narrative.rs` | 事件追踪 + 主题/摘要 |
+| Emoji 数据库 | `src/emoji/database.rs` | SQLite 存储 + SHA256 去重 + 分类生命周期 |
+| Emoji 管理器 | `src/emoji/manager.rs` | 采集/推荐/格式检测/VLM 分类 |
+| ProactiveShare 调度器 | `src/proactive_share/scheduler.rs` | 定时轮询 + 冷却 + 每日上限 |
+| ProactiveShare 存储 | `src/proactive_share/store.rs` | CRUD + 去重 + 计数 |
 | ContextRecorder | `src/core/context_recorder.rs` | 上下文录制与快照 |
 | ImmutableMessageLog | `src/core/immutable_message_log.rs` | 不可变消息日志（内存 + SQLite），有测试 |
 | MoodEngine | `src/core/mood_engine.rs` | 情绪引擎，有测试 |
+| MoodStore | `src/memory/stores/mood_store.rs` | SQLite 心情存储 |
 | SessionPipeline | `src/core/session_pipeline.rs` | 按会话串行消息处理 |
 | ChatScope | `src/core/scope.rs` | 群聊/私聊枚举 |
-| 默认 AIClient HTTP | `src/services/ai_client.rs` | 整合 Python ai/* 子模块功能 |
+| SessionResolver | `src/core/session_resolver.rs` | 事件到 SessionRef 转换 |
+| MessageTrace | `src/core/message_trace.rs` | Trace ID / 执行键 |
+| LogText | `src/core/log_text.rs` | 日志预览截断 |
+| LogLabels | `src/core/log_labels.rs` | 日志标签常量 |
+| Error types | `src/core/errors.rs` | 12 错误变体 + 4 子错误枚举 |
+| Bootstrap | `src/core/bootstrap.rs` | 依赖装配/组件构建/存储器初始化 |
+| BotRuntime | `src/core/runtime.rs` | 群状态机（动态阈值/防抖/延迟触发/冷却/饱和/空闲补偿），有测试 |
+| EventDispatcher | `src/core/dispatcher.rs` | 事件路由/预处理器/后处理器/统计 |
+| RuntimeMetrics | `src/core/metrics.rs` | 50+ 计数器（消息/命令/视觉/表情/记忆/系统/信号） |
+| ReplySender | `src/core/reply_sender.rs` | 分段发送编排 + 延迟 + 自动分段 |
+| XueliConfig | `src/core/config.rs` | 完整配置（Vision/Character/GroupReply/Memory/extraction/rerank/Emoji/Plugin/ContentSection） |
+| 平台类型（PlatformTypes） | `src/core/platform_types.rs` | InboundEvent/ReplyAction/SessionRef/GroupState |
+| 默认 AIClient HTTP | `src/services/ai_client.rs` | 整合 Python ai/* 子模块 + tools/tool_choice 序列化 |
+| TokenCounter | `src/services/token_counter.rs` | trim_messages_to_budget + tool_calls/多模态计数 |
+| VisionClient | `src/services/vision_client.rs` | 多模态消息构建 + 多图分析 + 贴纸情绪分类 + ImageAnalysisResult |
+| ImageClient | `src/services/image_client.rs` | 图片下载/Base64 编码 |
+| InvocationRouter | `src/services/invocation_router.rs` | 模型路由 + 超时控制 |
+| PromptTemplateLoader | `src/services/prompt_loader.rs` | trait 抽象 + 文件加载 + 渲染 |
 
 ### 部分（核心功能可用，有显著缺失）
 
 | 模块 | 文件 | 缺失内容 |
 |------|------|----------|
-| **MessageHandler** | `src/handlers/message_handler.rs`（126 行 vs Python 1807 行） | 情绪引擎、MemoryFlowService、EmojiService、SignalOrchestrator、CommandHandler、ImagePipeline、ModelInvocationRouter 均未集成；当前仅基本链式调用 |
-| **BotRuntime** | `src/core/runtime.rs`（141 行 vs Python ~1300 行） | 缺少群状态机（触发阈值/防抖/中断）、消息缓冲/去重、Debounce、Interrupt 处理、Mood 夜恢复 |
-| **XueliConfig** | `src/core/config.rs` | 缺少 Vision 配置、Character 成长配置（情绪参数/关系追踪/亲密度阈值）、GroupReply 决策配置、Memory extraction/rerank 配置、BotBehavior 调优参数（token 预算比例/分段回复延迟/频率限制）、PlanningWindow 配置、Plugin 配置 |
-| **ReplySender** | `src/core/reply_sender.rs`（29 行 vs Python 228 行） | 仅委托 `PlatformAdapter::send_action()`，缺少分段构建、延迟处理、私聊/群聊路由、@提及、引用回复、长消息分割 |
-| **EventDispatcher** | `src/core/dispatcher.rs`（25 行 vs Python 329 行） | 仅基础 channel，缺少前置/后置处理器、事件类型路由、处理器注册、统计、插件钩子 |
-| **RuntimeMetrics** | `src/core/metrics.rs`（7 计数器 vs Python 50+） | 缺少视觉/表情/记忆/规划器/命令/后台任务统计 |
-| **PlatformTypes** | `src/core/platform_types.rs` | 缺少 `SystemEvent`、`StickerAction`、`NoopAction`、`SenderRef`、`AttachmentRef`、`PlatformCapabilities` |
-| **ConversationPlanner** | `src/handlers/planner.rs` | 核心 JSON 解析完成，缺少 PromptPlanner schema 解析、情绪表情仓储集成 |
-| **ContextBuilder** | `src/handlers/context_builder.rs` | 基本存储加载完成，缺少临时上下文、视觉分析集成、时间线格式化、风格策略集成、记忆上下文加载 |
-| **ReplyPipeline** | `src/handlers/reply/pipeline.rs` | 记忆层加载完成，缺少视觉上下文、系统提示构建 |
-| **PromptBuilder** | `src/handlers/prompt_builder.rs` | 缺少信号标签注入（conversation_window_label、mood_decision_label）、角色卡快照渲染、场景引导选择 |
-| **SignalOrchestrator** | `src/signals/orchestrator.rs`（172 行 vs Python 521 行） | 仅结构化提取，缺少 LLM 信号计算（feedback_triage、character_adaptation）、L1/L2 缓存、信号存储集成 |
-| **ImagePipeline** | `src/handlers/image_pipeline.rs`（44 行 vs Python 176 行） | 仅有 `analyze_image_url()`，缺少下载/贴纸检测/表情管线集成 |
-| **GroupMessageCollector** | `src/handlers/group_collector.rs` | 内存缓冲完成，但缺少对话存储写入管线集成 |
-| **MemoryManager** | `src/memory/manager.rs`（167 行 vs Python 883 行） | 基本 CRUD + apply_patch，缺少 IndexCoordinator/BackgroundCoordinator/AccessPolicy/ImportantStore/PersonFactStore 编排、搜索编排、Prompt 上下文构建、迁移/压缩 |
-| **MemoryFlowService** | `src/memory/flow_service.rs` | 异步队列基础完成，缺少对话注册、角色成长、叙事更新、图片描述提取、冲突处理调度 |
-| **MemoryExtractor** | `src/memory/extraction/extractor.rs` | LLM 调用 + JSON 解析完成，缺少缓冲区集成、prompt 模板加载（硬编码）、`load_existing_memory_records()` |
-| **PersonFactService** | `src/memory/extraction/person_fact.rs` | 直接从对话提取（与 Python 从存储同步的架构不同），缺少 `sync_user_facts()` / `format_facts_for_prompt()` |
-| **ImportantMemoryStore** | `src/memory/stores/important.rs` | 缺少 `replace_memories()` / `clear_memories()` / `mark_recalled()` |
-| **MemoryItemStore** | `src/memory/stores/memory_item.rs` | 缺少衰减/归档/抑制/元数据更新/迁移 |
+| **MessageHandler** | `src/handlers/message_handler.rs` | MemoryFlowService/EmojiService/CommandHandler 等子组件已具备，但管线集成仍需完善（如回复后副作用、命令路由等） |
+| **MemoryManager** | `src/memory/manager.rs` | 基本 CRUD + search + apply_patch 完整，缺少 IndexCoordinator/BackgroundCoordinator/ImportantStore 编排集成 |
+| **MemoryFlowService** | `src/memory/flow_service.rs` | 异步队列 + apply_patch 完成，角色成长/关系追踪/记忆争议处理为 TODO 存根 |
+| **MemoryExtractor** | `src/memory/extraction/extractor.rs` | LLM 调用 + JSON 解析完成，prompt 模板加载已改用外部模板（非硬编码） |
+| **MemoryBackgroundCoordinator** | `src/memory/internal/background.rs` | tick timer + 回调架构完整，缺少消化/合并/对话保存实际逻辑 |
+| **GroupMessageCollector** | `src/handlers/group_collector.rs` | 内存缓冲完成，缺少 SQLite 对话存储写入管线集成 |
 | **ConversationStore** | `src/memory/stores/conversation.rs` | 扁平消息模型，缺少会话生命周期管理（active_session_ids、close_session、add_turn） |
-| **TokenCounter** | `src/services/token_counter.rs`（32 行 vs Python 179 行） | 缺少 `trim_messages_to_budget()`、Tool 定义计数、预算管理 |
-| **VisionClient** | `src/services/vision_client.rs`（49 行 vs Python 406 行） | 缺少多模态消息构建、贴纸情绪分类、ImageAnalysisResult 解析 |
-| **ImageClient** | `src/services/image_client.rs` | 缺少 `process_image_segment()` / `get_mface_image_url()` |
-| **InvocationRouter** | `src/services/invocation_router.rs` | 无队列/工作器/超时管理，仅静态路由函数 |
-| **BackgroundCoordinator** | `src/memory/internal/background.rs`（201 行 vs Python 815 行） | 仅有 tick timer 回调，缺少消化/合并/对话保存/会话终结逻辑 |
-| **RetrievalCoordinator** | `src/memory/retrieval/coordinator.rs`（161 行 vs Python 1038 行） | 仅 BM25 索引检索，缺少 prompt 上下文构建、预算管理、Scope 解析、重要记忆检索、抑制、会话召回集成 |
-| **AccessPolicy** | `src/memory/internal/access_policy.rs`（49 行 vs Python 387 行） | 仅检查 MemoryType，缺少 10 内容分类、5 适用性 Scope、可见性、元数据归一化 |
-| **MemoryDisputeResolver** | `src/memory/memory_dispute_resolver.rs` | 基本阈值判断，缺少 ReflectionPayload 构建集成 |
+| **MemoryItemStore** | `src/memory/stores/memory_item.rs` | 缺少衰减/归档/抑制/元数据更新/迁移 |
+| **ImportantMemoryStore** | `src/memory/stores/important.rs` | 缺少 `replace_memories()` / `clear_memories()` / `mark_recalled()` |
+| **EmojiReplyService** | `src/emoji/reply_service.rs` | 基本规则启发式完成，缺少 LLM 驱动的 emoji 回复决策和 ModelInvocationRouter 集成 |
+| **ImageClient** | `src/services/image_client.rs` | 缺少 `process_image_segment()` / `get_mface_image_url()` 高级功能 |
+| **ReplyPipeline** | `src/handlers/reply/pipeline.rs` | 记忆层 + 格式化完成，缺少视觉上下文集成和统一搜索 API |
 
 ### 骨架（仅有数据结构和 `// TODO` 占位）
 
-| 模块 | 文件 | Python 行数 | Rust 完成度 |
-|------|------|-------------|-------------|
-| EmojiDB | `src/emoji/database.rs` | 499 | **0%** — 全部 TODO |
-| EmojiManager | `src/emoji/manager.rs` | 291 | **0%** — 全部 TODO |
-| EmojiReplyService | `src/emoji/reply_service.rs` | 284 | **0%** — 全部 TODO |
-| ProactiveShareStore | `src/proactive_share/store.rs` | 140 | **0%** — 全部 TODO |
-| ProactiveShareScheduler | `src/proactive_share/scheduler.rs` | 131 | **0%** — 全部 TODO |
-| ConversationRecallService | `src/memory/recall_service.rs` | 170 | **10%** — `recall()` 返回空 Vec |
-| IndexCoordinator | `src/memory/internal/index_coordinator.rs` | 83 | **10%** — rebuild/update 空存根 |
-| PlanCoordinator | `src/handlers/plan_coordinator.rs` | 874 | **3%** — 空 coordinate() |
-| CharacterCardService | `src/character/card_service.rs` | 600 | **10%** — 仅有数据结构 + default_card() |
-| NarrativeService | `src/character/narrative.rs` | 193 | **10%** — 仅有数据结构 |
+无 — 所有模块至少达到"部分"级别。
 
 ### 未移植（尚无 Rust 对应文件）
 
@@ -297,18 +311,9 @@ InboundEvent
 
 | 模块 | Python 文件 | 行数 | 影响等级 |
 |------|-------------|------|----------|
-| 回复发送编排 | `reply_send_orchestrator.py` | 89 | **高** — 分段规范化/去重/延迟计算 |
-| 会话解析器 | `session_resolver.py` | 53 | **高** — 事件到 SessionRef 转换 |
-| 会话管理器 | `conversation/session_manager.py` | 226 | **高** — 会话生命周期管理 |
-| PromptPlanner | `shared/prompt_planner.py` | 296 | **高** — 决策输出 schema + plan 解析 |
-| 提取缓冲区 | `extraction/buffer.py` | 103 | **高** — 每会话 200 轮追踪 |
-| 启动引导 | `bootstrap.py` | 386 | **中** — 依赖装配/配置验证 |
-| 消息链路追踪 | `message_trace.py` | 39 | **中** — Trace ID / 执行键 |
-| 时间线格式化 | `conversation/timeline_formatter.py` | 200 | **中** — LRU 缓存时间线渲染 |
 | 存储 Scope | `storage_scope.py` | 200 | **低** — v3 键格式管理 |
-| 回顾渲染器 | `retrieval/recall_renderer.py` | 67 | **低** — 模糊回忆渲染 |
-| 消息文本工具 | `message_text.py` | 63 | **低** — 消息分割格式化 |
-| 日志文本工具 | `log_text.py` | 20 | **低** — 日志预览截断 |
+| TOML 工具 | `toml_utils.py` | 95 | **低** — WebUI 配置编辑辅助 |
+| 提取解析器 | `extraction/parser.py` | 203 | **低** — 行基解析/锚点验证（Rust 使用 JSON 解析替代） |
 
 ---
 
