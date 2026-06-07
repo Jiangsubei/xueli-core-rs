@@ -1,6 +1,6 @@
 # AGENTS.md
 
-原项目路径在 `/home/jiangsubei/Documents/xueli-qq-bot` 
+原项目路径在 `/home/jiangsubei/Documents/xueli-qq-bot`
 
 ---
 
@@ -162,120 +162,32 @@ InboundEvent
 
 ### 1. 组件初始化原则
 
-**优先使用构造器注入依赖（通过 trait object 或泛型）**
-
-```rust
-// 推荐：泛型 trait bound 依赖注入
-pub struct MessageHandler<A: AIClient, P: PlatformAdapter> {
-    config: Arc<XueliConfig>,
-    ai_client: Arc<A>,
-    platform: Arc<P>,
-    // ...
-}
-
-impl<A: AIClient, P: PlatformAdapter> MessageHandler<A, P> {
-    pub fn new(config: Arc<XueliConfig>, ai_client: Arc<A>, platform: Arc<P>) -> Self {
-        // ...
-    }
-}
-```
-
-**原因：** 使用 trait bound 泛型确保编译期检查所有依赖，测试中可用 Mock 实现替代。
+**优先使用构造器注入依赖（通过 trait object 或泛型）**。使用 trait bound 泛型确保编译期检查所有依赖，测试中可用 Mock 实现替代。
 
 ### 2. 异步资源初始化规范
 
-```rust
-// 推荐：显式 async init 方法（Builder 模式）
-impl BotRuntime {
-    pub async fn init(&self) -> Result<(), XueliError> {
-        // 初始化锁、连接池等异步资源
-    }
-}
-
-**锁管理：** 所有 `tokio::sync::Mutex` / `RwLock` 必须在 `init()` 或构造器中初始化，避免在持有锁时调用 `.await` 导致死锁。
+**显式 async init 方法（Builder 模式）**。所有 `tokio::sync::Mutex` / `RwLock` 必须在 `init()` 或构造器中初始化，避免在持有锁时调用 `.await` 导致死锁。
 
 ### 3. JSON 解析与 fallback 规范
 
-**问题背景：** 多层 fallback 可能导致已解析数据被覆盖。
-
-```rust
-// 推荐：解析阶段与 fallback 阶段分离，优先使用结构化数据
-let data: Option<ParsedData> = extract_json_object(&content);
-if let Some(parsed) = data {
-    // 使用结构化数据
-} else {
-    // 仅在结构化数据完全缺失时触发 fallback
-    fallback_to_raw_content(&content);
-}
-
-// 避免：fallback 覆盖已解析的数据
-```
-
-**原则：** fallback 仅在结构化数据完全缺失时触发，已解析的数据不能被覆盖。
+**解析阶段与 fallback 阶段分离，优先使用结构化数据**。fallback 仅在结构化数据完全缺失时触发，已解析的数据不能被覆盖。
 
 ### 4. 状态机/滑动平均类组件的测试规范
 
-**问题背景：** 使用滑动平均（如 `MoodEngine.tick()`）的组件，单次调用状态变化小，断言精确值易失败。
-
-```rust
-// 推荐：测试边界条件和方向，不测精确值
-#[test]
-fn test_mood_engine_extreme_input() {
-    let mut engine = MoodEngine::new(true, 0.0);
-    engine.set_valence(0.0);
-    let result = engine.tick(1.0);
-    assert!(result.state.valence > 0.0); // 验证方向
-}
-
-// 避免：断言精确相等
-assert_eq!(result.valence, expected_valence); // 滑动平均特性决定几乎不会精确相等
-```
-
-**原则：** 对于有状态连续性（滑动平均/指数平滑）的组件，测试应验证：
+对于有状态连续性（滑动平均/指数平滑）的组件，测试应验证：
 - 边界条件（输入极端值时状态不越界，如 [-1.0, 1.0]）
 - 变化方向（正向输入应产生正向变化）
 - 多轮迭代后的收敛性
 
+不应断言精确相等值，因为滑动平均特性决定单次调用状态变化小，几乎不会精确相等。
+
 ### 5. 集成测试规范
 
-```rust
-// 推荐：抽取公共 helper 函数复用构建逻辑
-fn build_test_config() -> XueliConfig {
-    XueliConfig::default()
-}
-
-fn build_test_runtime() -> BotRuntime {
-    BotRuntime::new(build_test_config())
-}
-
-#[tokio::test]
-async fn test_message_flow() {
-    let runtime = build_test_runtime();
-    // ...
-}
-```
-
-测试辅助代码放在 `tests/common/mod.rs` 中。
+抽取公共 helper 函数复用构建逻辑。测试辅助代码放在 `tests/common/mod.rs` 中。
 
 ### 6. 测试可观测性规范
 
-```rust
-// 推荐：测试失败时输出足够诊断信息
-#[test]
-fn test_reply_segments() {
-    let segments = get_segments();
-    assert_eq!(
-        segments.len(),
-        3,
-        "期望3段，实际{}段，segments={:?}",
-        segments.len(),
-        segments
-    );
-}
-
-// 避免：只报 assertion 本身
-assert_eq!(segments.len(), 3); // 失败时难以诊断
-```
+测试失败时输出足够诊断信息，包含期望值、实际值和上下文，避免仅报 assertion 本身导致难以诊断。
 
 ---
 
@@ -418,5 +330,3 @@ assert_eq!(segments.len(), 3); // 失败时难以诊断
 - `traits/ai_client.rs` — AIClient trait 定义
 
 修改上述模块，必须附带相关测试的通过证明。
-
----

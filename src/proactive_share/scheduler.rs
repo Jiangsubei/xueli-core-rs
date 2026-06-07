@@ -7,6 +7,7 @@ use crate::proactive_share::store::ProactiveShareStore;
 
 /// 主动分享调度器 — 定时检查待发送分享并触发发送。
 pub struct ProactiveShareScheduler {
+    #[allow(dead_code)]
     config: Arc<ProactiveShareConfig>,
     store: Arc<ProactiveShareStore>,
     running: Arc<RwLock<bool>>,

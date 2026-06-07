@@ -33,6 +33,7 @@ pub enum InvocationTask {
 }
 
 impl InvocationTask {
+    #[allow(dead_code)]
     fn purpose_key(&self) -> &'static str {
         match self {
             InvocationTask::TimingGate => "timing_gate",

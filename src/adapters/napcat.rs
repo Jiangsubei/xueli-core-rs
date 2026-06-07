@@ -7,11 +7,8 @@
 /// <https://github.com/botuniverse/onebot-11>
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
-use crate::core::platform_types::{
-    EventType, GroupState, InboundEvent, ReplyAction, SendAction, SessionRef,
-};
+use crate::core::platform_types::{EventType, GroupState, InboundEvent, ReplyAction, SessionRef};
 use crate::core::scope::ChatScope;
 use crate::core::types::UserMessage;
 use crate::prelude::{XueliError, XueliResult};
@@ -115,7 +112,10 @@ impl NapCatAdapter {
         if let Some(token) = &self.config.access_token {
             req = req.header("Authorization", format!("Bearer {}", token));
         }
-        let resp = req.send().await.map_err(|e| XueliError::external("http", e.to_string()))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| XueliError::external("http", e.to_string()))?;
         let status = resp.status();
         let body = resp
             .json::<serde_json::Value>()
@@ -160,6 +160,7 @@ impl NapCatAdapter {
     }
 
     /// 解析消息段为纯文本（用于提取 @提及）
+    #[allow(dead_code)]
     fn segments_to_text(segments: &[OneBotSegment]) -> String {
         segments
             .iter()
@@ -245,7 +246,8 @@ impl NapCatAdapter {
                     sender_name,
                     text,
                     scope: scope.clone(),
-                    timestamp: chrono::DateTime::from_timestamp(event.time, 0).unwrap_or_else(|| chrono::Utc::now()),
+                    timestamp: chrono::DateTime::from_timestamp(event.time, 0)
+                        .unwrap_or_else(|| chrono::Utc::now()),
                     is_mention,
                 };
 
@@ -352,7 +354,12 @@ impl NapCatAdapter {
     }
 
     /// 发送群名片变更请求（NapCat 扩展）
-    pub async fn set_group_card(&self, group_id: &str, user_id: &str, card: &str) -> XueliResult<()> {
+    pub async fn set_group_card(
+        &self,
+        group_id: &str,
+        user_id: &str,
+        card: &str,
+    ) -> XueliResult<()> {
         self.call_api(
             "set_group_card",
             serde_json::json!({
@@ -366,7 +373,10 @@ impl NapCatAdapter {
     }
 
     /// 获取群成员列表
-    pub async fn get_group_member_list(&self, group_id: &str) -> XueliResult<Vec<serde_json::Value>> {
+    pub async fn get_group_member_list(
+        &self,
+        group_id: &str,
+    ) -> XueliResult<Vec<serde_json::Value>> {
         let resp = self
             .call_api(
                 "get_group_member_list",
@@ -388,18 +398,9 @@ mod tests {
     #[test]
     fn test_strip_mentions() {
         let adapter = NapCatAdapter::new(NapCatConfig::default());
-        assert_eq!(
-            adapter.strip_mentions("[CQ:at,qq=12345] 你好"),
-            "你好"
-        );
-        assert_eq!(
-            adapter.strip_mentions("@雪梨 你好"),
-            "你好"
-        );
-        assert_eq!(
-            adapter.strip_mentions("你好 @雪梨"),
-            "你好 @雪梨"
-        );
+        assert_eq!(adapter.strip_mentions("[CQ:at,qq=12345] 你好"), "你好");
+        assert_eq!(adapter.strip_mentions("@雪梨 你好"), "你好");
+        assert_eq!(adapter.strip_mentions("你好 @雪梨"), "你好 @雪梨");
     }
 
     #[test]

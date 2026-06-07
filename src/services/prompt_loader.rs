@@ -49,19 +49,17 @@ impl FilePromptTemplateLoader {
             return Ok(locales);
         }
 
-        let mut entries = tokio::fs::read_dir(&self.base_dir)
-            .await
-            .map_err(|e| crate::core::errors::XueliError::Template(
-                crate::core::errors::TemplateError::Load(format!("无法读取模板根目录: {}", e))
-            ))?;
+        let mut entries = tokio::fs::read_dir(&self.base_dir).await.map_err(|e| {
+            crate::core::errors::XueliError::Template(crate::core::errors::TemplateError::Load(
+                format!("无法读取模板根目录: {}", e),
+            ))
+        })?;
 
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|e| crate::core::errors::XueliError::Template(
-                crate::core::errors::TemplateError::Load(format!("无法读取目录条目: {}", e))
-            ))?
-        {
+        while let Some(entry) = entries.next_entry().await.map_err(|e| {
+            crate::core::errors::XueliError::Template(crate::core::errors::TemplateError::Load(
+                format!("无法读取目录条目: {}", e),
+            ))
+        })? {
             let path = entry.path();
             if path.is_dir() {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -94,24 +92,25 @@ impl PromptTemplateLoader for FilePromptTemplateLoader {
             let dir = base_dir.join(&locale);
             if !dir.exists() {
                 return Err(crate::core::errors::XueliError::Template(
-                    crate::core::errors::TemplateError::NotFound(format!("模板目录不存在: {:?}", dir))
+                    crate::core::errors::TemplateError::NotFound(format!(
+                        "模板目录不存在: {:?}",
+                        dir
+                    )),
                 ));
             }
 
             let mut map = HashMap::new();
-            let mut entries = tokio::fs::read_dir(&dir)
-                .await
-                .map_err(|e| crate::core::errors::XueliError::Template(
-                    crate::core::errors::TemplateError::Load(format!("无法读取模板目录 {:?}: {}", dir, e))
-                ))?;
+            let mut entries = tokio::fs::read_dir(&dir).await.map_err(|e| {
+                crate::core::errors::XueliError::Template(crate::core::errors::TemplateError::Load(
+                    format!("无法读取模板目录 {:?}: {}", dir, e),
+                ))
+            })?;
 
-            while let Some(entry) = entries
-                .next_entry()
-                .await
-                .map_err(|e| crate::core::errors::XueliError::Template(
-                    crate::core::errors::TemplateError::Load(format!("无法读取目录条目: {}", e))
-                ))?
-            {
+            while let Some(entry) = entries.next_entry().await.map_err(|e| {
+                crate::core::errors::XueliError::Template(crate::core::errors::TemplateError::Load(
+                    format!("无法读取目录条目: {}", e),
+                ))
+            })? {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("prompt") {
                     let name = path
@@ -119,11 +118,14 @@ impl PromptTemplateLoader for FilePromptTemplateLoader {
                         .and_then(|n| n.to_str())
                         .unwrap_or("")
                         .to_string();
-                    let content = tokio::fs::read_to_string(&path)
-                        .await
-                        .map_err(|e| crate::core::errors::XueliError::Template(
-                            crate::core::errors::TemplateError::Load(format!("无法读取模板文件 {:?}: {}", path, e))
-                        ))?;
+                    let content = tokio::fs::read_to_string(&path).await.map_err(|e| {
+                        crate::core::errors::XueliError::Template(
+                            crate::core::errors::TemplateError::Load(format!(
+                                "无法读取模板文件 {:?}: {}",
+                                path, e
+                            )),
+                        )
+                    })?;
                     map.insert(name, content);
                 }
             }
@@ -144,7 +146,7 @@ impl PromptTemplateLoader for FilePromptTemplateLoader {
         name: &str,
     ) -> impl Future<Output = XueliResult<String>> + Send {
         let cache = self.cache.clone();
-        let base_dir = self.base_dir.clone();
+        let _base_dir = self.base_dir.clone();
         let locale = locale.to_string();
         let name = name.to_string();
         async move {
@@ -160,12 +162,11 @@ impl PromptTemplateLoader for FilePromptTemplateLoader {
 
             // 缓存未命中：加载全部模板
             let templates = self.load_templates(&locale).await?;
-            templates
-                .get(&name)
-                .cloned()
-                .ok_or_else(|| crate::core::errors::XueliError::Template(
-                    crate::core::errors::TemplateError::NotFound(format!("{} / {}", locale, name))
-                ))
+            templates.get(&name).cloned().ok_or_else(|| {
+                crate::core::errors::XueliError::Template(
+                    crate::core::errors::TemplateError::NotFound(format!("{} / {}", locale, name)),
+                )
+            })
         }
     }
 
@@ -197,7 +198,7 @@ impl PromptTemplateLoader for NoopPromptTemplateLoader {
         let name = name.to_string();
         async move {
             Err(crate::core::errors::XueliError::Template(
-                crate::core::errors::TemplateError::NotFound(name)
+                crate::core::errors::TemplateError::NotFound(name),
             ))
         }
     }
