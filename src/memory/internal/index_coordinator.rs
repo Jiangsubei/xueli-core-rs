@@ -85,7 +85,7 @@ impl IndexCoordinator {
     pub async fn ensure_fresh(&self, documents: &[(String, String)]) -> XueliResult<()> {
         let needs = *self.needs_rebuild.read().await;
         if needs {
-            drop(needs);
+            let _ = needs;
             self.rebuild(documents).await?;
         }
         Ok(())

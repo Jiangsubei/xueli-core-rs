@@ -3,4 +3,5 @@ pub mod coordinator;
 pub mod hybrid;
 pub mod limits;
 pub mod recall_renderer;
+pub mod two_stage_retriever;
 pub mod vector_index;

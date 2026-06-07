@@ -7,6 +7,7 @@ use crate::prelude::XueliResult;
 
 /// 记忆管理器 — 记忆系统的顶层入口
 pub struct MemoryManager {
+    #[allow(dead_code)]
     config: Arc<MemoryConfig>,
     store: Arc<dyn MemoryStore>,
 }

@@ -90,7 +90,11 @@ impl ChatSummaryService {
     }
 
     /// 获取会话的摘要（如果已有缓存则返回缓存）
-    pub fn get_summary(&self, records: &[ConversationRecord], cached_summary: Option<&str>) -> String {
+    pub fn get_summary(
+        &self,
+        records: &[ConversationRecord],
+        cached_summary: Option<&str>,
+    ) -> String {
         if let Some(summary) = cached_summary {
             let s = summary.trim();
             if !s.is_empty() {
@@ -105,7 +109,7 @@ impl ChatSummaryService {
         &self,
         store: &SqliteConversationStore,
         session_id: &str,
-        user_id: &str,
+        _user_id: &str,
     ) -> XueliResult<Option<String>> {
         let records = store.get_recent_by_session(session_id, 1000)?;
         if records.is_empty() {
@@ -157,7 +161,11 @@ mod tests {
             id: 0,
             session_id: "test_session".to_string(),
             user_id: "user1".to_string(),
-            sender_name: if is_bot { "bot".to_string() } else { "user".to_string() },
+            sender_name: if is_bot {
+                "bot".to_string()
+            } else {
+                "user".to_string()
+            },
             text: text.to_string(),
             is_bot,
             scope_type: "private".to_string(),

@@ -74,7 +74,11 @@ impl PersonFactService {
     }
 
     /// 获取用于 prompt 的事实条目
-    pub async fn get_prompt_entries(&self, user_id: &str, limit: Option<usize>) -> XueliResult<Vec<PersonFactEntry>> {
+    pub async fn get_prompt_entries(
+        &self,
+        user_id: &str,
+        limit: Option<usize>,
+    ) -> XueliResult<Vec<PersonFactEntry>> {
         let facts = self.sync_user_facts(user_id).await?;
         let limit = limit.unwrap_or(self.prompt_limit);
 
@@ -93,7 +97,11 @@ impl PersonFactService {
     }
 
     /// 格式化事实为 prompt 字符串
-    pub async fn format_facts_for_prompt(&self, user_id: &str, limit: Option<usize>) -> XueliResult<String> {
+    pub async fn format_facts_for_prompt(
+        &self,
+        user_id: &str,
+        limit: Option<usize>,
+    ) -> XueliResult<String> {
         let entries = self.get_prompt_entries(user_id, limit).await?;
         if entries.is_empty() {
             return Ok(String::new());
@@ -151,9 +159,11 @@ impl PersonFactService {
 
         // 按更新时间和置信度排序
         facts.sort_by(|a, b| {
-            b.updated_at
-                .cmp(&a.updated_at)
-                .then_with(|| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal))
+            b.updated_at.cmp(&a.updated_at).then_with(|| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         });
 
         facts
@@ -169,7 +179,10 @@ impl PersonFactService {
         // 排除特定分类（使用 memory_type 判断）
         use crate::core::types::MemoryType;
         match memory.memory_type {
-            MemoryType::Fact | MemoryType::Preference | MemoryType::Opinion | MemoryType::Relationship => true,
+            MemoryType::Fact
+            | MemoryType::Preference
+            | MemoryType::Opinion
+            | MemoryType::Relationship => true,
             MemoryType::Event => false,
         }
     }

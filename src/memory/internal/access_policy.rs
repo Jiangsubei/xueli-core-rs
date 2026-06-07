@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::core::scope::ChatScope;
 use crate::core::types::{MemoryItem, MemoryType};
 
@@ -41,6 +43,9 @@ pub struct MemoryAccessPolicy {
     pub group_allowed_types: Vec<MemoryType>,
 }
 
+/// 提示词条目类型
+pub type PromptEntry = HashMap<String, serde_json::Value>;
+
 impl MemoryAccessPolicy {
     pub fn new() -> Self {
         Self {
@@ -75,7 +80,6 @@ impl MemoryAccessPolicy {
 
     /// 去重：按内容文本相同去除重复记忆，保留 importance 最高的
     pub fn dedupe_entries(memories: &[MemoryItem]) -> Vec<MemoryItem> {
-        use std::collections::HashMap;
         let mut best: HashMap<String, MemoryItem> = HashMap::new();
         for m in memories {
             let key = m.content.trim().to_lowercase();
@@ -103,6 +107,64 @@ impl MemoryAccessPolicy {
                 .partial_cmp(&a.importance)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+    }
+
+    /// 检查元数据是否标记为 shared
+    pub fn is_shared(&self, metadata: Option<&serde_json::Value>) -> bool {
+        let meta = match metadata {
+            Some(v) => v,
+            None => return false,
+        };
+        meta.get("visibility")
+            .and_then(|v| v.as_str())
+            .map(|s| s == "shared")
+            .unwrap_or(false)
+    }
+
+    /// 检查元数据是否标记为 addressing preference
+    pub fn is_addressing(&self, metadata: Option<&serde_json::Value>) -> bool {
+        let meta = match metadata {
+            Some(v) => v,
+            None => return false,
+        };
+        meta.get("content_category")
+            .and_then(|v| v.as_str())
+            .map(|s| s == "addressing_preference")
+            .unwrap_or(false)
+    }
+
+    /// 为提示词分类记忆：返回 "private"、"shared" 或 "addressing"
+    pub fn classify_for_prompt(
+        &self,
+        metadata: Option<&serde_json::Value>,
+        owner_user_id: &str,
+        requester_user_id: &str,
+    ) -> &'static str {
+        if self.is_addressing(metadata) {
+            return "addressing";
+        }
+        if self.is_shared(metadata) && owner_user_id != requester_user_id {
+            return "shared";
+        }
+        "private"
+    }
+
+    /// 对提示词条目去重（按规范化内容文本）
+    pub fn dedupe_prompt_entries(&self, entries: &[PromptEntry]) -> Vec<PromptEntry> {
+        let mut seen: HashMap<String, PromptEntry> = HashMap::new();
+        for entry in entries {
+            let content = entry
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
+            if content.is_empty() || seen.contains_key(&content) {
+                continue;
+            }
+            seen.insert(content, entry.clone());
+        }
+        seen.into_values().collect()
     }
 }
 

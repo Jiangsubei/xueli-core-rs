@@ -6,7 +6,7 @@ use tracing::{debug, info, warn};
 use crate::core::config::MemoryDisputeConfig;
 use crate::core::types::{MemoryItem, MemoryPatch};
 use crate::memory::manager::MemoryManager;
-use crate::memory::memory_dispute_resolver::{MemoryDisputeDecision, MemoryDisputeResolver};
+use crate::memory::memory_dispute_resolver::MemoryDisputeResolver;
 use crate::memory::stores::fact_evidence::{FactEvidence, SqliteFactEvidenceStore};
 use crate::prelude::XueliResult;
 
@@ -15,6 +15,7 @@ use crate::prelude::XueliResult;
 /// 对应 Python 版 `src.memory.memory_flow_service.MemoryFlowService`
 pub struct MemoryFlowService {
     tx: mpsc::UnboundedSender<MemoryJob>,
+    #[allow(dead_code)]
     memory_manager: Arc<MemoryManager>,
     dispute_resolver: MemoryDisputeResolver,
     evidence_store: Option<Arc<SqliteFactEvidenceStore>>,
@@ -119,8 +120,8 @@ impl MemoryFlowService {
     /// 启动后台处理循环
     pub async fn run(
         memory_manager: Arc<MemoryManager>,
-        dispute_resolver: MemoryDisputeResolver,
-        evidence_store: Option<Arc<SqliteFactEvidenceStore>>,
+        _dispute_resolver: MemoryDisputeResolver,
+        _evidence_store: Option<Arc<SqliteFactEvidenceStore>>,
         rx: &mut mpsc::UnboundedReceiver<MemoryJob>,
     ) {
         while let Some(job) = rx.recv().await {
@@ -184,9 +185,16 @@ impl MemoryFlowService {
                     );
                     // TODO: 接入 conversation_store 注册对话轮次
                     let _ = (
-                        user_id, user_message, assistant_message, dialogue_key,
-                        scope_type, group_id, message_id, image_description,
-                        narrative_summary, platform,
+                        user_id,
+                        user_message,
+                        assistant_message,
+                        dialogue_key,
+                        scope_type,
+                        group_id,
+                        message_id,
+                        image_description,
+                        narrative_summary,
+                        platform,
                     );
                 }
             }
@@ -218,7 +226,9 @@ impl MemoryFlowService {
             }
 
             let metadata = serde_json::json!({"memory_type": memory_type});
-            let decision = self.dispute_resolver.resolve_from_memory_metadata(&metadata);
+            let decision = self
+                .dispute_resolver
+                .resolve_from_memory_metadata(&metadata);
 
             if decision.level == "ignore" {
                 continue;

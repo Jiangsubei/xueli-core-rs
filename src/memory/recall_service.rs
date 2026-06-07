@@ -11,7 +11,9 @@ pub struct ConversationRecallService {
     recall_entry_limit: usize,
     min_match_score: f64,
     max_excerpt_chars: usize,
+    #[allow(dead_code)]
     recall_confidence_decay_per_day: f64,
+    #[allow(dead_code)]
     recall_confidence_minimum: f64,
 }
 
@@ -30,11 +32,17 @@ pub struct RecallEntry {
 #[derive(Debug, Clone)]
 struct ScoredTurn {
     record: ConversationRecord,
+    #[allow(dead_code)]
     turn_user: String,
+    #[allow(dead_code)]
     turn_assistant: String,
+    #[allow(dead_code)]
     turn_timestamp: String,
+    #[allow(dead_code)]
     turn_id: usize,
+    #[allow(dead_code)]
     score: f64,
+    #[allow(dead_code)]
     recall_confidence: f64,
 }
 
@@ -52,6 +60,7 @@ impl ConversationRecallService {
     }
 
     /// 按时间衰减计算置信度
+    #[allow(dead_code)]
     fn compute_confidence(&self, timestamp: &str) -> f64 {
         if timestamp.is_empty() {
             return 1.0;

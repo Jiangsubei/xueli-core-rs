@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::warn;
 
 use crate::memory::extraction::chat_summary::ChatSummaryService;
 use crate::memory::stores::conversation::{ConversationRecord, SqliteConversationStore};
@@ -28,6 +27,7 @@ pub struct SessionRestoreMeta {
 /// 对应 Python 版 `src/memory/session_restore_service.py`
 pub struct SessionRestoreService<A: AIClient> {
     conversation_store: Arc<SqliteConversationStore>,
+    #[allow(dead_code)]
     summary_service: ChatSummaryService<A>,
     recent_session_limit: usize,
     restore_entry_limit: usize,

@@ -8,6 +8,7 @@ use crate::core::config::MemoryConfig;
 ///
 /// 对应 Python 版 `xueli/src/memory/internal/background_coordinator.py`
 pub struct BackgroundCoordinator {
+    #[allow(dead_code)]
     config: Arc<MemoryConfig>,
     /// 是否正在运行
     running: Arc<RwLock<bool>>,
