@@ -59,9 +59,25 @@ pub struct XueliConfig {
     #[serde(default)]
     pub group_reply: GroupReplyConfig,
 
+    /// 群聊 LLM 回复决策配置
+    #[serde(default)]
+    pub group_reply_decision: GroupReplyDecisionConfig,
+
+    /// 记忆 Rerank 配置
+    #[serde(default)]
+    pub memory_rerank: MemoryRerankConfig,
+
     /// 适配器连接配置
     #[serde(default)]
     pub adapter_connection: AdapterConnectionConfig,
+
+    /// 内容分区配置
+    #[serde(default)]
+    pub content_sections: Vec<ContentSection>,
+
+    /// 插件配置
+    #[serde(default)]
+    pub plugin: PluginConfig,
 }
 
 // ── IdentityConfig ───────────────────────────────────────
@@ -124,11 +140,21 @@ pub struct ModelConfig {
     pub extra_headers: HashMap<String, String>,
 }
 
-fn default_context_window() -> u32 { 128000 }
-fn default_timeout() -> u32 { 120 }
-fn default_response_path() -> String { "choices.0.message.content".to_string() }
-fn default_max_concurrency() -> usize { 5 }
-fn default_max_retries() -> usize { 3 }
+fn default_context_window() -> u32 {
+    128000
+}
+fn default_timeout() -> u32 {
+    120
+}
+fn default_response_path() -> String {
+    "choices.0.message.content".to_string()
+}
+fn default_max_concurrency() -> usize {
+    5
+}
+fn default_max_retries() -> usize {
+    3
+}
 
 impl Default for ModelConfig {
     fn default() -> Self {
@@ -158,15 +184,27 @@ pub struct VisionServiceConfig {
     /// 是否启用
     #[serde(default)]
     pub enabled: bool,
+    /// 视觉服务提供商
+    #[serde(default = "default_vision_provider")]
+    pub provider: String,
     /// API Base URL（默认使用 model.api_base）
     pub api_base: Option<String>,
     /// API Key（默认使用 model.api_key）
     pub api_key: Option<String>,
     /// 模型名称
     pub model: Option<String>,
+    /// Temperature
+    #[serde(default = "default_vision_temperature")]
+    pub temperature: f64,
+    /// 最大输出 token 数
+    #[serde(default = "default_vision_max_tokens")]
+    pub max_tokens: u32,
     /// 上下文窗口
     #[serde(default = "default_vision_context_window")]
     pub context_window: u32,
+    /// 最大并发请求数
+    #[serde(default = "default_vision_concurrent_limit")]
+    pub concurrent_limit: usize,
     /// 额外请求参数
     #[serde(default)]
     pub extra_params: Option<HashMap<String, serde_json::Value>>,
@@ -177,16 +215,34 @@ pub struct VisionServiceConfig {
     pub response_path: Option<String>,
 }
 
-fn default_vision_context_window() -> u32 { 32000 }
+fn default_vision_provider() -> String {
+    "openai".to_string()
+}
+fn default_vision_temperature() -> f64 {
+    0.7
+}
+fn default_vision_max_tokens() -> u32 {
+    4096
+}
+fn default_vision_concurrent_limit() -> usize {
+    3
+}
+fn default_vision_context_window() -> u32 {
+    32000
+}
 
 impl Default for VisionServiceConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            provider: default_vision_provider(),
             api_base: None,
             api_key: None,
             model: None,
+            temperature: default_vision_temperature(),
+            max_tokens: default_vision_max_tokens(),
             context_window: default_vision_context_window(),
+            concurrent_limit: default_vision_concurrent_limit(),
             extra_params: None,
             extra_headers: None,
             response_path: None,
@@ -259,16 +315,36 @@ pub struct BotBehaviorConfig {
     pub purpose_timeouts: HashMap<String, f64>,
 }
 
-fn default_token_budget_ratio() -> f64 { 0.7 }
-fn default_token_encoding() -> String { "cl100k_base".to_string() }
-fn default_max_message_length() -> usize { 4000 }
-fn default_response_timeout() -> u32 { 60 }
-fn default_rate_limit_interval() -> f64 { 1.0 }
-fn default_private_batch_window() -> f64 { 1.2 }
-fn default_segmented_reply_enabled() -> bool { true }
-fn default_max_segments() -> usize { 3 }
-fn default_followup_delay_min() -> f64 { 2.0 }
-fn default_followup_delay_max() -> f64 { 5.0 }
+fn default_token_budget_ratio() -> f64 {
+    0.7
+}
+fn default_token_encoding() -> String {
+    "cl100k_base".to_string()
+}
+fn default_max_message_length() -> usize {
+    4000
+}
+fn default_response_timeout() -> u32 {
+    60
+}
+fn default_rate_limit_interval() -> f64 {
+    1.0
+}
+fn default_private_batch_window() -> f64 {
+    1.2
+}
+fn default_segmented_reply_enabled() -> bool {
+    true
+}
+fn default_max_segments() -> usize {
+    3
+}
+fn default_followup_delay_min() -> f64 {
+    2.0
+}
+fn default_followup_delay_max() -> f64 {
+    5.0
+}
 
 impl Default for BotBehaviorConfig {
     fn default() -> Self {
@@ -333,11 +409,21 @@ pub struct MemoryConfig {
     pub retrieval_weights: RetrievalWeightsConfig,
 }
 
-fn default_storage_backend() -> String { "sqlite".to_string() }
-fn default_rerank_top_k() -> usize { 20 }
-fn default_dynamic_memory_limit() -> usize { 8 }
-fn default_auto_extract() -> bool { true }
-fn default_extract_every_n_turns() -> usize { 3 }
+fn default_storage_backend() -> String {
+    "sqlite".to_string()
+}
+fn default_rerank_top_k() -> usize {
+    20
+}
+fn default_dynamic_memory_limit() -> usize {
+    8
+}
+fn default_auto_extract() -> bool {
+    true
+}
+fn default_extract_every_n_turns() -> usize {
+    3
+}
 
 impl Default for MemoryConfig {
     fn default() -> Self {
@@ -380,11 +466,21 @@ pub struct MemoryDecayConfig {
     pub cold_decay_multiplier: f64,
 }
 
-fn default_decay_enabled() -> bool { true }
-fn default_half_life_days() -> f64 { 30.0 }
-fn default_forget_threshold() -> f64 { 0.5 }
-fn default_cold_memory_threshold() -> f64 { 90.0 }
-fn default_cold_decay_multiplier() -> f64 { 1.5 }
+fn default_decay_enabled() -> bool {
+    true
+}
+fn default_half_life_days() -> f64 {
+    30.0
+}
+fn default_forget_threshold() -> f64 {
+    0.5
+}
+fn default_cold_memory_threshold() -> f64 {
+    90.0
+}
+fn default_cold_decay_multiplier() -> f64 {
+    1.5
+}
 
 impl Default for MemoryDecayConfig {
     fn default() -> Self {
@@ -422,12 +518,24 @@ pub struct RetrievalWeightsConfig {
     pub vector_weight: f64,
 }
 
-fn default_bm25_weight() -> f64 { 1.0 }
-fn default_importance_weight() -> f64 { 0.35 }
-fn default_mention_weight() -> f64 { 0.2 }
-fn default_recency_weight() -> f64 { 0.15 }
-fn default_scene_weight() -> f64 { 0.3 }
-fn default_vector_weight() -> f64 { 0.4 }
+fn default_bm25_weight() -> f64 {
+    1.0
+}
+fn default_importance_weight() -> f64 {
+    0.35
+}
+fn default_mention_weight() -> f64 {
+    0.2
+}
+fn default_recency_weight() -> f64 {
+    0.15
+}
+fn default_scene_weight() -> f64 {
+    0.3
+}
+fn default_vector_weight() -> f64 {
+    0.4
+}
 
 impl Default for RetrievalWeightsConfig {
     fn default() -> Self {
@@ -460,10 +568,18 @@ pub struct MemoryDisputeConfig {
     pub signal_ttl_hours: f64,
 }
 
-fn default_dispute_enabled() -> bool { true }
-fn default_dispute_high_threshold() -> f64 { 0.75 }
-fn default_dispute_normal_threshold() -> f64 { 0.45 }
-fn default_signal_ttl_hours() -> f64 { 168.0 }
+fn default_dispute_enabled() -> bool {
+    true
+}
+fn default_dispute_high_threshold() -> f64 {
+    0.75
+}
+fn default_dispute_normal_threshold() -> f64 {
+    0.45
+}
+fn default_signal_ttl_hours() -> f64 {
+    168.0
+}
 
 impl Default for MemoryDisputeConfig {
     fn default() -> Self {
@@ -472,6 +588,73 @@ impl Default for MemoryDisputeConfig {
             high_confidence_threshold: 0.75,
             normal_confidence_threshold: 0.45,
             signal_ttl_hours: default_signal_ttl_hours(),
+        }
+    }
+}
+
+// ── MemoryRerankConfig ────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryRerankConfig {
+    /// 是否启用
+    #[serde(default)]
+    pub enabled: bool,
+    /// 模型名称
+    #[serde(default)]
+    pub model: String,
+    /// API Base URL
+    pub api_base: Option<String>,
+    /// API Key
+    pub api_key: Option<String>,
+    /// Temperature
+    #[serde(default = "default_rerank_temperature")]
+    pub temperature: f64,
+    /// 最大输出 token 数
+    #[serde(default = "default_rerank_max_tokens")]
+    pub max_tokens: u32,
+    /// 上下文窗口
+    #[serde(default = "default_rerank_context_window")]
+    pub context_window: u32,
+    /// Rerank 后返回数
+    #[serde(default = "default_rerank_top_k_field")]
+    pub rerank_top_k: usize,
+    /// Rerank 最低分数
+    #[serde(default = "default_rerank_min_score")]
+    pub rerank_min_score: f64,
+    /// 额外请求参数
+    #[serde(default)]
+    pub extra_params: HashMap<String, serde_json::Value>,
+}
+
+fn default_rerank_temperature() -> f64 {
+    0.3
+}
+fn default_rerank_max_tokens() -> u32 {
+    2048
+}
+fn default_rerank_context_window() -> u32 {
+    32000
+}
+fn default_rerank_top_k_field() -> usize {
+    5
+}
+fn default_rerank_min_score() -> f64 {
+    0.3
+}
+
+impl Default for MemoryRerankConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: String::new(),
+            api_base: None,
+            api_key: None,
+            temperature: default_rerank_temperature(),
+            max_tokens: default_rerank_max_tokens(),
+            context_window: default_rerank_context_window(),
+            rerank_top_k: default_rerank_top_k_field(),
+            rerank_min_score: default_rerank_min_score(),
+            extra_params: HashMap::new(),
         }
     }
 }
@@ -504,10 +687,18 @@ pub struct PlanningWindowConfig {
     pub queue_expire_seconds: f64,
 }
 
-fn default_planning_window_enabled() -> bool { true }
-fn default_private_window_seconds() -> f64 { 1.2 }
-fn default_group_proactive_window_seconds() -> f64 { 0.45 }
-fn default_queue_expire_seconds() -> f64 { 60.0 }
+fn default_planning_window_enabled() -> bool {
+    true
+}
+fn default_private_window_seconds() -> f64 {
+    1.2
+}
+fn default_group_proactive_window_seconds() -> f64 {
+    0.45
+}
+fn default_queue_expire_seconds() -> f64 {
+    60.0
+}
 
 impl Default for PlanningWindowConfig {
     fn default() -> Self {
@@ -538,12 +729,30 @@ pub struct EmojiConfig {
     pub enabled: bool,
     /// 表情包数据库路径
     pub db_path: Option<String>,
+    /// 表情数据目录
+    #[serde(default = "default_emoji_data_dir")]
+    pub data_dir: String,
+    /// 最大存储表情数
+    #[serde(default = "default_max_stored_emojis")]
+    pub max_stored_emojis: usize,
+    /// 最大贴纸数
+    #[serde(default = "default_max_stickers")]
+    pub max_stickers: usize,
+    /// 每个用户最大表情数
+    #[serde(default = "default_max_per_user")]
+    pub max_per_user: usize,
     /// 是否启用捕获
     #[serde(default = "default_emoji_capture_enabled")]
     pub capture_enabled: bool,
     /// 是否启用分类
     #[serde(default = "default_emoji_classification_enabled")]
     pub classification_enabled: bool,
+    /// 分类窗口时间范围（如 ["08:00-12:00", "18:00-22:00"]）
+    #[serde(default)]
+    pub classification_windows: Vec<String>,
+    /// 情绪标签列表
+    #[serde(default)]
+    pub emotion_labels: Vec<String>,
     /// 分类前空闲秒数
     #[serde(default = "default_emoji_idle_seconds")]
     pub idle_seconds_before_classify: f64,
@@ -556,34 +765,60 @@ pub struct EmojiConfig {
     /// 表情回复冷却秒数
     #[serde(default = "default_emoji_reply_cooldown")]
     pub reply_cooldown_seconds: f64,
-    /// 最大存储表情数
-    #[serde(default = "default_max_stored_emojis")]
-    pub max_stored_emojis: usize,
     /// 溢出策略
     #[serde(default = "default_emoji_overflow_policy")]
     pub overflow_policy: String,
 }
 
-fn default_emoji_capture_enabled() -> bool { true }
-fn default_emoji_classification_enabled() -> bool { true }
-fn default_emoji_idle_seconds() -> f64 { 45.0 }
-fn default_emoji_classification_interval() -> f64 { 30.0 }
-fn default_emoji_reply_cooldown() -> f64 { 180.0 }
-fn default_max_stored_emojis() -> usize { 100 }
-fn default_emoji_overflow_policy() -> String { "replace_oldest".to_string() }
+fn default_emoji_data_dir() -> String {
+    "data/emoji".to_string()
+}
+fn default_max_stickers() -> usize {
+    200
+}
+fn default_max_per_user() -> usize {
+    50
+}
+
+fn default_emoji_capture_enabled() -> bool {
+    true
+}
+fn default_emoji_classification_enabled() -> bool {
+    true
+}
+fn default_emoji_idle_seconds() -> f64 {
+    45.0
+}
+fn default_emoji_classification_interval() -> f64 {
+    30.0
+}
+fn default_emoji_reply_cooldown() -> f64 {
+    180.0
+}
+fn default_max_stored_emojis() -> usize {
+    100
+}
+fn default_emoji_overflow_policy() -> String {
+    "replace_oldest".to_string()
+}
 
 impl Default for EmojiConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             db_path: None,
+            data_dir: default_emoji_data_dir(),
+            max_stored_emojis: default_max_stored_emojis(),
+            max_stickers: default_max_stickers(),
+            max_per_user: default_max_per_user(),
             capture_enabled: default_emoji_capture_enabled(),
             classification_enabled: default_emoji_classification_enabled(),
+            classification_windows: Vec::new(),
+            emotion_labels: Vec::new(),
             idle_seconds_before_classify: default_emoji_idle_seconds(),
             classification_interval_seconds: default_emoji_classification_interval(),
             reply_enabled: false,
             reply_cooldown_seconds: default_emoji_reply_cooldown(),
-            max_stored_emojis: default_max_stored_emojis(),
             overflow_policy: default_emoji_overflow_policy(),
         }
     }
@@ -617,12 +852,24 @@ pub struct ProactiveShareConfig {
     pub interval_secs: u64,
 }
 
-fn default_idle_hours() -> f64 { 24.0 }
-fn default_cooldown_hours() -> f64 { 6.0 }
-fn default_max_per_day() -> usize { 3 }
-fn default_time_range_start() -> String { "09:00".to_string() }
-fn default_time_range_end() -> String { "22:00".to_string() }
-fn default_trigger_sources() -> Vec<String> { vec!["insight".to_string(), "time_signal".to_string()] }
+fn default_idle_hours() -> f64 {
+    24.0
+}
+fn default_cooldown_hours() -> f64 {
+    6.0
+}
+fn default_max_per_day() -> usize {
+    3
+}
+fn default_time_range_start() -> String {
+    "09:00".to_string()
+}
+fn default_time_range_end() -> String {
+    "22:00".to_string()
+}
+fn default_trigger_sources() -> Vec<String> {
+    vec!["insight".to_string(), "time_signal".to_string()]
+}
 
 impl Default for ProactiveShareConfig {
     fn default() -> Self {
@@ -635,6 +882,48 @@ impl Default for ProactiveShareConfig {
             time_range_end: default_time_range_end(),
             trigger_sources: default_trigger_sources(),
             interval_secs: 3600,
+        }
+    }
+}
+
+// ── IntimacyThresholdConfig ────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct IntimacyThresholdConfig {
+    /// 相识阈值
+    #[serde(default = "default_intimacy_acquaintance")]
+    pub acquaintance: f64,
+    /// 朋友阈值
+    #[serde(default = "default_intimacy_friend")]
+    pub friend: f64,
+    /// 好友阈值
+    #[serde(default = "default_intimacy_close_friend")]
+    pub close_friend: f64,
+    /// 信任阈值
+    #[serde(default = "default_intimacy_trusted")]
+    pub trusted: f64,
+}
+
+fn default_intimacy_acquaintance() -> f64 {
+    0.2
+}
+fn default_intimacy_friend() -> f64 {
+    0.5
+}
+fn default_intimacy_close_friend() -> f64 {
+    0.7
+}
+fn default_intimacy_trusted() -> f64 {
+    0.9
+}
+
+impl Default for IntimacyThresholdConfig {
+    fn default() -> Self {
+        Self {
+            acquaintance: default_intimacy_acquaintance(),
+            friend: default_intimacy_friend(),
+            close_friend: default_intimacy_close_friend(),
+            trusted: default_intimacy_trusted(),
         }
     }
 }
@@ -676,19 +965,63 @@ pub struct CharacterGrowthConfig {
     /// 关系追踪开关
     #[serde(default = "default_relationship_tracking")]
     pub relationship_tracking_enabled: bool,
+    /// 亲密度阈值配置
+    #[serde(default)]
+    pub intimacy_thresholds: IntimacyThresholdConfig,
+    /// 正面互动亲密度增益
+    #[serde(default = "default_gain_per_positive")]
+    pub gain_per_positive: f64,
+    /// 负面互动亲密度损失
+    #[serde(default = "default_loss_per_negative")]
+    pub loss_per_negative: f64,
+    /// 情绪历史记录大小
+    #[serde(default = "default_emotional_history_size")]
+    pub emotional_history_size: usize,
 }
 
-fn default_growth_enabled() -> bool { true }
-fn default_mood_fluctuation_enabled() -> bool { true }
-fn default_mood_volatility() -> f64 { 0.3 }
-fn default_mood_independence_ratio() -> f64 { 0.7 }
-fn default_mood_energy_decay() -> f64 { 0.05 }
-fn default_mood_energy_recovery() -> f64 { 0.2 }
-fn default_mood_valence_decay() -> f64 { 0.15 }
-fn default_mood_recovery_rate() -> f64 { 0.4 }
-fn default_mood_cycle_length() -> usize { 7 }
-fn default_mood_show_in_reply() -> bool { true }
-fn default_relationship_tracking() -> bool { true }
+fn default_gain_per_positive() -> f64 {
+    0.02
+}
+fn default_loss_per_negative() -> f64 {
+    0.03
+}
+fn default_emotional_history_size() -> usize {
+    50
+}
+
+fn default_growth_enabled() -> bool {
+    true
+}
+fn default_mood_fluctuation_enabled() -> bool {
+    true
+}
+fn default_mood_volatility() -> f64 {
+    0.3
+}
+fn default_mood_independence_ratio() -> f64 {
+    0.7
+}
+fn default_mood_energy_decay() -> f64 {
+    0.05
+}
+fn default_mood_energy_recovery() -> f64 {
+    0.2
+}
+fn default_mood_valence_decay() -> f64 {
+    0.15
+}
+fn default_mood_recovery_rate() -> f64 {
+    0.4
+}
+fn default_mood_cycle_length() -> usize {
+    7
+}
+fn default_mood_show_in_reply() -> bool {
+    true
+}
+fn default_relationship_tracking() -> bool {
+    true
+}
 
 impl Default for CharacterGrowthConfig {
     fn default() -> Self {
@@ -704,6 +1037,10 @@ impl Default for CharacterGrowthConfig {
             mood_cycle_length_days: default_mood_cycle_length(),
             mood_show_in_reply: default_mood_show_in_reply(),
             relationship_tracking_enabled: default_relationship_tracking(),
+            intimacy_thresholds: IntimacyThresholdConfig::default(),
+            gain_per_positive: default_gain_per_positive(),
+            loss_per_negative: default_loss_per_negative(),
+            emotional_history_size: default_emotional_history_size(),
         }
     }
 }
@@ -759,18 +1096,42 @@ pub struct GroupReplyConfig {
     pub saturation_log_factor: f64,
 }
 
-fn default_only_reply_when_at() -> bool { true }
-fn default_interest_reply_enabled() -> bool { true }
-fn default_plan_request_interval() -> f64 { 3.0 }
-fn default_plan_request_max_parallel() -> usize { 1 }
-fn default_group_wait_window() -> f64 { 5.0 }
-fn default_reply_probability() -> f64 { 1.0 }
-fn default_trigger_threshold() -> usize { 1 }
-fn default_idle_grace_seconds() -> f64 { 300.0 }
-fn default_debounce_seconds() -> f64 { 1.0 }
-fn default_debounce_max_resets() -> usize { 5 }
-fn default_base_frequency() -> f64 { 1.0 }
-fn default_saturation_log_factor() -> f64 { 1.2 }
+fn default_only_reply_when_at() -> bool {
+    true
+}
+fn default_interest_reply_enabled() -> bool {
+    true
+}
+fn default_plan_request_interval() -> f64 {
+    3.0
+}
+fn default_plan_request_max_parallel() -> usize {
+    1
+}
+fn default_group_wait_window() -> f64 {
+    5.0
+}
+fn default_reply_probability() -> f64 {
+    1.0
+}
+fn default_trigger_threshold() -> usize {
+    1
+}
+fn default_idle_grace_seconds() -> f64 {
+    300.0
+}
+fn default_debounce_seconds() -> f64 {
+    1.0
+}
+fn default_debounce_max_resets() -> usize {
+    5
+}
+fn default_base_frequency() -> f64 {
+    1.0
+}
+fn default_saturation_log_factor() -> f64 {
+    1.2
+}
 
 impl Default for GroupReplyConfig {
     fn default() -> Self {
@@ -794,6 +1155,77 @@ impl Default for GroupReplyConfig {
     }
 }
 
+// ── GroupReplyDecisionConfig ──────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GroupReplyDecisionConfig {
+    /// 是否启用 LLM 群聊回复决策
+    #[serde(default)]
+    pub enabled: bool,
+    /// 模型名称
+    #[serde(default)]
+    pub model: String,
+    /// API Base URL
+    pub api_base: Option<String>,
+    /// API Key
+    pub api_key: Option<String>,
+    /// Temperature
+    #[serde(default = "default_decision_temperature")]
+    pub temperature: f64,
+    /// 最大输出 token 数
+    #[serde(default = "default_decision_max_tokens")]
+    pub max_tokens: u32,
+    /// 上下文窗口
+    #[serde(default = "default_decision_context_window")]
+    pub context_window: u32,
+    /// 规划窗口大小
+    #[serde(default = "default_planning_window_size")]
+    pub planning_window_size: usize,
+    /// TimingGate TTL（秒）
+    #[serde(default = "default_timing_gate_ttl")]
+    pub timing_gate_ttl: f64,
+    /// 额外请求参数
+    #[serde(default)]
+    pub extra_params: HashMap<String, serde_json::Value>,
+    /// 额外 HTTP 请求头
+    #[serde(default)]
+    pub extra_headers: HashMap<String, String>,
+}
+
+fn default_decision_temperature() -> f64 {
+    0.7
+}
+fn default_decision_max_tokens() -> u32 {
+    512
+}
+fn default_decision_context_window() -> u32 {
+    8000
+}
+fn default_planning_window_size() -> usize {
+    20
+}
+fn default_timing_gate_ttl() -> f64 {
+    60.0
+}
+
+impl Default for GroupReplyDecisionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: String::new(),
+            api_base: None,
+            api_key: None,
+            temperature: default_decision_temperature(),
+            max_tokens: default_decision_max_tokens(),
+            context_window: default_decision_context_window(),
+            planning_window_size: default_planning_window_size(),
+            timing_gate_ttl: default_timing_gate_ttl(),
+            extra_params: HashMap::new(),
+            extra_headers: HashMap::new(),
+        }
+    }
+}
+
 // ── AdapterConnectionConfig ──────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -812,8 +1244,12 @@ pub struct AdapterConnectionConfig {
     pub http_url: String,
 }
 
-fn default_ws_url() -> String { "ws://0.0.0.0:8095".to_string() }
-fn default_http_url() -> String { "http://127.0.0.1:6700".to_string() }
+fn default_ws_url() -> String {
+    "ws://0.0.0.0:8095".to_string()
+}
+fn default_http_url() -> String {
+    "http://127.0.0.1:6700".to_string()
+}
 
 impl Default for AdapterConnectionConfig {
     fn default() -> Self {
@@ -822,6 +1258,60 @@ impl Default for AdapterConnectionConfig {
             platform: String::new(),
             ws_url: default_ws_url(),
             http_url: default_http_url(),
+        }
+    }
+}
+
+// ── ContentSection ────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ContentSection {
+    /// 是否启用
+    #[serde(default)]
+    pub enabled: bool,
+    /// 分区类型
+    #[serde(default)]
+    pub section_type: String,
+    /// 预算字符数
+    #[serde(default = "default_budget_chars")]
+    pub budget_chars: usize,
+}
+
+fn default_budget_chars() -> usize {
+    1000
+}
+
+impl Default for ContentSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            section_type: String::new(),
+            budget_chars: default_budget_chars(),
+        }
+    }
+}
+
+// ── PluginConfig ──────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PluginConfig {
+    /// 是否启用插件系统
+    #[serde(default)]
+    pub enabled: bool,
+    /// 插件目录
+    #[serde(default = "default_plugin_dir")]
+    pub plugin_dir: String,
+}
+
+fn default_plugin_dir() -> String {
+    "plugins".to_string()
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            plugin_dir: default_plugin_dir(),
         }
     }
 }
@@ -860,7 +1350,11 @@ impl Default for XueliConfig {
             character_growth: CharacterGrowthConfig::default(),
             memory_dispute: MemoryDisputeConfig::default(),
             group_reply: GroupReplyConfig::default(),
+            group_reply_decision: GroupReplyDecisionConfig::default(),
+            memory_rerank: MemoryRerankConfig::default(),
             adapter_connection: AdapterConnectionConfig::default(),
+            content_sections: Vec::new(),
+            plugin: PluginConfig::default(),
         }
     }
 }
@@ -868,9 +1362,12 @@ impl Default for XueliConfig {
 impl XueliConfig {
     /// 从 TOML 文件加载配置
     pub fn from_file(path: &str) -> XueliResult<Self> {
-        let content =
-            std::fs::read_to_string(path).map_err(|e| crate::core::errors::XueliError::Config(format!("读取配置文件失败: {}", e)))?;
-        toml::from_str(&content).map_err(|e| crate::core::errors::XueliError::Config(format!("解析 TOML 配置失败: {}", e)).into())
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            crate::core::errors::XueliError::Config(format!("读取配置文件失败: {}", e))
+        })?;
+        toml::from_str(&content).map_err(|e| {
+            crate::core::errors::XueliError::Config(format!("解析 TOML 配置失败: {}", e)).into()
+        })
     }
 
     /// 使用 config-rs 从多源加载配置（环境变量 + 文件）
@@ -894,8 +1391,9 @@ impl XueliConfig {
             .build()
             .map_err(|e| crate::core::errors::XueliError::Config(format!("构建配置失败: {}", e)))?;
 
-        cfg.try_deserialize()
-            .map_err(|e| crate::core::errors::XueliError::Config(format!("反序列化配置失败: {}", e)).into())
+        cfg.try_deserialize().map_err(|e| {
+            crate::core::errors::XueliError::Config(format!("反序列化配置失败: {}", e)).into()
+        })
     }
 
     /// 检查 AI 服务是否已配置
@@ -908,8 +1406,16 @@ impl XueliConfig {
         if !self.vision.enabled {
             return false;
         }
-        let base = self.vision.api_base.as_ref().unwrap_or(&self.model.api_base);
-        let model = self.vision.model.as_ref().unwrap_or(&self.model.primary_model);
+        let base = self
+            .vision
+            .api_base
+            .as_ref()
+            .unwrap_or(&self.model.api_base);
+        let model = self
+            .vision
+            .model
+            .as_ref()
+            .unwrap_or(&self.model.primary_model);
         !base.is_empty() && !model.is_empty()
     }
 
