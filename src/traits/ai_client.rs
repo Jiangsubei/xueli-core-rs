@@ -128,6 +128,10 @@ pub struct ChatMessage {
     pub content: MessageContent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -137,6 +141,8 @@ impl ChatMessage {
             role: role.into(),
             content: MessageContent::Text(content.into()),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
@@ -166,6 +172,33 @@ impl ChatMessage {
             role: role.into(),
             content: MessageContent::Multimodal(parts),
             name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// 构造带 tool_calls 的 assistant 消息
+    pub fn assistant_with_tool_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+    ) -> Self {
+        Self {
+            role: "assistant".into(),
+            content: MessageContent::Text(content.into()),
+            name: None,
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+        }
+    }
+
+    /// 构造 tool 响应消息
+    pub fn tool_result(tool_call_id: impl Into<String>, result: impl Into<String>) -> Self {
+        Self {
+            role: "tool".into(),
+            content: MessageContent::Text(result.into()),
+            name: None,
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.into()),
         }
     }
 }
@@ -186,6 +219,12 @@ pub struct ChatCompletionRequest {
     /// 是否流式
     #[serde(default)]
     pub stream: bool,
+    /// 工具定义列表
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<serde_json::Value>>,
+    /// 工具选择策略
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
     /// 额外参数（透传到请求体顶层）
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub extra_params: HashMap<String, serde_json::Value>,

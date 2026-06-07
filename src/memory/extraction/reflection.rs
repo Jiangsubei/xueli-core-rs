@@ -55,6 +55,8 @@ impl<A: AIClient> MemoryReflection<A> {
                 temperature: Some(0.2),
                 max_tokens: Some(512),
                 stream: false,
+                tools: None,
+                tool_choice: None,
                 extra_params: Default::default(),
             };
 

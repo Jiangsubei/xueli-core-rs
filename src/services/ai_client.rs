@@ -72,6 +72,15 @@ impl DefaultAIClient {
         if let Some(max_tokens) = request.max_tokens {
             body["max_tokens"] = serde_json::json!(max_tokens);
         }
+        // tools 和 tool_choice 作为顶层字段
+        if let Some(tools) = &request.tools {
+            if !tools.is_empty() {
+                body["tools"] = serde_json::json!(tools);
+                if let Some(tool_choice) = &request.tool_choice {
+                    body["tool_choice"] = tool_choice.clone();
+                }
+            }
+        }
 
         // 合并 config 级别 extra_params
         for (key, value) in &self.config.extra_params {

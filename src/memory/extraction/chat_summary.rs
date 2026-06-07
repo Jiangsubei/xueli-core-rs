@@ -34,11 +34,15 @@ impl<A: AIClient> ChatSummaryService<A> {
                 role: "system".to_string(),
                 content: MessageContent::Text(system_prompt.to_string()),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: MessageContent::Text(format!("请概括以下对话：\n{}", conversation_text)),
                 name: None,
+                tool_calls: None,
+                tool_call_id: None,
             },
         ];
 
@@ -48,6 +52,8 @@ impl<A: AIClient> ChatSummaryService<A> {
             temperature: Some(0.3),
             max_tokens: Some(256),
             stream: false,
+            tools: None,
+            tool_choice: None,
             extra_params: Default::default(),
         };
 

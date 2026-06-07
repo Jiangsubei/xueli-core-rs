@@ -54,6 +54,8 @@ impl<A: AIClient> MemoryExtractor<A> {
                 temperature: Some(0.3),
                 max_tokens: Some(1024),
                 stream: false,
+                tools: None,
+                tool_choice: None,
                 extra_params: Default::default(),
             };
 

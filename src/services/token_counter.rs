@@ -1,5 +1,5 @@
 use crate::prelude::XueliResult;
-use crate::traits::ai_client::ChatMessage;
+use crate::traits::ai_client::{ChatMessage, ContentPart, MessageContent};
 use crate::traits::tool_calling::ToolDefinition;
 
 /// Token 计数器 — 基于 tiktoken 的 token 估算和预算管理。
@@ -51,14 +51,49 @@ impl TokenCounter {
         total += self.count("role: ");
         total += self.count(&msg.role);
         total += 1;
-        total += self.count(&msg.content.text());
-        // name 字段开销（如存在）
+        total += self.count_content(&msg.content);
         if let Some(ref name) = msg.name {
             total += self.count("name: ");
             total += self.count(name);
             total += 1;
         }
+        if let Some(ref tool_calls) = msg.tool_calls {
+            for tc in tool_calls {
+                total += self.count(&tc.function.name);
+                total += self.count(&tc.function.arguments);
+                total += 11;
+            }
+        }
+        if let Some(ref tool_call_id) = msg.tool_call_id {
+            total += self.count(tool_call_id);
+        }
         total
+    }
+
+    /// 计算消息内容的 token 开销（支持纯文本与多模态）
+    fn count_content(&self, content: &MessageContent) -> usize {
+        match content {
+            MessageContent::Text(s) => self.count(s),
+            MessageContent::Multimodal(parts) => {
+                let mut total = 0;
+                for part in parts {
+                    match part {
+                        ContentPart::Text { text } => {
+                            total += self.count(text);
+                        }
+                        ContentPart::ImageUrl { image_url } => {
+                            if image_url.url.starts_with("data:") {
+                                total += 85;
+                            } else {
+                                total += self.count(&image_url.url);
+                            }
+                        }
+                    }
+                    total += 2;
+                }
+                total
+            }
+        }
     }
 
     /// 计算多条消息的 token 数（含消息级 + 请求级 overhead）
@@ -179,6 +214,48 @@ mod tests {
         ];
         let n = counter.count_messages(&msgs);
         assert!(n > 5);
+    }
+
+    #[test]
+    fn test_count_tool_calls() {
+        let counter = TokenCounter::new_cl100k().unwrap();
+        let msg = ChatMessage::assistant_with_tool_calls(
+            "",
+            vec![crate::traits::ai_client::ToolCall {
+                id: "call_1".to_string(),
+                call_type: "function".to_string(),
+                function: crate::traits::ai_client::FunctionCall {
+                    name: "search_memory".to_string(),
+                    arguments: r#"{"query":"天气"}"#.to_string(),
+                },
+            }],
+        );
+        let n = counter.count_messages(&[msg]);
+        assert!(n > 20); // role overhead + name tokens + args tokens + 11 per tool_call
+    }
+
+    #[test]
+    fn test_count_tool_call_id() {
+        let counter = TokenCounter::new_cl100k().unwrap();
+        let msg = ChatMessage::tool_result("call_abc123", "结果内容");
+        let n = counter.count_messages(&[msg]);
+        let msg_no_id = ChatMessage::text("tool", "结果内容");
+        let n_no_id = counter.count_messages(&[msg_no_id]);
+        assert!(n > n_no_id);
+    }
+
+    #[test]
+    fn test_count_multimodal_content() {
+        let counter = TokenCounter::new_cl100k().unwrap();
+        let msg = ChatMessage::multimodal(
+            "user",
+            "描述这张图片",
+            &["iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==".to_string()],
+            "image/png",
+        );
+        let n = counter.count_messages(&[msg]);
+        // text tokens + 85 for image data URI + 2 part overhead × 2 parts + message overhead
+        assert!(n > 90);
     }
 
     #[test]
