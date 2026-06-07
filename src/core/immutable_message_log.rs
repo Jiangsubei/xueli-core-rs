@@ -359,6 +359,7 @@ impl std::fmt::Display for PersistentImmutableMessageLog {
 
 // ── 辅助函数 ──
 
+#[allow(dead_code)]
 fn now_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

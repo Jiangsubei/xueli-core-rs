@@ -278,9 +278,18 @@ impl XueliError {
     pub fn classify_pipeline_error(err: &XueliError) -> PipelineErrorCategory {
         match err {
             XueliError::Config(_) => PipelineErrorCategory::Configuration,
-            XueliError::AIService(AIServiceError::ModelRequest(_) | AIServiceError::Timeout | AIServiceError::RateLimited | AIServiceError::ApiError(_)) => PipelineErrorCategory::ModelRequest,
-            XueliError::AIService(AIServiceError::ModelParse(_)) => PipelineErrorCategory::ModelParse,
-            XueliError::AIService(AIServiceError::ImageProcessing(_)) => PipelineErrorCategory::ImageProcessing,
+            XueliError::AIService(
+                AIServiceError::ModelRequest(_)
+                | AIServiceError::Timeout
+                | AIServiceError::RateLimited
+                | AIServiceError::ApiError(_),
+            ) => PipelineErrorCategory::ModelRequest,
+            XueliError::AIService(AIServiceError::ModelParse(_)) => {
+                PipelineErrorCategory::ModelParse
+            }
+            XueliError::AIService(AIServiceError::ImageProcessing(_)) => {
+                PipelineErrorCategory::ImageProcessing
+            }
             XueliError::Memory(_) => PipelineErrorCategory::MemoryOperation,
             XueliError::Platform(PlatformError::Send(_)) => PipelineErrorCategory::Send,
             XueliError::Platform(_) => PipelineErrorCategory::Platform,
