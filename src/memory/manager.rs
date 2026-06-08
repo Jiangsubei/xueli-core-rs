@@ -417,6 +417,13 @@ impl MemoryManager {
         user_id: &str,
         user_message: &str,
         assistant_message: &str,
+        _dialogue_key: &str,
+        _scope_type: &str,
+        _group_id: &str,
+        _message_id: &str,
+        _image_description: &str,
+        _narrative_summary: &str,
+        _platform: &str,
     ) -> XueliResult<()> {
         tracing::debug!(
             "[MemoryManager] 注册对话轮次 user={} (完整管线待接入)",

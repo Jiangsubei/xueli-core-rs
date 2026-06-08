@@ -15,11 +15,10 @@ use crate::prelude::XueliResult;
 /// 对应 Python 版 `src.memory.memory_flow_service.MemoryFlowService`
 pub struct MemoryFlowService {
     tx: mpsc::UnboundedSender<MemoryJob>,
-    #[allow(dead_code)]
-    memory_manager: Arc<MemoryManager>,
+    pub memory_manager: Arc<MemoryManager>,
     dispute_resolver: MemoryDisputeResolver,
     evidence_store: Option<Arc<SqliteFactEvidenceStore>>,
-    recent_reply_keys: std::sync::Mutex<HashMap<String, f64>>,
+    recent_reply_keys: std::sync::Mutex<HashMap<String, u64>>,
 }
 
 /// 记忆作业
@@ -48,6 +47,9 @@ pub enum MemoryJob {
         image_description: String,
         narrative_summary: String,
         platform: String,
+        warmth_guidance: String,
+        user_emotion_label: String,
+        intimacy_delta: f64,
     },
 }
 
@@ -78,13 +80,74 @@ impl MemoryFlowService {
             .map_err(|e| format!("记忆作业提交失败: {}", e).into())
     }
 
+    /// 回复生成后的副作用入口
+    pub fn on_reply_generated(
+        &self,
+        user_id: &str,
+        user_message: &str,
+        assistant_message: &str,
+        dialogue_key: &str,
+        scope_type: &str,
+        group_id: &str,
+        message_id: &str,
+        image_description: &str,
+        narrative_summary: &str,
+        platform: &str,
+        warmth_guidance: &str,
+        user_emotion_label: &str,
+        intimacy_delta: f64,
+    ) {
+        let has_text = !user_message.trim().is_empty();
+        if !has_text {
+            return;
+        }
+
+        let dedupe_key =
+            Self::build_dedupe_key(dialogue_key, message_id, user_message, assistant_message);
+        if self.check_dedupe_timestamp(&dedupe_key) {
+            return;
+        }
+
+        let job = MemoryJob::RegisterDialogue {
+            user_id: user_id.to_string(),
+            user_message: user_message.to_string(),
+            assistant_message: assistant_message.to_string(),
+            dialogue_key: dialogue_key.to_string(),
+            scope_type: scope_type.to_string(),
+            group_id: group_id.to_string(),
+            message_id: message_id.to_string(),
+            image_description: image_description.to_string(),
+            narrative_summary: narrative_summary.to_string(),
+            platform: platform.to_string(),
+            warmth_guidance: warmth_guidance.to_string(),
+            user_emotion_label: user_emotion_label.to_string(),
+            intimacy_delta,
+        };
+        let _ = self.tx.send(job);
+    }
+
+    fn check_dedupe_timestamp(&self, dedupe_key: &str) -> bool {
+        if dedupe_key.is_empty() {
+            return false;
+        }
+        let now = chrono::Utc::now().timestamp() as u64;
+        let expire_before = now.saturating_sub(30);
+        let mut keys = self.recent_reply_keys.lock().unwrap();
+        keys.retain(|_, ts| *ts >= expire_before);
+        if keys.contains_key(dedupe_key) {
+            return true;
+        }
+        keys.insert(dedupe_key.to_string(), now);
+        false
+    }
+
     /// 检查是否需要去重（基于事件和回复内容）
     pub fn should_dedupe(&self, dedupe_key: &str) -> bool {
         if dedupe_key.is_empty() {
             return false;
         }
-        let now = chrono::Utc::now().timestamp() as f64;
-        let expire_before = now - 30.0;
+        let now = chrono::Utc::now().timestamp() as u64;
+        let expire_before = now.saturating_sub(30);
 
         let mut keys = self.recent_reply_keys.lock().unwrap();
         keys.retain(|_, ts| *ts >= expire_before);
@@ -110,11 +173,10 @@ impl MemoryFlowService {
         if payload.trim().is_empty() {
             return String::new();
         }
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        payload.hash(&mut hasher);
-        format!("{:x}", hasher.finish())
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(payload.as_bytes());
+        format!("{:x}", hasher.finalize())
     }
 
     /// 启动后台处理循环
@@ -177,24 +239,26 @@ impl MemoryFlowService {
                     image_description,
                     narrative_summary,
                     platform,
+                    ..
                 } => {
+                    let _ = memory_manager
+                        .register_dialogue_turn(
+                            &user_id,
+                            &user_message,
+                            &assistant_message,
+                            &dialogue_key,
+                            &scope_type,
+                            &group_id,
+                            &message_id,
+                            &image_description,
+                            &narrative_summary,
+                            &platform,
+                        )
+                        .await;
                     debug!(
                         user_id = %user_id,
                         dialogue_key = %dialogue_key,
                         "[MemoryFlow] 注册对话轮次"
-                    );
-                    // TODO: 接入 conversation_store 注册对话轮次
-                    let _ = (
-                        user_id,
-                        user_message,
-                        assistant_message,
-                        dialogue_key,
-                        scope_type,
-                        group_id,
-                        message_id,
-                        image_description,
-                        narrative_summary,
-                        platform,
                     );
                 }
             }
