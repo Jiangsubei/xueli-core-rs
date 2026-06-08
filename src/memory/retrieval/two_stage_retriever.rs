@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -401,6 +402,46 @@ impl TwoStageRetriever {
     }
 }
 
+/// 抑制注册表 — 防止同一 memory_id 被反复抑制（抑制风暴防护）
+pub struct SuppressionRegistry {
+    entries: Mutex<HashMap<String, usize>>,
+    cooldown_interval: usize,
+    retrieval_count: AtomicUsize,
+}
+
+impl SuppressionRegistry {
+    pub fn new(cooldown: usize) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            cooldown_interval: cooldown,
+            retrieval_count: AtomicUsize::new(0),
+        }
+    }
+
+    /// Return true if this (mem_id, query_hash) should be suppressed
+    pub fn should_suppress(&self, mem_id: &str, query_hash: &str) -> bool {
+        let count = self.retrieval_count.fetch_add(1, Ordering::SeqCst);
+        let key = format!("{}:{}", mem_id, query_hash);
+        let mut entries = self.entries.lock().unwrap();
+
+        if count % self.cooldown_interval == 0 && count > 0 {
+            entries.clear();
+        }
+
+        let current = entries.entry(key).or_insert(0);
+        if *current >= 3 {
+            return false;
+        }
+        *current += 1;
+        true
+    }
+
+    pub fn reset(&self) {
+        self.entries.lock().unwrap().clear();
+        self.retrieval_count.store(0, Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,5 +582,31 @@ mod tests {
 
         let results_no_ctx = retriever.search("u1", "咖啡", 5, None);
         assert!(!results_no_ctx.is_empty());
+    }
+
+    #[test]
+    fn test_suppression_basic_within_limit() {
+        let registry = SuppressionRegistry::new(100);
+        assert!(registry.should_suppress("m1", "q1"));
+        assert!(registry.should_suppress("m1", "q1"));
+        assert!(registry.should_suppress("m1", "q1"));
+        assert!(!registry.should_suppress("m1", "q1"));
+    }
+
+    #[test]
+    fn test_suppression_cooldown_reset() {
+        let registry = SuppressionRegistry::new(3);
+        assert!(registry.should_suppress("m1", "q1"));
+        assert!(registry.should_suppress("m1", "q1"));
+        registry.should_suppress("m2", "q2"); // 3rd call triggers cooldown clear
+        assert!(registry.should_suppress("m1", "q1"));
+    }
+
+    #[test]
+    fn test_suppression_independent_keys() {
+        let registry = SuppressionRegistry::new(100);
+        assert!(registry.should_suppress("m1", "q1"));
+        assert!(registry.should_suppress("m2", "q2"));
+        assert!(registry.should_suppress("m1", "q2"));
     }
 }

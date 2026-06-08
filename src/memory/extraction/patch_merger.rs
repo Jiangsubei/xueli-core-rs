@@ -1,4 +1,4 @@
-use crate::core::types::MemoryPatch;
+use crate::core::types::{MemoryItem, MemoryPatch, MemoryType};
 use crate::prelude::XueliResult;
 
 /// 记忆 Patch 合并器 — 将新提取的记忆合并到已有记忆
@@ -84,6 +84,48 @@ impl PatchMerger {
                 .count();
             (common as f64 / min_len as f64) > 0.75
         })
+    }
+
+    /// Check if metadata shows the memory was suppressed
+    pub fn is_suppressed_memory(metadata: &serde_json::Value) -> bool {
+        metadata
+            .get("patch_status")
+            .and_then(|v| v.as_str())
+            .map(|s| s == "superseded" || s == "contextualized")
+            .unwrap_or(false)
+    }
+
+    /// Map reflection action to new memory patch_status
+    pub fn resolve_new_memory_patch_status(action: &str) -> String {
+        match action.to_lowercase().as_str() {
+            "prefer_existing" => "superseded".to_string(),
+            "prefer_new" | "keep_both_prefer_recent" | "merge_context" => {
+                "active_patch".to_string()
+            }
+            _ => "conflict_reflected".to_string(),
+        }
+    }
+
+    /// Map reflection action to existing memory patch_status
+    pub fn resolve_existing_memory_patch_status(action: &str) -> String {
+        match action.to_lowercase().as_str() {
+            "prefer_new" | "keep_both_prefer_recent" => "superseded".to_string(),
+            "merge_context" => "contextualized".to_string(),
+            _ => "active".to_string(),
+        }
+    }
+
+    /// Check if ordinary memory should be promoted to important
+    pub fn should_promote_to_important(item: &MemoryItem) -> bool {
+        matches!(
+            item.memory_type,
+            MemoryType::Fact
+                | MemoryType::Preference
+                | MemoryType::Event
+                | MemoryType::Opinion
+                | MemoryType::Relationship
+        ) && item.importance >= 5.0
+            && item.access_count >= 2
     }
 }
 
@@ -172,5 +214,146 @@ mod tests {
     fn test_is_duplicate_different() {
         let merger = PatchMerger::new();
         assert!(!merger.is_duplicate("用户喜欢喝咖啡", &["用户住在北京"]));
+    }
+
+    #[test]
+    fn test_is_suppressed_memory_superseded() {
+        let metadata = serde_json::json!({"patch_status": "superseded"});
+        assert!(PatchMerger::is_suppressed_memory(&metadata));
+    }
+
+    #[test]
+    fn test_is_suppressed_memory_contextualized() {
+        let metadata = serde_json::json!({"patch_status": "contextualized"});
+        assert!(PatchMerger::is_suppressed_memory(&metadata));
+    }
+
+    #[test]
+    fn test_is_suppressed_memory_active() {
+        let metadata = serde_json::json!({"patch_status": "active"});
+        assert!(!PatchMerger::is_suppressed_memory(&metadata));
+    }
+
+    #[test]
+    fn test_is_suppressed_memory_no_status() {
+        let metadata = serde_json::json!({});
+        assert!(!PatchMerger::is_suppressed_memory(&metadata));
+    }
+
+    #[test]
+    fn test_resolve_new_memory_patch_status_prefer_existing() {
+        assert_eq!(
+            PatchMerger::resolve_new_memory_patch_status("prefer_existing"),
+            "superseded"
+        );
+    }
+
+    #[test]
+    fn test_resolve_new_memory_patch_status_prefer_new() {
+        assert_eq!(
+            PatchMerger::resolve_new_memory_patch_status("prefer_new"),
+            "active_patch"
+        );
+    }
+
+    #[test]
+    fn test_resolve_new_memory_patch_status_keep_both() {
+        assert_eq!(
+            PatchMerger::resolve_new_memory_patch_status("keep_both_prefer_recent"),
+            "active_patch"
+        );
+    }
+
+    #[test]
+    fn test_resolve_new_memory_patch_status_merge_context() {
+        assert_eq!(
+            PatchMerger::resolve_new_memory_patch_status("merge_context"),
+            "active_patch"
+        );
+    }
+
+    #[test]
+    fn test_resolve_new_memory_patch_status_unknown() {
+        assert_eq!(
+            PatchMerger::resolve_new_memory_patch_status("unknown_action"),
+            "conflict_reflected"
+        );
+    }
+
+    #[test]
+    fn test_resolve_existing_memory_patch_status_prefer_new() {
+        assert_eq!(
+            PatchMerger::resolve_existing_memory_patch_status("prefer_new"),
+            "superseded"
+        );
+    }
+
+    #[test]
+    fn test_resolve_existing_memory_patch_status_keep_both() {
+        assert_eq!(
+            PatchMerger::resolve_existing_memory_patch_status("keep_both_prefer_recent"),
+            "superseded"
+        );
+    }
+
+    #[test]
+    fn test_resolve_existing_memory_patch_status_merge_context() {
+        assert_eq!(
+            PatchMerger::resolve_existing_memory_patch_status("merge_context"),
+            "contextualized"
+        );
+    }
+
+    #[test]
+    fn test_resolve_existing_memory_patch_status_unknown() {
+        assert_eq!(
+            PatchMerger::resolve_existing_memory_patch_status("prefer_existing"),
+            "active"
+        );
+    }
+
+    #[test]
+    fn test_should_promote_to_important_eligible() {
+        let item = MemoryItem {
+            id: "id1".to_string(),
+            user_id: "u1".to_string(),
+            content: "test".to_string(),
+            memory_type: MemoryType::Fact,
+            importance: 6.0,
+            created_at: chrono::Utc::now(),
+            last_accessed_at: chrono::Utc::now(),
+            access_count: 3,
+        };
+        assert!(PatchMerger::should_promote_to_important(&item));
+    }
+
+    #[test]
+    fn test_should_promote_to_important_not_eligible_low_importance() {
+        let item = MemoryItem {
+            id: "id2".to_string(),
+            user_id: "u1".to_string(),
+            content: "test".to_string(),
+            memory_type: MemoryType::Fact,
+            importance: 4.0,
+            created_at: chrono::Utc::now(),
+            last_accessed_at: chrono::Utc::now(),
+            access_count: 3,
+        };
+        assert!(!PatchMerger::should_promote_to_important(&item));
+    }
+
+    #[test]
+    fn test_should_promote_to_important_not_eligible_low_access() {
+        let item = MemoryItem {
+            id: "id3".to_string(),
+            user_id: "u1".to_string(),
+            content: "test".to_string(),
+            memory_type: MemoryType::Fact,
+            importance: 6.0,
+            created_at: chrono::Utc::now(),
+            last_accessed_at: chrono::Utc::now(),
+            access_count: 1,
+        };
+        assert!(!PatchMerger::should_promote_to_important(&item));
     }
 }
