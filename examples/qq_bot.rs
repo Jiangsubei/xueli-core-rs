@@ -2,8 +2,7 @@
 //!
 //! 演示如何使用 xueli-core 库构建一个 QQ Bot
 
-use std::sync::Arc;
-
+use xueli_core::adapters::napcat::NapCatAdapter;
 use xueli_core::core::config::XueliConfig;
 use xueli_core::core::runtime::BotRuntime;
 
@@ -18,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = XueliConfig::default();
 
     // 创建运行时
-    let runtime = BotRuntime::new(config);
+    let runtime: BotRuntime<NapCatAdapter> = BotRuntime::new(config);
     runtime
         .init()
         .await

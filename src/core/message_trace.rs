@@ -113,6 +113,7 @@ mod tests {
             raw_payload: None,
             received_at: Utc::now(),
             session: None,
+            ..Default::default()
         };
         let key = get_execution_key(&event);
         assert!(key.contains("group:g1"));

@@ -139,6 +139,7 @@ mod tests {
             raw_payload: None,
             received_at: chrono::Utc::now(),
             session: None,
+            ..Default::default()
         };
         let session = resolver.reply_session_for_event(&event);
         assert!(session.scope.is_group());

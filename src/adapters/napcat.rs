@@ -263,6 +263,7 @@ impl NapCatAdapter {
                         scope,
                         user_id: Some(sender_id),
                     }),
+                    ..Default::default()
                 })
             }
             "notice" => {
@@ -275,6 +276,7 @@ impl NapCatAdapter {
                     raw_payload: Some(raw.to_string()),
                     received_at: chrono::Utc::now(),
                     session: None,
+                    ..Default::default()
                 })
             }
             _ => Ok(InboundEvent {
@@ -285,6 +287,7 @@ impl NapCatAdapter {
                 raw_payload: Some(raw.to_string()),
                 received_at: chrono::Utc::now(),
                 session: None,
+                ..Default::default()
             }),
         }
     }
@@ -326,10 +329,16 @@ impl PlatformAdapter for NapCatAdapter {
     }
 
     fn strip_mentions(&self, text: &str) -> String {
-        // OneBot @格式通常为 [CQ:at,qq=xxx] 或纯文本中的 @昵称
-        // 这里做简单处理：移除 CQ:at 码和行首的 @昵称
         let re = regex::Regex::new(r"\[CQ:at,qq=\d+\]|^@[^\s]+\s*").unwrap();
         re.replace_all(text, "").trim().to_string()
+    }
+
+    fn extract_mentions(&self, event: &InboundEvent) -> Vec<String> {
+        event.mentioned_user_ids.clone()
+    }
+
+    fn resolve_mention_placeholders(&self, text: &str, _mentions: &[String]) -> String {
+        text.to_string()
     }
 
     fn platform_name(&self) -> &str {
