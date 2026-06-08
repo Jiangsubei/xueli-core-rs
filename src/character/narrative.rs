@@ -1,9 +1,13 @@
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use crate::character::{build_scope_payload_path, legacy_payload_path};
+use crate::prelude::XueliResult;
+
 /// 叙事线 — 追踪长期相处中的叙事脉络
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NarrativeThread {
     pub id: String,
     pub user_id: String,
@@ -12,24 +16,32 @@ pub struct NarrativeThread {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub events: Vec<NarrativeEvent>,
-    /// 对话轮次计数（用于判断是否需要更新）
     pub turn_count_since_last_update: usize,
 }
 
 /// 叙事事件
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NarrativeEvent {
     pub timestamp: DateTime<Utc>,
     pub description: String,
     pub significance: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct NarrativeSelfPayload {
+    #[serde(default)]
+    narrative_self: String,
+    #[serde(default)]
+    updated_at: String,
+}
+
 /// 叙事服务 — 管理每个用户的叙事线。
 pub struct NarrativeService {
     threads: Mutex<HashMap<String, NarrativeThread>>,
-    /// 每多少轮对话触发一次叙事更新
     update_interval: usize,
     storage_dir: String,
+    narrative_self: Mutex<Option<String>>,
+    narrative_self_user: Mutex<Option<String>>,
 }
 
 impl NarrativeThread {
@@ -52,12 +64,13 @@ impl NarrativeService {
     pub fn new(storage_dir: &str) -> Self {
         Self {
             threads: Mutex::new(HashMap::new()),
-            update_interval: 50,
+            update_interval: 10,
             storage_dir: storage_dir.to_string(),
+            narrative_self: Mutex::new(None),
+            narrative_self_user: Mutex::new(None),
         }
     }
 
-    /// 获取用户的叙事线（不存在则创建）
     pub fn get_thread(&self, user_id: &str) -> NarrativeThread {
         let mut threads = self.threads.lock().unwrap();
         threads
@@ -66,7 +79,6 @@ impl NarrativeService {
             .clone()
     }
 
-    /// 添加事件到叙事线
     pub fn add_event(&self, user_id: &str, description: &str, significance: f64) {
         let data_str = {
             let mut threads = self.threads.lock().unwrap();
@@ -80,7 +92,6 @@ impl NarrativeService {
             });
             thread.turn_count_since_last_update += 1;
             thread.updated_at = Utc::now();
-            // 保留最近 200
             if thread.events.len() > 200 {
                 thread.events.drain(..thread.events.len() - 200);
             }
@@ -94,14 +105,14 @@ impl NarrativeService {
         }
     }
 
-    /// 更新叙事主线摘要
     pub fn update_summary(&self, user_id: &str, summary: &str) {
+        let truncated = Self::build_summary(summary);
         let data_str = {
             let mut threads = self.threads.lock().unwrap();
             let thread = threads
                 .entry(user_id.to_string())
                 .or_insert_with(|| Self::load_or_create(user_id, &self.storage_dir));
-            thread.summary = summary.to_string();
+            thread.summary = truncated;
             thread.updated_at = Utc::now();
             serde_json::to_string_pretty(thread).ok()
         };
@@ -113,13 +124,28 @@ impl NarrativeService {
         }
     }
 
-    /// 检查是否应触发叙事更新
-    pub fn should_update(&self, user_id: &str) -> bool {
-        let thread = self.get_thread(user_id);
-        thread.turn_count_since_last_update >= self.update_interval
+    fn build_summary(raw: &str) -> String {
+        let compact: String = raw.split_whitespace().collect::<Vec<&str>>().join(" ");
+        if compact.is_empty() {
+            return String::new();
+        }
+        if compact.chars().count() <= 80 {
+            return compact;
+        }
+        let truncated: String = compact.chars().take(80).collect();
+        truncated.trim_end().to_string() + "..."
     }
 
-    /// 标记叙事已更新（重置计数）
+    pub fn should_update(&self, user_id: &str, min_interval_seconds: f64) -> bool {
+        let thread = self.get_thread(user_id);
+        let turn_ok = thread.turn_count_since_last_update >= self.update_interval;
+        let elapsed = Utc::now()
+            .signed_duration_since(thread.updated_at)
+            .num_seconds() as f64;
+        let time_ok = elapsed >= min_interval_seconds;
+        turn_ok && time_ok
+    }
+
     pub fn mark_updated(&self, user_id: &str) {
         let mut threads = self.threads.lock().unwrap();
         if let Some(thread) = threads.get_mut(user_id) {
@@ -127,13 +153,83 @@ impl NarrativeService {
         }
     }
 
+    pub fn update_narrative_self(&self, user_id: &str, signal_text: &str) -> XueliResult<()> {
+        {
+            let mut ns = self.narrative_self.lock().unwrap();
+            *ns = Some(signal_text.to_string());
+            let mut nsu = self.narrative_self_user.lock().unwrap();
+            *nsu = Some(user_id.to_string());
+        }
+        let payload = NarrativeSelfPayload {
+            narrative_self: signal_text.to_string(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let path = build_scope_payload_path(&self.storage_dir, user_id, "narrative_self.json");
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let content = serde_json::to_string_pretty(&payload).unwrap_or_default();
+        let tmp = format!("{}.tmp", path);
+        let _ = std::fs::write(&tmp, &content);
+        let _ = std::fs::rename(&tmp, &path);
+        Ok(())
+    }
+
+    pub fn get_narrative_self(&self) -> Option<String> {
+        self.narrative_self.lock().unwrap().clone()
+    }
+
+    pub fn load_narrative_self(&self, user_id: &str) -> Option<String> {
+        let path = build_scope_payload_path(&self.storage_dir, user_id, "narrative_self.json");
+        match std::fs::read_to_string(&path) {
+            Ok(data) => match serde_json::from_str::<NarrativeSelfPayload>(&data) {
+                Ok(p) if !p.narrative_self.is_empty() => return Some(p.narrative_self),
+                _ => {}
+            },
+            Err(_) => {}
+        }
+        let legacy = legacy_payload_path(&self.storage_dir, user_id, "narrative_self.json");
+        match std::fs::read_to_string(&legacy) {
+            Ok(data) => serde_json::from_str::<NarrativeSelfPayload>(&data)
+                .ok()
+                .and_then(|p| {
+                    if p.narrative_self.is_empty() {
+                        None
+                    } else {
+                        Some(p.narrative_self)
+                    }
+                }),
+            Err(_) => None,
+        }
+    }
+
+    // ── async variants ──
+
+    pub async fn update_narrative_self_async(
+        &self,
+        user_id: String,
+        signal_text: String,
+    ) -> XueliResult<()> {
+        tokio::task::block_in_place(|| self.update_narrative_self(&user_id, &signal_text))
+    }
+
+    pub async fn get_narrative_self_async(&self) -> Option<String> {
+        tokio::task::block_in_place(|| self.get_narrative_self())
+    }
+
     fn thread_path(&self, user_id: &str) -> String {
-        format!("{}/{}.json", self.storage_dir, user_id)
+        build_scope_payload_path(&self.storage_dir, user_id, "narrative.json")
     }
 
     fn load_or_create(user_id: &str, dir: &str) -> NarrativeThread {
-        let path = format!("{}/{}.json", dir, user_id);
+        let path = build_scope_payload_path(dir, user_id, "narrative.json");
         if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(thread) = serde_json::from_str::<NarrativeThread>(&data) {
+                return thread;
+            }
+        }
+        let legacy = legacy_payload_path(dir, user_id, "narrative.json");
+        if let Ok(data) = std::fs::read_to_string(&legacy) {
             if let Ok(thread) = serde_json::from_str::<NarrativeThread>(&data) {
                 return thread;
             }
@@ -193,16 +289,97 @@ mod tests {
     #[test]
     fn test_should_update() {
         let svc = make_service();
-        // 新线程不应立即触发更新
-        assert!(!svc.should_update("u1"));
+        assert!(!svc.should_update("u1", 1800.0));
 
-        // 手动增加足够多的事件
-        for i in 0..60 {
+        for i in 0..15 {
             svc.add_event("u1", &format!("对话轮次 {}", i), 0.3);
         }
-        assert!(svc.should_update("u1"));
+        assert!(svc.should_update("u1", 0.0));
 
         svc.mark_updated("u1");
-        assert!(!svc.should_update("u1"));
+        assert!(!svc.should_update("u1", 0.0));
+    }
+
+    #[test]
+    fn test_should_update_respects_interval() {
+        let svc = make_service();
+        for i in 0..15 {
+            svc.add_event("u1", &format!("对话轮次 {}", i), 0.3);
+        }
+        assert!(!svc.should_update("u1", 999999.0));
+        assert!(svc.should_update("u1", 0.0));
+    }
+
+    #[test]
+    fn test_build_summary_truncation() {
+        let long = "这是非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常长的消息文本用来测试摘要截断功能超过限制";
+        let result = NarrativeService::build_summary(long);
+        assert!(result.chars().count() <= 83); // 80 chars + "..."
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_build_summary_short() {
+        let short = "简短消息";
+        let result = NarrativeService::build_summary(short);
+        assert_eq!(result, short);
+    }
+
+    #[test]
+    fn test_build_summary_empty() {
+        let result = NarrativeService::build_summary("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_build_summary_exactly_80() {
+        let exact = "一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十";
+        let result = NarrativeService::build_summary(exact);
+        assert!(result.chars().count() <= 83);
+    }
+
+    #[test]
+    fn test_update_summary_truncation() {
+        let svc = make_service();
+        svc.update_summary(
+            "u1",
+            "这是非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常长的消息文本用来测试摘要截断功能超过限制",
+        );
+        let thread = svc.get_thread("u1");
+        assert!(thread.summary.chars().count() <= 83);
+        assert!(thread.summary.ends_with("..."));
+    }
+
+    #[test]
+    fn test_narrative_self_persist() {
+        let svc = make_service();
+        svc.update_narrative_self("u1", "关系正在深入发展").unwrap();
+        let ns = svc.get_narrative_self();
+        assert_eq!(ns, Some("关系正在深入发展".to_string()));
+    }
+
+    #[test]
+    fn test_narrative_self_load() {
+        let svc = make_service();
+        svc.update_narrative_self("u2", "用户对我越来越信任")
+            .unwrap();
+        let loaded = svc.load_narrative_self("u2");
+        assert_eq!(loaded, Some("用户对我越来越信任".to_string()));
+    }
+
+    #[test]
+    fn test_narrative_self_none_for_unknown_user() {
+        let svc = make_service();
+        let loaded = svc.load_narrative_self("unknown_user");
+        assert_eq!(loaded, None);
+    }
+
+    #[test]
+    fn test_scope_based_narrative_path() {
+        let dir = "/tmp/test_narratives";
+        let user_id = "qq:group:g123:u456";
+        let path = build_scope_payload_path(dir, user_id, "narrative.json");
+        assert!(path.contains("qq_group_g123_u456"));
+        assert!(path.contains("narrative.json"));
     }
 }

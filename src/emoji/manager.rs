@@ -1,40 +1,73 @@
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::time::Instant;
 
-use crate::emoji::database::{EmojiDB, EmojiDatabase, EmojiEntry, StickerRecord};
-use crate::prelude::XueliResult;
+use chrono::Timelike;
+use parking_lot::Mutex;
+
+use crate::core::errors::XueliError;
+use crate::emoji::database::{EmojiDB, EmojiEntry, StickerRecord};
+use crate::prelude::{AIClient, PromptTemplateLoader, XueliResult};
 use crate::services::vision_client::VisionClient;
-use crate::traits::ai_client::AIClient;
 use crate::util::crypto;
 
-/// 表情管理器 — 采集、分类、推荐表情。
-///
-/// 贴纸类型（sticker）自动入库，SHA256 去重；普通图片不做表情采集。
-pub struct EmojiManager {
+pub struct EmojiManager<A: AIClient, L: PromptTemplateLoader> {
     db: EmojiDB,
-    /// 最近使用过的表情 (FIFO 用于冷却)
-    recent_used: Mutex<VecDeque<String>>,
+    recent_used: StdMutex<VecDeque<String>>,
     max_recent: usize,
+    vision_client: Option<Arc<VisionClient<A, L>>>,
+    classification_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    activity_flag: Mutex<Instant>,
+    classification_enabled: bool,
+    idle_seconds: f64,
+    classification_interval_seconds: f64,
+    classification_windows: Vec<String>,
+    emotion_labels: Vec<String>,
 }
 
-impl EmojiManager {
+impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> EmojiManager<A, L> {
     pub fn new(db: EmojiDB) -> Self {
         Self {
             db,
-            recent_used: Mutex::new(VecDeque::new()),
+            recent_used: StdMutex::new(VecDeque::new()),
             max_recent: 20,
+            vision_client: None,
+            classification_handle: parking_lot::Mutex::new(None),
+            activity_flag: Mutex::new(Instant::now()),
+            classification_enabled: false,
+            idle_seconds: 45.0,
+            classification_interval_seconds: 30.0,
+            classification_windows: Vec::new(),
+            emotion_labels: Vec::new(),
         }
     }
 
-    /// 获取数据库引用
-    pub fn database(&self) -> &EmojiDatabase {
+    pub fn with_vision_client(mut self, vc: Arc<VisionClient<A, L>>) -> Self {
+        self.vision_client = Some(vc);
+        self
+    }
+
+    pub fn with_classification_config(
+        mut self,
+        enabled: bool,
+        idle_seconds: f64,
+        interval_seconds: f64,
+        windows: Vec<String>,
+        emotion_labels: Vec<String>,
+    ) -> Self {
+        self.classification_enabled = enabled;
+        self.idle_seconds = idle_seconds;
+        self.classification_interval_seconds = interval_seconds;
+        self.classification_windows = windows;
+        self.emotion_labels = emotion_labels;
+        self
+    }
+
+    pub fn database(&self) -> &crate::emoji::database::EmojiDatabase {
         self.db.database()
     }
 
-    /// 采集表情贴纸入库（SHA256 去重，自动计算 hash）
-    ///
-    /// 从文件字节、消息 ID、用户 ID、群 ID 直接采集，自动检测格式并计算 SHA256。
-    /// 返回贴纸记录（None 表示跳过或失败）。
     pub async fn capture_sticker(
         &self,
         file_bytes: &[u8],
@@ -54,7 +87,6 @@ impl EmojiManager {
         let file_format = Self::detect_format(file_bytes);
         let file_path = format!("data/emojis/{}.{}", sha256, file_format);
 
-        // 保存文件到磁盘
         if !std::path::Path::new(&file_path).exists() {
             let tmp_path = format!("{}.tmp", file_path);
             if let Some(parent) = std::path::Path::new(&file_path).parent() {
@@ -78,7 +110,6 @@ impl EmojiManager {
             )
             .await?;
 
-        // 如果新入库，同步刷新内存缓存
         if let Some(ref rec) = record {
             self.db.refresh_cache();
             let emoji_id = format!("emoji_{}", &rec.file_hash[..16.min(rec.file_hash.len())]);
@@ -88,7 +119,6 @@ impl EmojiManager {
         Ok(record)
     }
 
-    /// 检测文件格式（通过魔术字节）
     pub fn detect_format(data: &[u8]) -> String {
         if data.len() >= 3 && data[..3] == [b'G', b'I', b'F'] {
             return "gif".to_string();
@@ -102,9 +132,7 @@ impl EmojiManager {
         "gif".to_string()
     }
 
-    /// 根据对话内容推荐表情（优先按情绪匹配，其次随机）
     pub fn recommend(&self, intent_keywords: &str) -> XueliResult<Option<EmojiEntry>> {
-        // 先尝试在内存缓存中按情绪搜索
         let emotion = detect_emotion(intent_keywords);
         if let Some(em) = &emotion {
             if let Ok(Some(entry)) = self.db.find_by_emotion(em) {
@@ -116,7 +144,6 @@ impl EmojiManager {
         self.db.get_random(Some("sticker"))
     }
 
-    /// 记录表情使用（冷却追踪）
     pub fn record_usage(&self, emoji_id: &str) -> XueliResult<()> {
         self.db.increment_usage(emoji_id);
 
@@ -128,7 +155,6 @@ impl EmojiManager {
         Ok(())
     }
 
-    /// 检查是否为近期已用（避免重复发送）
     pub fn is_recently_used(&self, emoji_id: &str) -> bool {
         self.recent_used
             .lock()
@@ -137,30 +163,24 @@ impl EmojiManager {
             .any(|id| id == emoji_id)
     }
 
-    /// 对贴纸进行 VLM 情绪分类（委托给 VisionClient）
-    ///
-    /// 如果 VisionClient 可用，调用视觉模型对贴纸进行情绪分类，
-    /// 将结果写入 description 并注册该贴纸。
-    pub async fn classify_sticker<A: AIClient>(
-        &self,
-        vision_client: Option<&VisionClient<A>>,
-        file_hash: &str,
-        file_data: &[u8],
-    ) -> XueliResult<String> {
-        let vc = match vision_client {
-            Some(v) => v,
-            None => return Err("VisionClient 不可用".into()),
-        };
+    pub async fn classify_sticker(&self, file_hash: &str, file_data: &[u8]) -> XueliResult<String> {
+        let vc = self
+            .vision_client
+            .as_ref()
+            .ok_or_else(|| XueliError::Internal("VisionClient 不可用".into()))?;
 
         if !vc.is_available() {
-            return Err("VLM 未配置".into());
+            return Err(XueliError::Internal("VLM 未配置".into()));
         }
 
         use base64::{engine::general_purpose::STANDARD, Engine};
         let image_b64 = STANDARD.encode(file_data);
 
-        let mood = vc.classify_sticker_emotion(&image_b64, "").await?;
-        let trimmed = mood.trim().to_string();
+        let empty_tones: Vec<String> = Vec::new();
+        let emotion_result = vc
+            .classify_sticker_emotion(&image_b64, &self.emotion_labels, &empty_tones)
+            .await?;
+        let trimmed = emotion_result.primary_emotion.trim().to_string();
 
         if !trimmed.is_empty() {
             let database = self.db.database();
@@ -174,13 +194,181 @@ impl EmojiManager {
         Ok(trimmed)
     }
 
-    /// 表情库大小
     pub fn count(&self) -> usize {
         self.db.count()
     }
+
+    pub fn start_idle_classification_loop(self: &Arc<Self>) {
+        if !self.classification_enabled {
+            return;
+        }
+        if self.vision_client.is_none() {
+            tracing::warn!("[表情管理] 未配置 VisionClient，无法启动空闲分类循环");
+            return;
+        }
+
+        {
+            let mut guard = self.classification_handle.lock();
+            if guard.is_some() {
+                return;
+            }
+            let this = Arc::clone(self);
+            let h = tokio::spawn(async move {
+                this.run_classification_loop().await;
+            });
+            *guard = Some(h);
+        }
+    }
+
+    pub fn stop_idle_classification_loop(&self) {
+        let mut guard = self.classification_handle.lock();
+        if let Some(handle) = guard.take() {
+            handle.abort();
+        }
+    }
+
+    pub fn record_activity(&self) {
+        *self.activity_flag.lock() = Instant::now();
+    }
+
+    async fn run_classification_loop(&self) {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs_f64(self.next_wait_seconds())) => {
+                    if !self.can_run_classification_now() {
+                        continue;
+                    }
+                }
+            }
+
+            let database = self.db.database();
+            let pending = match database.list_pending_async().await {
+                Ok(p) => p,
+                Err(_) => {
+                    tokio::time::sleep(tokio::time::Duration::from_secs_f64(
+                        self.classification_interval_seconds.max(1.0),
+                    ))
+                    .await;
+                    continue;
+                }
+            };
+
+            if pending.is_empty() {
+                return;
+            }
+
+            for record in pending {
+                self.classify_one(&record).await;
+            }
+        }
+    }
+
+    async fn classify_one(&self, record: &StickerRecord) {
+        let file_path = record.file_path.clone();
+        if file_path.is_empty() {
+            return;
+        }
+
+        let file_data = match tokio::fs::read(&file_path).await {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        let database = self.db.database();
+        if database
+            .set_emotion_status_async(&record.file_hash, "processing")
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        if self
+            .classify_sticker(&record.file_hash, &file_data)
+            .await
+            .is_err()
+        {
+            tracing::warn!("[表情管理] 表情包分类失败");
+        }
+    }
+
+    fn can_run_classification_now(&self) -> bool {
+        if !self.classification_enabled {
+            return false;
+        }
+        let elapsed = self.activity_flag.lock().elapsed().as_secs_f64();
+        if elapsed < self.idle_seconds {
+            return false;
+        }
+        self.is_within_classification_window()
+    }
+
+    fn next_wait_seconds(&self) -> f64 {
+        let elapsed = self.activity_flag.lock().elapsed().as_secs_f64();
+        let idle_remaining = (self.idle_seconds - elapsed).max(0.0);
+        if idle_remaining > 0.0 {
+            return idle_remaining.min(1.0).max(0.05);
+        }
+        if !self.is_within_classification_window() {
+            return self.classification_interval_seconds.min(5.0).max(0.1);
+        }
+        self.classification_interval_seconds.max(0.05)
+    }
+
+    fn is_within_classification_window(&self) -> bool {
+        if self.classification_windows.is_empty() {
+            return true;
+        }
+        let now = chrono::Local::now().time();
+        let current_minutes = now.hour() as i32 * 60 + now.minute() as i32;
+        for (start_min, end_min) in self.parsed_windows() {
+            if start_min <= end_min {
+                if start_min <= current_minutes && current_minutes < end_min {
+                    return true;
+                }
+            } else if current_minutes >= start_min || current_minutes < end_min {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn parsed_windows(&self) -> Vec<(i32, i32)> {
+        let mut parsed = Vec::new();
+        for window in &self.classification_windows {
+            let parts: Vec<&str> = window.split('-').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            if let (Ok(s), Ok(e)) = (
+                Self::parse_clock_minutes(parts[0]),
+                Self::parse_clock_minutes(parts[1]),
+            ) {
+                parsed.push((s, e));
+            }
+        }
+        parsed
+    }
+
+    fn parse_clock_minutes(text: &str) -> Result<i32, ()> {
+        let parts: Vec<&str> = text.trim().split(':').collect();
+        if parts.len() != 2 {
+            return Err(());
+        }
+        let hours: i32 = parts[0].parse().map_err(|_| ())?;
+        let mins: i32 = parts[1].parse().map_err(|_| ())?;
+        Ok(hours * 60 + mins)
+    }
+
+    pub fn has_pending_stickers(&self) -> bool {
+        self.db
+            .database()
+            .get_stats()
+            .map(|s| s.pending > 0)
+            .unwrap_or(false)
+    }
 }
 
-/// 简单的情绪关键词检测
 pub fn detect_emotion(text: &str) -> Option<String> {
     let text = text.to_lowercase();
     let pairs: &[(&[&str], &str)] = &[
@@ -203,9 +391,14 @@ pub fn detect_emotion(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::ai_client::DefaultAIClient;
+    use crate::services::prompt_loader::NoopPromptTemplateLoader;
     use tempfile::TempDir;
 
-    fn make_mgr() -> (EmojiManager, TempDir) {
+    fn make_mgr() -> (
+        EmojiManager<DefaultAIClient, NoopPromptTemplateLoader>,
+        TempDir,
+    ) {
         let dir = TempDir::new().unwrap();
         let db = EmojiDB::new(dir.path().to_str().unwrap());
         (EmojiManager::new(db), dir)
@@ -213,21 +406,29 @@ mod tests {
 
     #[test]
     fn test_detect_format() {
-        // PNG magic
         let png = [0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-        assert_eq!(EmojiManager::detect_format(&png), "png");
+        assert_eq!(
+            EmojiManager::<DefaultAIClient, NoopPromptTemplateLoader>::detect_format(&png),
+            "png"
+        );
 
-        // GIF magic
         let gif = [b'G', b'I', b'F', b'8', b'9', b'a'];
-        assert_eq!(EmojiManager::detect_format(&gif), "gif");
+        assert_eq!(
+            EmojiManager::<DefaultAIClient, NoopPromptTemplateLoader>::detect_format(&gif),
+            "gif"
+        );
 
-        // JPEG magic
         let jpg = [0xFFu8, 0xD8, 0xFF, 0xE0];
-        assert_eq!(EmojiManager::detect_format(&jpg), "jpg");
+        assert_eq!(
+            EmojiManager::<DefaultAIClient, NoopPromptTemplateLoader>::detect_format(&jpg),
+            "jpg"
+        );
 
-        // Unknown -> defaults to gif
         let unknown = [0x00u8, 0x01, 0x02];
-        assert_eq!(EmojiManager::detect_format(&unknown), "gif");
+        assert_eq!(
+            EmojiManager::<DefaultAIClient, NoopPromptTemplateLoader>::detect_format(&unknown),
+            "gif"
+        );
     }
 
     #[tokio::test]
@@ -263,7 +464,6 @@ mod tests {
         let r1 = mgr.capture_sticker(data, "msg1", "u1", "g1").await.unwrap();
         assert!(r1.is_some());
         let r2 = mgr.capture_sticker(data, "msg2", "u2", "g2").await.unwrap();
-        // 重复 SHA256 仍返回记录（更新 last_seen_at）
         assert!(r2.is_some());
     }
 
@@ -290,7 +490,6 @@ mod tests {
         assert!(mgr.is_recently_used(&emoji_id));
 
         let recommendation = mgr.recommend("哈哈").unwrap();
-        // 推荐不应该返回最近用过的
         assert!(recommendation.is_none() || recommendation.unwrap().id != emoji_id);
     }
 }

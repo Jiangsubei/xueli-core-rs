@@ -1,7 +1,10 @@
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use crate::character::{build_scope_payload_path, legacy_payload_path};
 use crate::prelude::XueliResult;
 
 /// 角色卡 — 定义 bot 的角色身份及其对特定用户的适应
@@ -67,6 +70,49 @@ impl Default for CharacterCardSnapshot {
             relationship_state_summary: String::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PersonaHints {
+    pub core_traits: Vec<String>,
+    pub tone_preferences: Vec<String>,
+    pub bot_persona_hints: Vec<String>,
+    #[serde(default)]
+    pub behavior_habits: Vec<String>,
+    #[serde(default)]
+    pub style_adaptation_summary: String,
+    #[serde(default)]
+    pub relationship_tone_hint: String,
+    #[serde(default)]
+    pub emotional_trend: String,
+    #[serde(default)]
+    pub feedback_summary: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedbackCategory {
+    Praise,
+    Criticism,
+    Correction,
+    Preference,
+    Other,
+}
+
+impl FeedbackCategory {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FeedbackCategory::Praise => "praise",
+            FeedbackCategory::Criticism => "criticism",
+            FeedbackCategory::Correction => "correction",
+            FeedbackCategory::Preference => "preference",
+            FeedbackCategory::Other => "other",
+        }
+    }
+}
+
+#[async_trait]
+pub trait PersonaHintProvider: Send + Sync {
+    async fn compute_character_adaptation_signal(&self, payload: &Value) -> Value;
 }
 
 // ── 内部持久化类型 ──
@@ -146,12 +192,11 @@ struct UserPayload {
 
 /// 角色卡服务 — 管理角色定义、用户快照和关系亲密度。
 pub struct CharacterCardService {
-    /// 角色基础定义
     card: CharacterCard,
-    /// 用户快照缓存
     snapshots: Mutex<HashMap<String, CharacterCardSnapshot>>,
-    /// 持久化目录
     storage_dir: String,
+    signal_orchestrator: Option<Arc<dyn PersonaHintProvider>>,
+    persona_hints_cache: Mutex<HashMap<String, PersonaHints>>,
 }
 
 impl CharacterCardService {
@@ -160,6 +205,8 @@ impl CharacterCardService {
             card,
             snapshots: Mutex::new(HashMap::new()),
             storage_dir: storage_dir.to_string(),
+            signal_orchestrator: None,
+            persona_hints_cache: Mutex::new(HashMap::new()),
         };
         svc.load_all();
         svc
@@ -182,12 +229,14 @@ impl CharacterCardService {
         }
     }
 
-    /// 获取角色基础定义
+    pub fn set_signal_orchestrator(&mut self, orchestrator: Option<Arc<dyn PersonaHintProvider>>) {
+        self.signal_orchestrator = orchestrator;
+    }
+
     pub fn get_card(&self) -> &CharacterCard {
         &self.card
     }
 
-    /// 获取用户快照（不存在则创建默认）
     pub fn get_snapshot(&self, user_id: &str) -> CharacterCardSnapshot {
         let mut snapshots = self.snapshots.lock().unwrap();
         snapshots
@@ -199,14 +248,12 @@ impl CharacterCardService {
             .clone()
     }
 
-    /// 更新用户快照
     pub fn update_snapshot(&self, snapshot: CharacterCardSnapshot) {
         let mut snapshots = self.snapshots.lock().unwrap();
         snapshots.insert(snapshot.user_id.clone(), snapshot.clone());
         self.save_one(&snapshot);
     }
 
-    /// 记录反馈并调整亲密度
     pub fn record_feedback(
         &self,
         user_id: &str,
@@ -235,7 +282,6 @@ impl CharacterCardService {
         self.update_snapshot(snapshot);
     }
 
-    /// 根据亲密度解析关系阶段
     pub fn resolve_stage(intimacy: f64) -> String {
         if intimacy >= 0.9 {
             "intimate"
@@ -253,9 +299,6 @@ impl CharacterCardService {
         .into()
     }
 
-    // ── 新增方法 ──────────────────────────────────────────
-
-    /// 记录用户显式反馈类别（category-based feedback counting）
     pub fn record_explicit_feedback_category(
         &self,
         user_id: &str,
@@ -275,7 +318,6 @@ impl CharacterCardService {
         Ok(())
     }
 
-    /// 记录交互信号（per-signal interaction tracking with weights）
     pub fn record_interaction_signal(&self, user_id: &str, signal_name: &str) -> XueliResult<()> {
         let normalized = signal_name.trim();
         if normalized.is_empty() {
@@ -291,7 +333,6 @@ impl CharacterCardService {
         Ok(())
     }
 
-    /// 记录回复反馈（feedback label tracking + intimacy delta）
     pub fn record_reply_feedback(
         &self,
         user_id: &str,
@@ -342,7 +383,6 @@ impl CharacterCardService {
         Ok(())
     }
 
-    /// 记录用户情绪（emotional history sliding window, last 10 entries）
     pub fn record_emotion(&self, user_id: &str, emotion_label: &str) -> XueliResult<()> {
         let tone = emotion_label.trim();
         if tone.is_empty() {
@@ -362,7 +402,6 @@ impl CharacterCardService {
         Ok(())
     }
 
-    /// 注入用户画像信号到快照
     pub fn update_snapshot_signals(
         &self,
         user_id: &str,
@@ -398,7 +437,6 @@ impl CharacterCardService {
         Ok(snapshot)
     }
 
-    /// 分析近期情绪历史趋势方向
     pub fn get_emotional_trend(&self, user_id: &str) -> String {
         let payload = self.load_payload(user_id);
         if payload.emotional_history.len() < 2 {
@@ -436,23 +474,19 @@ impl CharacterCardService {
         }
     }
 
-    /// 刷新用户快照：计算预测命中率、信号计数器，构建完整快照
     pub fn refresh_snapshot(&self, user_id: &str) -> CharacterCardSnapshot {
         let mut payload = self.load_payload(user_id);
 
-        // 统计显式反馈类别
         let mut category_counts: HashMap<String, usize> = HashMap::new();
         for entry in &payload.explicit_feedback {
             *category_counts.entry(entry.category.clone()).or_insert(0) += 1;
         }
 
-        // 统计信号
         let mut signal_counts: HashMap<String, i32> = HashMap::new();
         for entry in &payload.stable_signals {
             *signal_counts.entry(entry.signal.clone()).or_insert(0) += entry.weight;
         }
 
-        // 计算预测命中率
         let prediction_met = signal_counts.get("prediction:met").copied().unwrap_or(0) as usize;
         let prediction_failed =
             signal_counts.get("prediction:failed").copied().unwrap_or(0) as usize;
@@ -475,11 +509,16 @@ impl CharacterCardService {
             .cloned()
             .unwrap_or_default();
 
+        let hints = {
+            let cache = self.persona_hints_cache.lock().unwrap();
+            cache.get(user_id).cloned().unwrap_or_default()
+        };
+
         let snapshot = CharacterCardSnapshot {
             user_id: user_id.to_string(),
-            core_traits: Vec::new(),
-            tone_preferences: Vec::new(),
-            bot_persona_hints: Vec::new(),
+            core_traits: hints.core_traits,
+            tone_preferences: hints.tone_preferences,
+            bot_persona_hints: hints.bot_persona_hints,
             explicit_feedback_count: category_counts.values().sum(),
             stable_signal_count: signal_counts.values().sum::<i32>() as usize,
             intimacy_level: profile.intimacy_level,
@@ -488,11 +527,15 @@ impl CharacterCardService {
             } else {
                 profile.relationship_stage
             },
-            emotional_trend: self.get_emotional_trend(user_id),
+            emotional_trend: if hints.emotional_trend.is_empty() {
+                self.get_emotional_trend(user_id)
+            } else {
+                hints.emotional_trend
+            },
             updated_at: chrono::Utc::now().to_rfc3339(),
             prediction_feedback_summary,
-            relationship_tone_hint: String::new(),
-            behavior_habits: Vec::new(),
+            relationship_tone_hint: hints.relationship_tone_hint,
+            behavior_habits: hints.behavior_habits,
             relationship_state_summary: String::new(),
         };
 
@@ -503,16 +546,119 @@ impl CharacterCardService {
         snapshot
     }
 
-    /// 综合反馈应用：在一次调用中处理回复效果的所有维度
-    ///
-    /// 参数：
-    /// - `score`: 回复效度评分，正值 = 正向，负值 = 负向/需修复
-    /// - `feedback_label`: 反馈标签 (positive/negative/repair)
-    /// - `intent_label`: 回复意图标签
-    /// - `style_label`: 风格标签
-    /// - `emotion_label`: 用户情绪标签
-    /// - `expected_effect`: 预期效果
-    /// - `prediction_met`: 预测是否命中
+    pub async fn refresh_persona_hints_async(&self, user_id: &str) {
+        let orchestrator = match &self.signal_orchestrator {
+            Some(o) => o.clone(),
+            None => return,
+        };
+
+        let payload = self.build_adaptation_payload(user_id);
+        let result = orchestrator
+            .compute_character_adaptation_signal(&payload)
+            .await;
+
+        if result.is_null() || result.as_object().map_or(true, |o| o.is_empty()) {
+            return;
+        }
+
+        let core_traits = list_val(&result, "core_traits", 8);
+        let tone_preferences = list_val(&result, "tone_preferences", 8);
+        let bot_persona_hints = list_val(&result, "bot_persona_hints", 8);
+        let behavior_habits = list_val(&result, "behavior_habits", 8);
+        let style_adaptation_summary = str_val(&result, "style_adaptation_summary");
+        let relationship_tone_hint = str_val(&result, "relationship_tone_hint");
+        let emotional_trend = str_val(&result, "emotional_trend");
+        let feedback_summary = str_val(&result, "feedback_summary");
+
+        let hints = PersonaHints {
+            core_traits,
+            tone_preferences,
+            bot_persona_hints,
+            behavior_habits,
+            style_adaptation_summary,
+            relationship_tone_hint,
+            emotional_trend,
+            feedback_summary,
+        };
+
+        {
+            let mut cache = self.persona_hints_cache.lock().unwrap();
+            cache.insert(user_id.to_string(), hints);
+        }
+    }
+
+    pub fn get_cached_persona_hints(&self, user_id: &str) -> Option<PersonaHints> {
+        let cache = self.persona_hints_cache.lock().unwrap();
+        cache.get(user_id).cloned()
+    }
+
+    fn build_adaptation_payload(&self, user_id: &str) -> Value {
+        let payload = self.load_payload(user_id);
+        let profile = payload.relationship_profile.clone().unwrap_or_default();
+
+        let feedback_limit = 50;
+        let feedback_slice: Vec<&FeedbackEntry> = payload
+            .explicit_feedback
+            .iter()
+            .rev()
+            .take(feedback_limit)
+            .collect();
+        let feedback: Vec<Value> = feedback_slice
+            .iter()
+            .rev()
+            .map(|e| {
+                serde_json::json!({
+                    "text": e.text,
+                    "category": e.category,
+                    "created_at": e.created_at,
+                })
+            })
+            .collect();
+
+        let signals: Vec<Value> = payload
+            .stable_signals
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "signal": s.signal,
+                    "weight": s.weight,
+                    "created_at": s.created_at,
+                })
+            })
+            .collect();
+
+        let emotions: Vec<Value> = payload
+            .emotional_history
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "tone": e.tone,
+                    "created_at": e.created_at,
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "user_id": user_id,
+            "explicit_feedback": feedback,
+            "stable_signals": signals,
+            "relationship_profile": {
+                "intimacy_level": profile.intimacy_level,
+                "total_interactions": profile.total_interactions,
+                "reply_positive_count": profile.reply_positive_count,
+                "reply_negative_count": profile.reply_negative_count,
+                "reply_repair_count": profile.reply_repair_count,
+                "friction_signals": profile.friction_signals,
+                "last_feedback_label": profile.last_feedback_label,
+                "last_reply_intent": profile.last_reply_intent,
+                "relationship_stage": profile.relationship_stage,
+                "last_interaction_at": profile.last_interaction_at,
+                "last_intimacy_change": profile.last_intimacy_change,
+            },
+            "emotional_history": emotions,
+        })
+    }
+
     pub fn apply_reply_effect_bundle(
         &self,
         user_id: &str,
@@ -539,7 +685,6 @@ impl CharacterCardService {
             "neutral"
         };
 
-        // 记录评分信号
         if score_label == "negative" {
             payload.stable_signals.push(SignalEntry {
                 signal: "reply_negative".to_string(),
@@ -560,7 +705,6 @@ impl CharacterCardService {
             });
         }
 
-        // 记录意图+反馈组合信号
         if !normalized_intent.is_empty() && !normalized_feedback.is_empty() {
             payload.stable_signals.push(SignalEntry {
                 signal: format!("reply_effect:{}:{}", normalized_intent, normalized_feedback),
@@ -569,7 +713,6 @@ impl CharacterCardService {
             });
         }
 
-        // 记录预期效果
         let normalized_expected = expected_effect.trim().to_lowercase();
         if !normalized_expected.is_empty() {
             let actual = if score > 0.0 { "satisfy" } else { "clarify" };
@@ -580,7 +723,6 @@ impl CharacterCardService {
             });
         }
 
-        // 记录预测结果
         if let Some(met) = prediction_met {
             let suffix = if met { "met" } else { "failed" };
             payload.stable_signals.push(SignalEntry {
@@ -590,7 +732,6 @@ impl CharacterCardService {
             });
         }
 
-        // 更新关系亲密度
         if !normalized_feedback.is_empty() {
             let mut profile = payload.relationship_profile.take().unwrap_or_default();
 
@@ -632,7 +773,6 @@ impl CharacterCardService {
             payload.relationship_profile = Some(profile);
         }
 
-        // 记录风格反馈
         if !style_label.trim().is_empty() {
             payload.explicit_feedback.push(FeedbackEntry {
                 text: "[llm feedback triage]".to_string(),
@@ -641,7 +781,6 @@ impl CharacterCardService {
             });
         }
 
-        // 记录情绪历史
         if !emotion_label.trim().is_empty() {
             payload.emotional_history.push(EmotionEntry {
                 tone: emotion_label.trim().to_string(),
@@ -660,22 +799,118 @@ impl CharacterCardService {
         Ok(())
     }
 
+    pub fn classify_feedback(&self, feedback_text: &str) -> FeedbackCategory {
+        let text = feedback_text.to_lowercase();
+
+        let praise_keywords = [
+            "好", "棒", "赞", "厉害", "优秀", "不错", "喜欢", "爱了", "good", "great", "nice",
+            "感谢", "谢谢", "太强", "牛逼", "牛", "厉害", "真好",
+        ];
+        let criticism_keywords = [
+            "不好", "差", "烂", "糟糕", "失望", "讨厌", "烦", "bad", "terrible", "垃圾", "无语",
+            "不行",
+        ];
+        let correction_keywords = [
+            "不对",
+            "错了",
+            "纠正",
+            "更正",
+            "应该是",
+            "不是",
+            "改一下",
+            "说错了",
+            "理解错了",
+            "误解",
+        ];
+        let preference_keywords = [
+            "希望",
+            "想要",
+            "更喜欢",
+            "偏好",
+            "倾向",
+            "喜欢...风格",
+            "能不能",
+            "可以...吗",
+            "以后",
+            "下次",
+        ];
+
+        if praise_keywords.iter().any(|k| text.contains(k)) {
+            FeedbackCategory::Praise
+        } else if criticism_keywords.iter().any(|k| text.contains(k)) {
+            FeedbackCategory::Criticism
+        } else if correction_keywords.iter().any(|k| text.contains(k)) {
+            FeedbackCategory::Correction
+        } else if preference_keywords.iter().any(|k| text.contains(k)) {
+            FeedbackCategory::Preference
+        } else {
+            FeedbackCategory::Other
+        }
+    }
+
+    pub fn normalize_expected_effect(&self, raw_effect: &str) -> f64 {
+        match raw_effect.trim().to_lowercase().as_str() {
+            "very_positive" => 0.8,
+            "positive" => 0.5,
+            "neutral" => 0.0,
+            "negative" => -0.3,
+            "very_negative" => -0.6,
+            _ => 0.0,
+        }
+    }
+
+    // ── async variants ──
+
+    pub async fn record_interaction_signal_async(
+        &self,
+        user_id: String,
+        signal_name: String,
+    ) -> XueliResult<()> {
+        tokio::task::block_in_place(|| self.record_interaction_signal(&user_id, &signal_name))
+    }
+
+    pub async fn record_feedback_async(
+        &self,
+        user_id: String,
+        sentiment: f64,
+        traits: Vec<String>,
+        preferences: Vec<String>,
+    ) {
+        let traits_refs: Vec<&str> = traits.iter().map(|s| s.as_str()).collect();
+        let prefs_refs: Vec<&str> = preferences.iter().map(|s| s.as_str()).collect();
+        tokio::task::block_in_place(|| {
+            self.record_feedback(&user_id, sentiment, &traits_refs, &prefs_refs)
+        })
+    }
+
+    pub async fn refresh_snapshot_async(&self, user_id: String) -> CharacterCardSnapshot {
+        tokio::task::block_in_place(|| self.refresh_snapshot(&user_id))
+    }
+
     // ── 载荷管理 ──
 
-    fn payload_path(&self, user_id: &str) -> String {
-        format!("{}/{}_payload.json", self.storage_dir, user_id)
+    fn payload_suffix(&self) -> String {
+        "payload.json".to_string()
     }
 
     fn load_payload(&self, user_id: &str) -> UserPayload {
-        let path = self.payload_path(user_id);
+        let path = build_scope_payload_path(&self.storage_dir, user_id, "payload.json");
         match std::fs::read_to_string(&path) {
+            Ok(data) => match serde_json::from_str(&data) {
+                Ok(p) => return p,
+                Err(_) => {}
+            },
+            Err(_) => {}
+        }
+        let legacy = legacy_payload_path(&self.storage_dir, user_id, "payload.json");
+        match std::fs::read_to_string(&legacy) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
             Err(_) => UserPayload::default(),
         }
     }
 
     fn save_payload(&self, user_id: &str, payload: &UserPayload) {
-        let path = self.payload_path(user_id);
+        let path = build_scope_payload_path(&self.storage_dir, user_id, "payload.json");
         if let Some(parent) = std::path::Path::new(&path).parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -688,11 +923,11 @@ impl CharacterCardService {
     // ── 快照文件读写 ──
 
     fn snapshot_path(&self, user_id: &str) -> String {
-        format!("{}/{}.json", self.storage_dir, user_id)
+        build_scope_payload_path(&self.storage_dir, user_id, "card.json")
     }
 
     fn save_one(&self, snapshot: &CharacterCardSnapshot) {
-        let path = self.snapshot_path(&snapshot.user_id);
+        let path = build_scope_payload_path(&self.storage_dir, &snapshot.user_id, "card.json");
         if let Some(parent) = std::path::Path::new(&path).parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -707,7 +942,12 @@ impl CharacterCardService {
         if let Ok(entries) = std::fs::read_dir(&self.storage_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "json") {
+                if path.extension().map_or(false, |e| e == "json")
+                    && path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map_or(false, |n| n.ends_with("_card.json"))
+                {
                     if let Ok(data) = std::fs::read_to_string(&path) {
                         if let Ok(snap) = serde_json::from_str::<CharacterCardSnapshot>(&data) {
                             self.snapshots
@@ -726,6 +966,27 @@ impl Default for CharacterCardService {
     fn default() -> Self {
         Self::new(Self::default_card(), "data/character_cards")
     }
+}
+
+// ── helpers for Value extraction ──
+
+fn str_val(v: &Value, key: &str) -> String {
+    v.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+}
+
+fn list_val(v: &Value, key: &str, _max_len: usize) -> Vec<String> {
+    v.get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -800,7 +1061,7 @@ mod tests {
         svc.record_reply_feedback("u3", "positive", 0.8).unwrap();
         let snapshot = svc.get_snapshot("u3");
         assert!(snapshot.intimacy_level > 0.0);
-        assert_eq!(snapshot.stable_signal_count, 0); // 只更新关系，不写入 stable_signals
+        assert_eq!(snapshot.stable_signal_count, 0);
     }
 
     #[test]
@@ -812,7 +1073,6 @@ mod tests {
         }
 
         let trend = svc.get_emotional_trend("u4");
-        // 滑动窗口保留最近 10 条
         assert!(!trend.is_empty());
     }
 
@@ -828,7 +1088,6 @@ mod tests {
         let trend = svc.get_emotional_trend("u5");
         assert!(trend.contains("积极"));
 
-        // 无历史数据
         assert_eq!(svc.get_emotional_trend("u_empty"), "");
     }
 
@@ -852,7 +1111,6 @@ mod tests {
     fn test_refresh_snapshot_prediction_rate() {
         let (svc, _dir) = make_svc();
 
-        // 写入信号
         let mut payload = svc.load_payload("u7");
         payload.stable_signals.push(SignalEntry {
             signal: "prediction:met".to_string(),
@@ -892,7 +1150,6 @@ mod tests {
         )
         .unwrap();
 
-        // 再应用一次确保情绪趋势有足够数据
         svc.apply_reply_effect_bundle(
             "u8",
             0.7,
@@ -928,7 +1185,71 @@ mod tests {
         .unwrap();
 
         let snapshot = svc.get_snapshot("u9");
-        // 负向反馈应降低亲密度
         assert!(snapshot.intimacy_level < 0.01);
+    }
+
+    #[test]
+    fn test_classify_feedback() {
+        let (svc, _dir) = make_svc();
+        assert_eq!(svc.classify_feedback("你太棒了"), FeedbackCategory::Praise);
+        assert_eq!(
+            svc.classify_feedback("这不对，你理解错了"),
+            FeedbackCategory::Correction
+        );
+        assert_eq!(
+            svc.classify_feedback("希望你以后能更活跃"),
+            FeedbackCategory::Preference
+        );
+        assert_eq!(svc.classify_feedback("随便聊聊"), FeedbackCategory::Other);
+    }
+
+    #[test]
+    fn test_normalize_expected_effect() {
+        let (svc, _dir) = make_svc();
+        assert!((svc.normalize_expected_effect("very_positive") - 0.8).abs() < 0.001);
+        assert!((svc.normalize_expected_effect("positive") - 0.5).abs() < 0.001);
+        assert!((svc.normalize_expected_effect("neutral") - 0.0).abs() < 0.001);
+        assert!((svc.normalize_expected_effect("negative") - (-0.3)).abs() < 0.001);
+        assert!((svc.normalize_expected_effect("very_negative") - (-0.6)).abs() < 0.001);
+        assert!((svc.normalize_expected_effect("unknown") - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_persona_hints_default() {
+        let hints = PersonaHints::default();
+        assert!(hints.core_traits.is_empty());
+        assert!(hints.tone_preferences.is_empty());
+    }
+
+    #[test]
+    fn test_get_cached_persona_hints_none() {
+        let (svc, _dir) = make_svc();
+        assert!(svc.get_cached_persona_hints("u_none").is_none());
+    }
+
+    #[test]
+    fn test_scope_based_payload_path_group() {
+        let dir = "/tmp/test_cards";
+        let user_id = "qq:group:g123:u456";
+        let path = build_scope_payload_path(dir, user_id, "payload.json");
+        assert!(path.contains("qq_group_g123_u456"));
+        assert!(path.contains("payload.json"));
+    }
+
+    #[test]
+    fn test_scope_based_payload_path_private() {
+        let dir = "/tmp/test_cards";
+        let user_id = "qq:private:u789";
+        let path = build_scope_payload_path(dir, user_id, "payload.json");
+        assert!(path.contains("qq_private_u789"));
+        assert!(path.contains("payload.json"));
+    }
+
+    #[test]
+    fn test_scope_based_payload_path_legacy_fallback() {
+        let dir = "/tmp/test_cards";
+        let user_id = "plain_user";
+        let path = build_scope_payload_path(dir, user_id, "payload.json");
+        assert!(path.contains("plain_user_payload.json"));
     }
 }
