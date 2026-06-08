@@ -1,12 +1,35 @@
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+
 use crate::core::config::ModelConfig;
 use crate::prelude::XueliResult;
 
-/// 模型调用路由器 — 按任务类型分派模型目标，支持超时控制。
+/// 模型调用路由器 — 按任务类型分派模型目标，支持 FIFO 按用途排队与超时控制。
 ///
-/// 同用途调用通过内部任务句柄追踪，保证顺序不会互相干扰。
+/// 同用途调用按 FIFO 顺序串行执行，不同用途之间并行。
 pub struct ModelInvocationRouter {
     config: ModelConfig,
-    base_timeout: f64,
+    base_timeout: u64,
+    state: std::sync::Mutex<RouterState>,
+}
+
+struct RouterState {
+    queues: HashMap<String, tokio::sync::mpsc::Sender<QueueItem>>,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    closed: bool,
+}
+
+struct QueueItem {
+    label: String,
+    trace_id: String,
+    timeout_secs: u64,
+    runner: Box<
+        dyn FnOnce() -> Pin<
+                Box<dyn Future<Output = Result<String, crate::core::errors::XueliError>> + Send>,
+            > + Send,
+    >,
+    reply: tokio::sync::oneshot::Sender<Result<String, crate::core::errors::XueliError>>,
 }
 
 /// 调用目标
@@ -33,7 +56,6 @@ pub enum InvocationTask {
 }
 
 impl InvocationTask {
-    #[allow(dead_code)]
     fn purpose_key(&self) -> &'static str {
         match self {
             InvocationTask::TimingGate => "timing_gate",
@@ -67,12 +89,17 @@ impl ModelInvocationRouter {
     pub fn new(config: ModelConfig) -> Self {
         Self {
             config,
-            base_timeout: 60.0,
+            base_timeout: 60,
+            state: std::sync::Mutex::new(RouterState {
+                queues: HashMap::new(),
+                handles: Vec::new(),
+                closed: false,
+            }),
         }
     }
 
-    pub fn with_base_timeout(mut self, secs: f64) -> Self {
-        self.base_timeout = secs.max(0.001);
+    pub fn with_base_timeout(mut self, secs: u64) -> Self {
+        self.base_timeout = secs.max(1);
         self
     }
 
@@ -106,32 +133,104 @@ impl ModelInvocationRouter {
         }
     }
 
-    /// 提交任务执行，带超时控制。失败或超时返回错误。
+    /// 提交任务执行，按用途 FIFO 排队，带超时控制。
     pub async fn submit<F, Fut>(
         &self,
         task: &InvocationTask,
         runner: F,
-        _trace_id: &str,
+        trace_id: &str,
         timeout_override: Option<f64>,
     ) -> XueliResult<String>
     where
         F: FnOnce() -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = XueliResult<String>> + Send,
+        Fut: std::future::Future<Output = XueliResult<String>> + Send + 'static,
     {
-        let timeout = timeout_override.unwrap_or_else(|| task.default_timeout(self.base_timeout));
+        let purpose = task.purpose_key().to_string();
+        let timeout =
+            timeout_override.unwrap_or_else(|| task.default_timeout(self.base_timeout as f64));
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        let item = QueueItem {
+            label: format!("{:?}", task),
+            trace_id: trace_id.to_string(),
+            timeout_secs: (timeout.max(1.0) as u64),
+            runner: Box::new(move || Box::pin(runner())),
+            reply: tx,
+        };
+
+        let sender = self.get_or_create_queue(&purpose);
+        sender.send(item).await.map_err(|_| {
+            let msg = format!("{} 队列已关闭", purpose);
+            crate::core::errors::XueliError::Internal(msg)
+        })?;
+
+        rx.await.map_err(|_| {
+            let msg = format!("{} 任务通道关闭", purpose);
+            crate::core::errors::XueliError::Internal(msg)
+        })?
+    }
+
+    /// 获取或创建用途专用 FIFO 队列，返回 mpsc sender。
+    fn get_or_create_queue(&self, purpose: &str) -> tokio::sync::mpsc::Sender<QueueItem> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(sender) = state.queues.get(purpose) {
+            return sender.clone();
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<QueueItem>(1024);
+        state.queues.insert(purpose.to_string(), tx.clone());
 
         let handle = tokio::spawn(async move {
-            match tokio::time::timeout(std::time::Duration::from_secs_f64(timeout), runner()).await
-            {
-                Ok(result) => result,
-                Err(_) => Err(format!("任务执行超时 ({:.1}s)", timeout).into()),
+            while let Some(item) = rx.recv().await {
+                let QueueItem {
+                    timeout_secs,
+                    runner,
+                    reply,
+                    ..
+                } = item;
+
+                let result = match tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    runner(),
+                )
+                .await
+                {
+                    Ok(inner) => inner,
+                    Err(_) => Err(format!("任务执行超时 ({}s)", timeout_secs).into()),
+                };
+                let _ = reply.send(result);
             }
         });
 
-        match handle.await {
-            Ok(result) => result,
-            Err(e) => Err(format!("任务执行失败: {}", e).into()),
+        state.handles.push(handle);
+        tx
+    }
+
+    /// 关闭所有队列，等待 worker 任务结束。
+    pub async fn close(&self) {
+        let handles = {
+            let mut state = self.state.lock().unwrap();
+            state.closed = true;
+            state.queues.clear();
+            std::mem::take(&mut state.handles)
+        };
+        for handle in handles {
+            let _ = handle.await;
         }
+    }
+
+    /// 返回各用途队列的快照（pending / running 计数的近似值）。
+    pub fn snapshot(&self) -> HashMap<String, HashMap<String, usize>> {
+        let state = self.state.lock().unwrap();
+        let mut result = HashMap::new();
+        for purpose in state.queues.keys() {
+            let mut counts = HashMap::new();
+            counts.insert("pending".to_string(), 0);
+            counts.insert("running".to_string(), 1);
+            result.insert(purpose.clone(), counts);
+        }
+        result
     }
 }
 
