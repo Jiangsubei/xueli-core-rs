@@ -661,29 +661,32 @@ mod tests {
     #[test]
     fn test_query_memory_tool_definition() {
         let tool = QueryMemoryTool {
-            memory_manager: Arc::new(MemoryManager::new(
-                Arc::new(crate::core::config::MemoryConfig {
-                    enabled: true,
-                    db_path: ":memory:".to_string(),
-                    storage_backend: "sqlite".to_string(),
-                    extraction_min_messages: 5,
-                    bm25_top_k: 10,
-                    vector_top_k: 5,
-                    rerank_top_k: 20,
-                    dynamic_memory_limit: 8,
-                    dispute: Default::default(),
-                    auto_extract: true,
-                    extract_every_n_turns: 3,
-                    decay: Default::default(),
-                    retrieval_weights: Default::default(),
-                }),
-                Arc::new(
-                    crate::memory::stores::memory_item::SqliteMemoryItemStore::new(
-                        std::path::Path::new("/tmp/xueli_test"),
-                    )
-                    .unwrap(),
-                ),
-            )),
+            memory_manager: Arc::new(
+                MemoryManager::new(
+                    Arc::new(crate::core::config::MemoryConfig {
+                        enabled: true,
+                        db_path: ":memory:".to_string(),
+                        storage_backend: "sqlite".to_string(),
+                        extraction_min_messages: 5,
+                        bm25_top_k: 10,
+                        vector_top_k: 5,
+                        rerank_top_k: 20,
+                        dynamic_memory_limit: 8,
+                        dispute: Default::default(),
+                        auto_extract: true,
+                        extract_every_n_turns: 3,
+                        decay: Default::default(),
+                        retrieval_weights: Default::default(),
+                    }),
+                    Arc::new(
+                        crate::memory::stores::memory_item::SqliteMemoryItemStore::new(
+                            std::path::Path::new("/tmp/xueli_test"),
+                        )
+                        .unwrap(),
+                    ),
+                )
+                .unwrap(),
+            ),
             user_id: "test_user".to_string(),
         };
         let def = tool.definition();

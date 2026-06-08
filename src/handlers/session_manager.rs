@@ -452,6 +452,7 @@ mod tests {
             raw_payload: None,
             received_at: chrono::Utc::now(),
             session: None,
+            ..Default::default()
         };
         let key = mgr.get_key_for_event(&event);
         assert!(key.contains("group"));

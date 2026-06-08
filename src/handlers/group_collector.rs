@@ -139,6 +139,7 @@ mod tests {
             raw_payload: None,
             received_at: Utc::now(),
             session: None,
+            ..Default::default()
         }
     }
 
@@ -209,6 +210,7 @@ mod tests {
             raw_payload: None,
             received_at: Utc::now(),
             session: None,
+            ..Default::default()
         };
         assert!(collector.add(event).is_none());
     }
