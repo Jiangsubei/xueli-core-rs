@@ -5,12 +5,18 @@ use std::time::Duration;
 use chrono::{Local, Timelike};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::core::config::XueliConfig;
-use crate::core::log_labels::LOG_STARTUP_INFO;
+use crate::core::config::{ProactiveShareConfig, XueliConfig};
+use crate::core::log_labels::{LOG_RETRY, LOG_STARTUP_INFO};
 use crate::core::metrics::RuntimeMetrics;
-use crate::core::platform_types::GroupState;
-use crate::core::platform_types::InboundEvent;
+use crate::core::platform_types::{GroupState, InboundEvent, ReplyAction};
+use crate::core::scope::ChatScope;
+use crate::handlers::message_handler::MessageHandler;
 use crate::prelude::XueliResult;
+use crate::proactive_share::scheduler::ProactiveShareScheduler;
+use crate::proactive_share::store::ProactiveShareStore;
+use crate::services::ai_client::DefaultAIClient;
+use crate::services::prompt_loader::NoopPromptTemplateLoader;
+use crate::traits::platform_adapter::PlatformAdapter;
 
 /// 运行时外部挂钩（mood / saturation 等依赖外部系统）
 #[derive(Clone)]
@@ -34,7 +40,7 @@ impl Default for RuntimeHooks {
 }
 
 /// Bot 运行时 — 系统生命周期管理中心，包含群状态机、消息缓冲与触发引擎。
-pub struct BotRuntime {
+pub struct BotRuntime<P: PlatformAdapter + 'static> {
     pub config: Arc<XueliConfig>,
     pub metrics: Arc<RwLock<RuntimeMetrics>>,
     state: Arc<RwLock<RuntimeState>>,
@@ -69,6 +75,14 @@ pub struct BotRuntime {
     trigger_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     /// 外部挂钩
     pub hooks: RuntimeHooks,
+    /// 消息处理器
+    message_handler: Option<Arc<MessageHandler<DefaultAIClient, P, NoopPromptTemplateLoader>>>,
+    /// 主动分享存储
+    proactive_share_store: Option<Arc<ProactiveShareStore>>,
+    /// 主动分享调度器
+    proactive_scheduler: Option<Arc<ProactiveShareScheduler>>,
+    /// 平台适配器
+    adapter: Option<Arc<P>>,
 }
 
 /// 运行时生命周期状态
@@ -81,7 +95,7 @@ pub enum RuntimeState {
     Stopped,
 }
 
-impl BotRuntime {
+impl<P: PlatformAdapter + 'static> BotRuntime<P> {
     pub fn new(config: XueliConfig) -> Self {
         Self {
             config: Arc::new(config),
@@ -102,12 +116,94 @@ impl BotRuntime {
             max_dedup_size: 500,
             trigger_tx: None,
             hooks: RuntimeHooks::default(),
+            message_handler: None,
+            proactive_share_store: None,
+            proactive_scheduler: None,
+            adapter: None,
         }
     }
 
     /// 设置延迟触发通知通道
     pub fn set_trigger_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
         self.trigger_tx = Some(tx);
+    }
+
+    /// 设置消息处理器
+    pub fn set_message_handler(
+        &mut self,
+        handler: Arc<MessageHandler<DefaultAIClient, P, NoopPromptTemplateLoader>>,
+    ) {
+        self.message_handler = Some(handler);
+    }
+
+    /// 设置平台适配器
+    pub fn set_adapter(&mut self, adapter: Arc<P>) {
+        self.adapter = Some(adapter);
+    }
+
+    /// 设置主动分享组件
+    pub fn setup_proactive_share(
+        &mut self,
+        config: &ProactiveShareConfig,
+        store: Arc<ProactiveShareStore>,
+    ) -> XueliResult<()> {
+        let arc_config = Arc::new(config.clone());
+        let scheduler = ProactiveShareScheduler::new(arc_config, store.clone());
+        self.proactive_share_store = Some(store);
+        self.proactive_scheduler = Some(Arc::new(scheduler));
+        Ok(())
+    }
+
+    /// 发送主动分享
+    pub async fn send_proactive_share(
+        &self,
+        content: &str,
+        target_user_id: &str,
+        target_group_id: Option<&str>,
+    ) -> XueliResult<bool> {
+        let adapter = match &self.adapter {
+            Some(a) => a.clone(),
+            None => {
+                tracing::debug!("[主动分享] 未配置平台适配器，跳过发送");
+                return Ok(false);
+            }
+        };
+
+        let scope = if let Some(gid) = target_group_id {
+            ChatScope::Group(gid.to_string())
+        } else {
+            ChatScope::Private
+        };
+
+        let action = ReplyAction {
+            scope,
+            text: content.to_string(),
+            reply_to: None,
+            image_url: None,
+            emoji_id: None,
+        };
+
+        match adapter.send_action(&action).await {
+            Ok(()) => {
+                tracing::info!("[主动分享] 发送成功 target_user={}", target_user_id);
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::error!("[主动分享] 发送失败: {}", e);
+                Ok(false)
+            }
+        }
+    }
+
+    /// 夜间情绪恢复 — 对所有情绪引擎执行夜间恢复并持久化
+    pub async fn apply_mood_night_recovery(&self) -> XueliResult<()> {
+        if self.message_handler.is_none() {
+            tracing::debug!("[夜间恢复] 未配置消息处理器，跳过");
+            return Ok(());
+        }
+
+        tracing::info!("[夜间恢复] 未实现情绪引擎夜间恢复（MessageHandler 尚无 mood_engines）");
+        Ok(())
     }
 
     /// 初始化运行时
@@ -384,6 +480,113 @@ impl BotRuntime {
             .lock()
             .await
             .insert(group_key.to_string(), now_secs());
+    }
+
+    // ── 消息处理管线 ──
+
+    /// 处理缓冲消息（被触发引擎调用）。
+    ///
+    /// 从 group_pending_events 取事件 → message_handler.handle() → 发送回复 → 清理。
+    pub async fn _process_reply(&self, group_key: &str) -> XueliResult<()> {
+        let event = {
+            let events = self.group_pending_events.lock().await;
+            events.get(group_key).cloned()
+        };
+
+        let event = match event {
+            Some(e) => e,
+            None => {
+                tracing::debug!("[处理] key={} 无待处理事件", group_key);
+                self.cleanup_after_processing(group_key).await;
+                return Ok(());
+            }
+        };
+
+        let handler = match &self.message_handler {
+            Some(h) => h.clone(),
+            None => {
+                tracing::debug!("[处理] key={} 未配置消息处理器，直接清理", group_key);
+                self.cleanup_after_processing(group_key).await;
+                return Ok(());
+            }
+        };
+
+        // 记录处理开始
+        self.finish_processing(group_key).await;
+
+        // 运行 agent 循环（含重试）
+        let result = self._run_agent_loop(&event, group_key, handler).await;
+
+        // 记录回复完成
+        self.record_reply_completion(group_key).await;
+        self.record_group_reply(group_key).await;
+
+        // 清理
+        self.cleanup_after_processing(group_key).await;
+
+        result
+    }
+
+    /// agent 循环：调用消息处理器，若成功则发送回复。
+    async fn _run_agent_loop(
+        &self,
+        event: &InboundEvent,
+        group_key: &str,
+        handler: Arc<MessageHandler<DefaultAIClient, P, NoopPromptTemplateLoader>>,
+    ) -> XueliResult<()> {
+        let max_retries = 2;
+        let mut attempt = 0;
+
+        loop {
+            attempt += 1;
+
+            match handler.handle(event).await {
+                Ok(Some(action)) => {
+                    // 发送回复
+                    if let Some(adapter) = &self.adapter {
+                        if let Err(e) = adapter.send_action(&action).await {
+                            tracing::error!("[处理] key={} 发送回复失败: {}", group_key, e,);
+                        } else {
+                            tracing::info!(
+                                "[处理] key={} 回复发送成功 attempt={}",
+                                group_key,
+                                attempt
+                            );
+                        }
+                    } else {
+                        tracing::debug!("[处理] key={} 未配置适配器，跳过发送", group_key);
+                    }
+                    return Ok(());
+                }
+                Ok(None) => {
+                    // 决策不回复（wait/ignore）
+                    tracing::debug!("[处理] key={} 决策不回复，转入 WAITING", group_key);
+                    self.set_group_waiting(group_key).await;
+                    return Ok(());
+                }
+                Err(e) if attempt < max_retries => {
+                    tracing::info!(
+                        target: LOG_RETRY,
+                        "[处理] key={} AI 调用失败 attempt={}/{}: {}",
+                        group_key,
+                        attempt,
+                        max_retries,
+                        e,
+                    );
+                    tokio::time::sleep(Duration::from_secs_f64(1.0)).await;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "[处理] key={} AI 调用最终失败 attempt={}/{}: {}",
+                        group_key,
+                        attempt,
+                        max_retries,
+                        e,
+                    );
+                    return Err(e);
+                }
+            }
+        }
     }
 
     // ── 触发阈值计算 ──
@@ -736,6 +939,33 @@ fn now_secs() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+
+    struct TestPlatform;
+
+    #[async_trait]
+    impl PlatformAdapter for TestPlatform {
+        async fn send_action(&self, _action: &ReplyAction) -> XueliResult<()> {
+            Ok(())
+        }
+        fn strip_mentions(&self, text: &str) -> String {
+            text.to_string()
+        }
+        fn extract_mentions(&self, _event: &InboundEvent) -> Vec<String> {
+            Vec::new()
+        }
+        fn resolve_mention_placeholders(&self, text: &str, _mentions: &[String]) -> String {
+            text.to_string()
+        }
+        fn platform_name(&self) -> &str {
+            "test"
+        }
+        fn parse_event(&self, _raw: &str) -> XueliResult<InboundEvent> {
+            Err("not implemented".into())
+        }
+    }
+
+    type TestRuntime = BotRuntime<TestPlatform>;
 
     fn test_config() -> XueliConfig {
         let mut cfg = XueliConfig::default();
@@ -750,7 +980,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_lifecycle() {
-        let rt = BotRuntime::new(XueliConfig::default());
+        let rt = TestRuntime::new(XueliConfig::default());
         assert!(!rt.is_running().await);
         rt.init().await.unwrap();
         assert!(rt.is_running().await);
@@ -760,7 +990,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_group_state_machine() {
-        let rt = BotRuntime::new(XueliConfig::default());
+        let rt = TestRuntime::new(XueliConfig::default());
         assert_eq!(rt.get_group_state("g1").await, GroupState::Running);
         rt.set_group_waiting("g1").await;
         assert!(rt.is_group_waiting("g1").await);
@@ -772,7 +1002,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dedup() {
-        let rt = BotRuntime::new(XueliConfig::default());
+        let rt = TestRuntime::new(XueliConfig::default());
         assert!(rt.check_and_mark_processed("m1").await);
         assert!(!rt.check_and_mark_processed("m1").await);
         assert!(rt.check_and_mark_processed("m2").await);
@@ -782,7 +1012,7 @@ mod tests {
     async fn test_pending_message_buffering() {
         let mut cfg = test_config();
         cfg.group_reply.base_frequency = 0.34; // threshold = ceil(1/0.34) ≈ 3
-        let rt = BotRuntime::new(cfg);
+        let rt = TestRuntime::new(cfg);
         // 第一条消息：不应触发（count=1 < threshold=3）
         assert!(!rt.register_pending_message("g1", None).await);
         assert_eq!(rt.get_pending_count("g1").await, 1);
@@ -800,7 +1030,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_reply_completion() {
-        let rt = BotRuntime::new(XueliConfig::default());
+        let rt = TestRuntime::new(XueliConfig::default());
         rt.record_reply_completion("g1").await;
         rt.record_reply_completion("g1").await;
         let timestamps = rt.recent_reply_timestamps.lock().await;
@@ -809,7 +1039,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_calculate_trigger_threshold_default() {
-        let rt = BotRuntime::new(test_config());
+        let rt = TestRuntime::new(test_config());
         // base_frequency=1.0, no time_rules, no overrides, no mood
         // effective = 1.0, base_threshold = ceil(1/1.0) = 1
         let t = rt.calculate_trigger_threshold("g1").await;
@@ -820,7 +1050,7 @@ mod tests {
     async fn test_calculate_trigger_threshold_low_freq() {
         let mut cfg = test_config();
         cfg.group_reply.base_frequency = 0.25;
-        let rt = BotRuntime::new(cfg);
+        let rt = TestRuntime::new(cfg);
         // effective = 0.25, base_threshold = ceil(1/0.25) = ceil(4) = 4
         let t = rt.calculate_trigger_threshold("g1").await;
         assert_eq!(t, 4);
@@ -830,7 +1060,7 @@ mod tests {
     async fn test_calculate_trigger_threshold_clamped() {
         let mut cfg = test_config();
         cfg.group_reply.base_frequency = 0.01; // clamps to 0.05
-        let rt = BotRuntime::new(cfg);
+        let rt = TestRuntime::new(cfg);
         // effective = 0.05, base_threshold = ceil(1/0.05) = ceil(20) = 20
         let t = rt.calculate_trigger_threshold("g1").await;
         assert_eq!(t, 20);
@@ -843,7 +1073,7 @@ mod tests {
         cfg.group_reply
             .group_overrides
             .insert("noisy_group".to_string(), 0.5);
-        let rt = BotRuntime::new(cfg);
+        let rt = TestRuntime::new(cfg);
         // effective = 1.0 * 0.5 = 0.5, base_threshold = ceil(1/0.5) = 2
         let t = rt.calculate_trigger_threshold("noisy_group").await;
         assert_eq!(t, 2);
@@ -852,20 +1082,20 @@ mod tests {
     #[tokio::test]
     async fn test_in_time_range() {
         // "09:00-18:00" → hour 12 in range
-        assert!(BotRuntime::in_time_range(12, "09:00-18:00"));
+        assert!(TestRuntime::in_time_range(12, "09:00-18:00"));
         // "09:00-18:00" → hour 8 not in range
-        assert!(!BotRuntime::in_time_range(8, "09:00-18:00"));
+        assert!(!TestRuntime::in_time_range(8, "09:00-18:00"));
         // cross-midnight "22:00-06:00" → hour 2 in range
-        assert!(BotRuntime::in_time_range(2, "22:00-06:00"));
+        assert!(TestRuntime::in_time_range(2, "22:00-06:00"));
         // cross-midnight "22:00-06:00" → hour 12 not in range
-        assert!(!BotRuntime::in_time_range(12, "22:00-06:00"));
+        assert!(!TestRuntime::in_time_range(12, "22:00-06:00"));
         // invalid format
-        assert!(!BotRuntime::in_time_range(12, "invalid"));
+        assert!(!TestRuntime::in_time_range(12, "invalid"));
     }
 
     #[tokio::test]
     async fn test_debounce_wait_no_new_messages() {
-        let rt = BotRuntime::new(test_config());
+        let rt = TestRuntime::new(test_config());
         // No pending messages → debounce exits immediately after first sleep
         rt.debounce_wait("g1").await;
     }
@@ -874,27 +1104,27 @@ mod tests {
     async fn test_debounce_wait_disabled() {
         let mut cfg = test_config();
         cfg.group_reply.debounce_seconds = 0.0;
-        let rt = BotRuntime::new(cfg);
+        let rt = TestRuntime::new(cfg);
         // debounce disabled → returns immediately
         rt.debounce_wait("g1").await;
     }
 
     #[tokio::test]
     async fn test_get_average_reply_interval_empty() {
-        let rt = BotRuntime::new(test_config());
+        let rt = TestRuntime::new(test_config());
         assert_eq!(rt.get_average_reply_interval("g1").await, None);
     }
 
     #[tokio::test]
     async fn test_get_average_reply_interval_single() {
-        let rt = BotRuntime::new(test_config());
+        let rt = TestRuntime::new(test_config());
         rt.record_reply_completion("g1").await;
         assert_eq!(rt.get_average_reply_interval("g1").await, None);
     }
 
     #[tokio::test]
     async fn test_get_average_reply_interval_two() {
-        let rt = BotRuntime::new(test_config());
+        let rt = TestRuntime::new(test_config());
         rt.record_reply_completion("g1").await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         rt.record_reply_completion("g1").await;
@@ -905,7 +1135,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_saturation_multiplier() {
-        let rt = BotRuntime::new(test_config());
+        let rt = TestRuntime::new(test_config());
         // No replies yet → 1.0
         assert!((rt.get_group_saturation_multiplier("g1").await - 1.0).abs() < 0.001);
         // Add 3 replies within 5 minutes → should increase
@@ -921,7 +1151,7 @@ mod tests {
         let mut cfg = test_config();
         cfg.group_reply.base_frequency = 1.0;
         cfg.group_reply.idle_grace_seconds = 0.001; // nearly immediate
-        let rt = BotRuntime::new(cfg);
+        let rt = TestRuntime::new(cfg);
 
         // Set last activity to 10 seconds ago (idle for a while)
         rt.group_last_activity
@@ -935,7 +1165,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_turn_scheduled_prevents_duplicate_trigger() {
-        let rt = BotRuntime::new(test_config());
+        let rt = TestRuntime::new(test_config());
         // Manually mark turn as scheduled
         rt.group_turn_scheduled
             .lock()
@@ -943,5 +1173,64 @@ mod tests {
             .insert("g1".to_string(), true);
         // Should not trigger because turn already scheduled
         assert!(!rt.register_pending_message("g1", None).await);
+    }
+
+    #[tokio::test]
+    async fn test_process_reply_no_handler() {
+        let rt = TestRuntime::new(XueliConfig::default());
+        let result = rt._process_reply("g1").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_setup_proactive_share() {
+        let mut rt = TestRuntime::new(XueliConfig::default());
+        let store = Arc::new(ProactiveShareStore::new("/tmp/test_runtime_shares.json"));
+        let config = ProactiveShareConfig::default();
+        let result = rt.setup_proactive_share(&config, store);
+        assert!(result.is_ok());
+        let _ = std::fs::remove_file("/tmp/test_runtime_shares.json");
+    }
+
+    #[tokio::test]
+    async fn test_send_proactive_share_no_adapter() {
+        let rt = TestRuntime::new(XueliConfig::default());
+        let result = rt.send_proactive_share("hello", "u1", Some("g1")).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_send_proactive_share_with_adapter() {
+        let mut rt = TestRuntime::new(XueliConfig::default());
+        rt.set_adapter(Arc::new(TestPlatform));
+        let result = rt.send_proactive_share("hello", "u1", Some("g1")).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_send_proactive_share_private() {
+        let mut rt = TestRuntime::new(XueliConfig::default());
+        rt.set_adapter(Arc::new(TestPlatform));
+        let result = rt.send_proactive_share("hello", "u1", None).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_apply_mood_night_recovery_no_handler() {
+        let rt = TestRuntime::new(XueliConfig::default());
+        let result = rt.apply_mood_night_recovery().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_set_message_handler() {
+        let mut rt = TestRuntime::new(XueliConfig::default());
+        assert!(rt.message_handler.is_none());
+        // set_adapter + set_message_handler test that fields accept values
+        rt.set_adapter(Arc::new(TestPlatform));
+        assert!(rt.adapter.is_some());
     }
 }

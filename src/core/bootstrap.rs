@@ -92,7 +92,7 @@ impl<P: PlatformAdapter> BotBootstrapper<P> {
                 let mgr = Arc::new(MemoryManager::new(
                     Arc::new(memory_config.clone()),
                     mem_store.clone(),
-                ));
+                )?);
                 info!("[启动] 记忆管理器初始化完成");
                 Some(mgr)
             } else {
@@ -109,10 +109,13 @@ impl<P: PlatformAdapter> BotBootstrapper<P> {
         let pfs_for_handler = Arc::new(SqlitePersonFactStore::new(data_path)?);
 
         let mgr_for_handler = memory_manager.clone().unwrap_or_else(|| {
-            Arc::new(MemoryManager::new(
-                Arc::new(memory_config.clone()),
-                Arc::new(SqliteMemoryItemStore::new(data_path).unwrap()),
-            ))
+            Arc::new(
+                MemoryManager::new(
+                    Arc::new(memory_config.clone()),
+                    Arc::new(SqliteMemoryItemStore::new(data_path).unwrap()),
+                )
+                .unwrap(),
+            )
         });
 
         // 初始化消息处理器
@@ -175,6 +178,14 @@ mod tests {
         }
 
         fn strip_mentions(&self, text: &str) -> String {
+            text.to_string()
+        }
+
+        fn extract_mentions(&self, _event: &InboundEvent) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn resolve_mention_placeholders(&self, text: &str, _mentions: &[String]) -> String {
             text.to_string()
         }
 
