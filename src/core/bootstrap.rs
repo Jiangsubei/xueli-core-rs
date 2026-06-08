@@ -108,15 +108,13 @@ impl<P: PlatformAdapter> BotBootstrapper<P> {
 
         let pfs_for_handler = Arc::new(SqlitePersonFactStore::new(data_path)?);
 
-        let mgr_for_handler = memory_manager.clone().unwrap_or_else(|| {
-            Arc::new(
-                MemoryManager::new(
-                    Arc::new(memory_config.clone()),
-                    Arc::new(SqliteMemoryItemStore::new(data_path).unwrap()),
-                )
-                .unwrap(),
-            )
-        });
+        let mgr_for_handler = match memory_manager.clone() {
+            Some(mgr) => mgr,
+            None => Arc::new(MemoryManager::new(
+                Arc::new(memory_config.clone()),
+                Arc::new(SqliteMemoryItemStore::new(data_path)?),
+            )?),
+        };
 
         // 初始化消息处理器
         let message_handler = Arc::new(MessageHandler::new(
