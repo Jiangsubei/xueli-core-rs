@@ -1,8 +1,8 @@
 use crate::prelude::XueliResult;
 
-/// 图片下载与编码服务
 pub struct ImageClient {
     client: reqwest::Client,
+    base_url: String,
 }
 
 impl ImageClient {
@@ -11,14 +11,31 @@ impl ImageClient {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            base_url: String::new(),
+        })
     }
 
-    /// 下载图片并返回字节
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
+        self
+    }
+
+    pub fn fix_url(url: &str) -> String {
+        url.replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&#39;", "'")
+            .replace("&quot;", "\"")
+            .replace("&#x27;", "'")
+    }
+
     pub async fn download(&self, url: &str) -> XueliResult<Vec<u8>> {
+        let fixed_url = Self::fix_url(url);
         let response = self
             .client
-            .get(url)
+            .get(&fixed_url)
             .send()
             .await
             .map_err(|e| format!("图片下载失败: {}", e))?;
@@ -30,11 +47,67 @@ impl ImageClient {
             .map_err(|e| format!("读取图片数据失败: {}", e).into())
     }
 
-    /// 下载图片并编码为 base64
     pub async fn download_as_base64(&self, url: &str) -> XueliResult<String> {
         use base64::Engine;
         let bytes = self.download(url).await?;
         Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+    }
+
+    pub fn download_image_from_base64(base64_str: &str) -> XueliResult<Vec<u8>> {
+        use base64::Engine;
+        let cleaned = if let Some(idx) = base64_str.find(";base64,") {
+            &base64_str[idx + 8..]
+        } else if base64_str.contains(':') && base64_str.contains(',') {
+            if let Some(idx) = base64_str.find(',') {
+                &base64_str[idx + 1..]
+            } else {
+                base64_str
+            }
+        } else {
+            base64_str
+        };
+        base64::engine::general_purpose::STANDARD
+            .decode(cleaned)
+            .map_err(|e| format!("Base64 解码失败: {}", e).into())
+    }
+
+    pub async fn process_image_segment(&self, segment: &serde_json::Value) -> XueliResult<Vec<u8>> {
+        if let Some(url) = segment.get("url").and_then(|v| v.as_str()) {
+            self.download(url).await
+        } else if let Some(data) = segment
+            .get("data")
+            .or_else(|| segment.get("base64"))
+            .and_then(|v| v.as_str())
+        {
+            Self::download_image_from_base64(data)
+        } else {
+            Err("图片消息段缺少 url/data/base64 字段".into())
+        }
+    }
+
+    pub async fn get_mface_image_url(&self, file_id: &str) -> XueliResult<String> {
+        let url = format!("{}/get_image", self.base_url.trim_end_matches('/'));
+        let body = serde_json::json!({"file_id": file_id});
+        let response = self
+            .client
+            .post(&url)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| format!("获取 mface 图片 URL 失败: {}", e))?;
+        let data: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("解析响应失败: {}", e))?;
+        let image_url = data
+            .get("data")
+            .and_then(|d| d.get("url"))
+            .and_then(|v| v.as_str());
+        match image_url {
+            Some(u) => Ok(Self::fix_url(u)),
+            None => Err("响应中未找到图片 URL".into()),
+        }
     }
 }
 
