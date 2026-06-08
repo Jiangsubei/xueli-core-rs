@@ -1,40 +1,28 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tokio::sync::Semaphore;
 
 use crate::prelude::XueliResult;
 
-/// 统一的消息记录 — 覆盖群聊和私聊
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationRecord {
-    /// 自增主键
     pub id: i64,
-    /// 会话标识（按 dialogue_key 格式，如 "qq:group:123" 或 "qq:private:uid"）
     pub session_id: String,
-    /// 用户 ID
     pub user_id: String,
-    /// 发送者昵称
     pub sender_name: String,
-    /// 消息文本
     pub text: String,
-    /// 是否 bot 回复
     pub is_bot: bool,
-    /// 作用域类型：private / group
     pub scope_type: String,
-    /// 群组 ID（群聊时使用）
     pub scope_id: String,
-    /// 事件时间（Unix 时间戳，秒）
     pub event_time: f64,
-    /// 平台消息 ID
     pub message_id: String,
-    /// 平台名称
     pub platform: String,
 }
 
 impl ConversationRecord {
-    /// 从入站消息构造记录（非 bot 发言）
     pub fn from_inbound(
         session_id: String,
         user_id: String,
@@ -61,7 +49,6 @@ impl ConversationRecord {
         }
     }
 
-    /// 从 bot 回复构造记录
     pub fn from_bot_reply(
         session_id: String,
         user_id: String,
@@ -86,14 +73,65 @@ impl ConversationRecord {
     }
 }
 
-/// SQLite 对话存储 — 统一管理群聊/私聊消息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageRecord {
+    pub user_id: String,
+    pub display_name: String,
+    pub message_text: String,
+    pub raw_text: String,
+    pub image_descriptions: Vec<String>,
+    pub message_kind: String,
+    pub segments: serde_json::Value,
+    pub timestamp: i64,
+    pub message_id: String,
+    pub speaker_role: String,
+}
+
+impl MessageRecord {
+    pub fn user(
+        user_id: impl Into<String>,
+        display_name: impl Into<String>,
+        text: impl Into<String>,
+        timestamp: i64,
+        message_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            user_id: user_id.into(),
+            display_name: display_name.into(),
+            message_text: text.into(),
+            raw_text: String::new(),
+            image_descriptions: Vec::new(),
+            message_kind: "text".to_string(),
+            segments: serde_json::Value::Array(Vec::new()),
+            timestamp,
+            message_id: message_id.into(),
+            speaker_role: "user".to_string(),
+        }
+    }
+
+    pub fn assistant(text: impl Into<String>, timestamp: i64) -> Self {
+        Self {
+            user_id: String::new(),
+            display_name: "bot".to_string(),
+            message_text: text.into(),
+            raw_text: String::new(),
+            image_descriptions: Vec::new(),
+            message_kind: "text".to_string(),
+            segments: serde_json::Value::Array(Vec::new()),
+            timestamp,
+            message_id: String::new(),
+            speaker_role: "assistant".to_string(),
+        }
+    }
+}
+
 pub struct SqliteConversationStore {
     conn: Mutex<Connection>,
-    /// 写并发限制
+    db_path: PathBuf,
     _write_sem: Semaphore,
 }
 
-const INIT_SCHEMA: &str = "
+const INIT_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS conversation_messages (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id      TEXT NOT NULL,
@@ -113,10 +151,83 @@ CREATE INDEX IF NOT EXISTS idx_cm_session_time
 
 CREATE INDEX IF NOT EXISTS idx_cm_scope_time
     ON conversation_messages(scope_type, scope_id, event_time DESC);
-";
+
+CREATE TABLE IF NOT EXISTS conversation_sessions (
+    session_id      TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL,
+    scope_key       TEXT NOT NULL,
+    message_type    TEXT DEFAULT 'private',
+    group_id        TEXT DEFAULT '',
+    platform        TEXT DEFAULT '',
+    created_at      TEXT NOT NULL,
+    closed_at       TEXT DEFAULT '',
+    turn_count      INTEGER DEFAULT 0,
+    metadata        TEXT DEFAULT '{}',
+    dialogue_key    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cs_dialogue
+    ON conversation_sessions(dialogue_key);
+CREATE INDEX IF NOT EXISTS idx_cs_user
+    ON conversation_sessions(user_id);
+
+CREATE TABLE IF NOT EXISTS conversation_turns (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    turn_id             INTEGER NOT NULL,
+    session_id          TEXT NOT NULL,
+    user_msg_json       TEXT NOT NULL,
+    assistant_msg_json  TEXT NOT NULL,
+    timestamp           INTEGER NOT NULL,
+    source_message_id   TEXT DEFAULT '',
+    UNIQUE(session_id, turn_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ct_session
+    ON conversation_turns(session_id);
+
+CREATE TABLE IF NOT EXISTS group_messages (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          TEXT DEFAULT '',
+    group_id            TEXT NOT NULL,
+    user_id             TEXT DEFAULT '',
+    display_name        TEXT DEFAULT '',
+    message_text        TEXT NOT NULL,
+    raw_text            TEXT NOT NULL,
+    image_descriptions  TEXT DEFAULT '[]',
+    message_kind        TEXT DEFAULT 'text',
+    segments            TEXT DEFAULT '[]',
+    timestamp           INTEGER NOT NULL,
+    message_id          TEXT DEFAULT '0',
+    speaker_role        TEXT DEFAULT 'user'
+);
+
+CREATE INDEX IF NOT EXISTS idx_gm_group_time
+    ON group_messages(group_id, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_gm_message_id
+    ON group_messages(message_id);
+
+CREATE TABLE IF NOT EXISTS private_messages (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          TEXT DEFAULT '',
+    user_id             TEXT DEFAULT '',
+    display_name        TEXT DEFAULT '',
+    message_text        TEXT NOT NULL,
+    raw_text            TEXT NOT NULL,
+    image_descriptions  TEXT DEFAULT '[]',
+    message_kind        TEXT DEFAULT 'text',
+    segments            TEXT DEFAULT '[]',
+    timestamp           INTEGER NOT NULL,
+    message_id          TEXT DEFAULT '0',
+    speaker_role        TEXT DEFAULT 'user'
+);
+
+CREATE INDEX IF NOT EXISTS idx_pm_user_time
+    ON private_messages(user_id, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_pm_message_id
+    ON private_messages(message_id);
+"#;
 
 impl SqliteConversationStore {
-    /// 打开数据库并初始化
     pub fn open(db_dir: &Path) -> XueliResult<Self> {
         std::fs::create_dir_all(db_dir).map_err(|e| format!("无法创建目录: {e}"))?;
         let db_path = db_dir.join("conversations.db");
@@ -133,11 +244,11 @@ impl SqliteConversationStore {
 
         Ok(Self {
             conn: Mutex::new(conn),
+            db_path,
             _write_sem: Semaphore::new(5),
         })
     }
 
-    /// 插入一条消息
     pub fn insert_message(&self, record: &ConversationRecord) -> XueliResult<i64> {
         let conn = self.conn.lock().map_err(|e| format!("锁错误: {e}"))?;
         conn.execute(
@@ -162,7 +273,6 @@ impl SqliteConversationStore {
         Ok(conn.last_insert_rowid())
     }
 
-    /// 批量插入消息
     pub fn insert_messages(&self, records: &[ConversationRecord]) -> XueliResult<usize> {
         let conn = self.conn.lock().map_err(|e| format!("锁错误: {e}"))?;
         let tx = conn
@@ -194,7 +304,6 @@ impl SqliteConversationStore {
         Ok(records.len())
     }
 
-    /// 按 session_id 获取最近 N 条消息
     pub fn get_recent_by_session(
         &self,
         session_id: &str,
@@ -234,12 +343,10 @@ impl SqliteConversationStore {
         for row in rows {
             records.push(row.map_err(|e| format!("读取行失败: {e}"))?);
         }
-        // 反转为时间升序（从旧到新）
         records.reverse();
         Ok(records)
     }
 
-    /// 按作用域获取最近 N 条消息（群聊或私聊）
     pub fn get_recent_by_scope(
         &self,
         scope_type: &str,
@@ -284,7 +391,6 @@ impl SqliteConversationStore {
         Ok(records)
     }
 
-    /// 按用户 ID 获取最近 N 条消息
     pub fn get_recent_by_user(
         &self,
         user_id: &str,
@@ -327,15 +433,479 @@ impl SqliteConversationStore {
         records.reverse();
         Ok(records)
     }
+
+    pub async fn active_session_ids(&self) -> XueliResult<Vec<String>> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT session_id FROM conversation_sessions WHERE closed_at = '' \
+                     ORDER BY created_at DESC",
+                )
+                .map_err(|e| format!("查询失败: {e}"))?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("查询失败: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(ids)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
+    }
+
+    pub async fn add_turn(
+        &self,
+        session_id: &str,
+        user_msg: &MessageRecord,
+        assistant_msg: &MessageRecord,
+    ) -> XueliResult<()> {
+        let session_id = session_id.to_string();
+        let user_id = user_msg.user_id.clone();
+        let user_json = serde_json::to_string(user_msg).map_err(|e| format!("序列化失败: {e}"))?;
+        let assistant_json =
+            serde_json::to_string(assistant_msg).map_err(|e| format!("序列化失败: {e}"))?;
+        let timestamp = user_msg.timestamp;
+        let source_msg_id = user_msg.message_id.clone();
+        let db_path = self.db_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+
+            let now = chrono::Utc::now().to_rfc3339();
+            let (scope_key, dialogue_key) = Self::parse_session_id(&session_id)
+                .map(|(_, dk, _, _)| (dk.clone(), dk))
+                .unwrap_or((session_id.clone(), session_id.clone()));
+            conn.execute(
+                "INSERT OR IGNORE INTO conversation_sessions
+                 (session_id, user_id, scope_key, message_type, group_id, platform, created_at, closed_at, turn_count, metadata, dialogue_key)
+                 VALUES (?1, ?2, ?3, 'private', '', '', ?4, '', 0, '{}', ?5)",
+                params![session_id, user_id, scope_key, now, dialogue_key],
+            )
+            .map_err(|e| format!("创建会话失败: {e}"))?;
+
+            let current_count: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(turn_id), 0) FROM conversation_turns WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            let turn_id = current_count + 1;
+
+            conn.execute(
+                "INSERT OR REPLACE INTO conversation_turns
+                 (turn_id, session_id, user_msg_json, assistant_msg_json, timestamp, source_message_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![turn_id, session_id, user_json, assistant_json, timestamp, source_msg_id],
+            )
+            .map_err(|e| format!("插入 turn 失败: {e}"))?;
+
+            conn.execute(
+                "UPDATE conversation_sessions SET turn_count = ?1 WHERE session_id = ?2",
+                params![turn_id, session_id],
+            )
+            .map_err(|e| format!("更新 turn_count 失败: {e}"))?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
+    }
+
+    pub async fn close_session(
+        &self,
+        user_id: &str,
+        scope_key: &str,
+    ) -> XueliResult<Option<String>> {
+        let user_id = user_id.to_string();
+        let scope_key = scope_key.to_string();
+        let db_path = self.db_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+            let now = chrono::Utc::now().to_rfc3339();
+
+            let affected = conn
+                .execute(
+                    "UPDATE conversation_sessions SET closed_at = ?1 \
+                     WHERE closed_at = '' AND user_id = ?2 AND scope_key = ?3",
+                    params![now, user_id, scope_key],
+                )
+                .map_err(|e| format!("关闭会话失败: {e}"))?;
+
+            if affected == 0 {
+                return Ok(None);
+            }
+
+            let session_id: Option<String> = conn
+                .query_row(
+                    "SELECT session_id FROM conversation_sessions \
+                     WHERE closed_at = ?1 AND user_id = ?2 AND scope_key = ?3",
+                    params![now, user_id, scope_key],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            Ok(session_id)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
+    }
+
+    pub async fn close_all_sessions(&self) -> XueliResult<Vec<String>> {
+        let db_path = self.db_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+            let now = chrono::Utc::now().to_rfc3339();
+
+            let ids: Vec<String> = {
+                let mut stmt = conn
+                    .prepare("SELECT session_id FROM conversation_sessions WHERE closed_at = ''")
+                    .map_err(|e| format!("查询失败: {e}"))?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(|e| format!("查询失败: {e}"))?;
+                rows.filter_map(|r| r.ok()).collect()
+            };
+
+            conn.execute(
+                "UPDATE conversation_sessions SET closed_at = ?1 WHERE closed_at = ''",
+                params![now],
+            )
+            .map_err(|e| format!("关闭所有会话失败: {e}"))?;
+
+            Ok(ids)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
+    }
+
+    pub async fn save_conversation(
+        &self,
+        session_id: &str,
+        messages: &[MessageRecord],
+    ) -> XueliResult<()> {
+        let session_id = session_id.to_string();
+        let messages_vec = messages.to_vec();
+        let db_path = self.db_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+
+            let first_user_id = messages_vec
+                .iter()
+                .find(|m| m.speaker_role == "user")
+                .map(|m| m.user_id.as_str())
+                .unwrap_or("");
+            let now = chrono::Utc::now().to_rfc3339();
+            let (scope_key, dialogue_key) = SqliteConversationStore::parse_session_id(&session_id)
+                .map(|(_, dk, _, _)| (dk.clone(), dk))
+                .unwrap_or((session_id.clone(), session_id.clone()));
+            conn.execute(
+                "INSERT OR IGNORE INTO conversation_sessions
+                 (session_id, user_id, scope_key, message_type, group_id, platform, created_at, closed_at, turn_count, metadata, dialogue_key)
+                 VALUES (?1, ?2, ?3, 'private', '', '', ?4, '', 0, '{}', ?5)",
+                params![session_id, first_user_id, scope_key, now, dialogue_key],
+            )
+            .map_err(|e| format!("创建会话失败: {e}"))?;
+
+            let existing_count: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(turn_id), 0) FROM conversation_turns WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+
+            let mut turn_id = existing_count + 1;
+            let mut i = 0;
+            while i + 1 < messages_vec.len() {
+                let user_msg = &messages_vec[i];
+                let assistant_msg = &messages_vec[i + 1];
+                let user_json = serde_json::to_string(user_msg).unwrap_or_default();
+                let assistant_json = serde_json::to_string(assistant_msg).unwrap_or_default();
+                let source_msg_id = user_msg.message_id.clone();
+                let timestamp = user_msg.timestamp;
+
+                let _ = conn.execute(
+                    "INSERT OR REPLACE INTO conversation_turns
+                     (turn_id, session_id, user_msg_json, assistant_msg_json, timestamp, source_message_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![turn_id, session_id, user_json, assistant_json, timestamp, source_msg_id],
+                );
+
+                turn_id += 1;
+                i += 2;
+            }
+
+            let _ = conn.execute(
+                "UPDATE conversation_sessions SET turn_count = ?1 WHERE session_id = ?2",
+                params![turn_id - 1, session_id],
+            );
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
+    }
+
+    pub async fn load_session(&self, session_id: &str) -> XueliResult<Vec<MessageRecord>> {
+        let session_id = session_id.to_string();
+        let db_path = self.db_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT user_msg_json, assistant_msg_json FROM conversation_turns \
+                     WHERE session_id = ?1 ORDER BY turn_id ASC",
+                )
+                .map_err(|e| format!("查询失败: {e}"))?;
+
+            let pairs: Vec<(String, String)> = stmt
+                .query_map(params![session_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| format!("查询失败: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            let mut messages: Vec<MessageRecord> = Vec::new();
+            for (user_json, assistant_json) in pairs {
+                if let Ok(msg) = serde_json::from_str::<MessageRecord>(&user_json) {
+                    messages.push(msg);
+                }
+                if let Ok(msg) = serde_json::from_str::<MessageRecord>(&assistant_json) {
+                    messages.push(msg);
+                }
+            }
+            Ok(messages)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
+    }
+
+    pub async fn update_session_metadata(
+        &self,
+        session_id: &str,
+        metadata: &HashMap<String, String>,
+    ) -> XueliResult<()> {
+        let session_id = session_id.to_string();
+        let metadata = metadata.clone();
+        let db_path = self.db_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+
+            let existing_json: String = conn
+                .query_row(
+                    "SELECT metadata FROM conversation_sessions WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|_| "{}".to_string());
+
+            let mut merged: serde_json::Value = serde_json::from_str(&existing_json)
+                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+            if let serde_json::Value::Object(ref mut map) = merged {
+                for (k, v) in &metadata {
+                    map.insert(k.clone(), serde_json::Value::String(v.clone()));
+                }
+            }
+            let merged_json = serde_json::to_string(&merged).unwrap_or_else(|_| "{}".to_string());
+
+            conn.execute(
+                "UPDATE conversation_sessions SET metadata = ?1 WHERE session_id = ?2",
+                params![merged_json, session_id],
+            )
+            .map_err(|e| format!("更新元数据失败: {e}"))?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
+    }
+
+    pub async fn add_group_message(&self, group_id: &str, msg: &MessageRecord) -> XueliResult<()> {
+        let group_id = group_id.to_string();
+        let msg = msg.clone();
+        let db_path = self.db_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+            let image_json =
+                serde_json::to_string(&msg.image_descriptions).unwrap_or_else(|_| "[]".to_string());
+            let segments_json =
+                serde_json::to_string(&msg.segments).unwrap_or_else(|_| "[]".to_string());
+
+            conn.execute(
+                "INSERT INTO group_messages
+                 (session_id, group_id, user_id, display_name, message_text, raw_text,
+                  image_descriptions, message_kind, segments, timestamp, message_id, speaker_role)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    "",
+                    group_id,
+                    msg.user_id,
+                    msg.display_name,
+                    msg.message_text,
+                    msg.raw_text,
+                    image_json,
+                    msg.message_kind,
+                    segments_json,
+                    msg.timestamp,
+                    msg.message_id,
+                    msg.speaker_role,
+                ],
+            )
+            .map_err(|e| format!("插入群聊消息失败: {e}"))?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
+    }
+
+    pub async fn add_private_message(&self, user_id: &str, msg: &MessageRecord) -> XueliResult<()> {
+        let user_id = user_id.to_string();
+        let msg = msg.clone();
+        let db_path = self.db_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+            let image_json =
+                serde_json::to_string(&msg.image_descriptions).unwrap_or_else(|_| "[]".to_string());
+            let segments_json =
+                serde_json::to_string(&msg.segments).unwrap_or_else(|_| "[]".to_string());
+
+            conn.execute(
+                "INSERT INTO private_messages
+                 (session_id, user_id, display_name, message_text, raw_text, image_descriptions,
+                  message_kind, segments, timestamp, message_id, speaker_role)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    "",
+                    user_id,
+                    msg.display_name,
+                    msg.message_text,
+                    msg.raw_text,
+                    image_json,
+                    msg.message_kind,
+                    segments_json,
+                    msg.timestamp,
+                    msg.message_id,
+                    msg.speaker_role,
+                ],
+            )
+            .map_err(|e| format!("插入私聊消息失败: {e}"))?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
+    }
+
+    pub async fn get_messages_after_id(
+        &self,
+        group_id: &str,
+        after_id: &str,
+    ) -> XueliResult<Vec<MessageRecord>> {
+        let group_id = group_id.to_string();
+        let after_id = after_id.to_string();
+        let db_path = self.db_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+            let after_rowid: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(id, 0) FROM group_messages WHERE message_id = ?1 LIMIT 1",
+                    params![after_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT user_id, display_name, message_text, raw_text, image_descriptions,
+                            message_kind, segments, timestamp, message_id, speaker_role
+                     FROM group_messages
+                     WHERE group_id = ?1 AND id > ?2
+                     ORDER BY timestamp ASC, id ASC",
+                )
+                .map_err(|e| format!("查询失败: {e}"))?;
+
+            let records: Vec<MessageRecord> = stmt
+                .query_map(params![group_id, after_rowid], |row| {
+                    let img_str: String = row.get(4)?;
+                    let seg_str: String = row.get(6)?;
+                    Ok(MessageRecord {
+                        user_id: row.get(0)?,
+                        display_name: row.get(1)?,
+                        message_text: row.get(2)?,
+                        raw_text: row.get(3)?,
+                        image_descriptions: serde_json::from_str(&img_str).unwrap_or_default(),
+                        message_kind: row.get(5)?,
+                        segments: serde_json::from_str(&seg_str).unwrap_or_default(),
+                        timestamp: row.get(7)?,
+                        message_id: row.get(8)?,
+                        speaker_role: row.get(9)?,
+                    })
+                })
+                .map_err(|e| format!("查询失败: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            Ok(records)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
+    }
+
+    pub fn generate_session_id(&self, user_id: &str, dialogue_key: &str) -> String {
+        let normalized = dialogue_key.replace(':', "_");
+        let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
+        let suffix = uuid::Uuid::new_v4().to_string().replace('-', "")[..8].to_string();
+        format!("session_{user_id}_{normalized}_{stamp}_{suffix}")
+    }
+
+    fn parse_session_id(session_id: &str) -> Option<(String, String, String, String)> {
+        let body = session_id.strip_prefix("session_")?;
+        if body.len() < 24 {
+            return None;
+        }
+        let rev: Vec<&str> = body.rsplitn(3, '_').collect();
+        if rev.len() < 3 {
+            return None;
+        }
+        let suffix = rev[0];
+        let stamp = rev[1];
+        if suffix.len() != 8 || stamp.len() != 14 || !stamp.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let prefix = rev[2];
+        prefix.split_once('_').map(|(uid, dk)| {
+            let dialogue_key = dk.replace('_', ":");
+            (
+                uid.to_string(),
+                dialogue_key,
+                stamp.to_string(),
+                suffix.to_string(),
+            )
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn setup_test_store() -> SqliteConversationStore {
+    fn setup_test_store() -> (SqliteConversationStore, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().expect("临时目录创建失败");
-        SqliteConversationStore::open(dir.path()).expect("打开数据库失败")
+        let store = SqliteConversationStore::open(dir.path()).expect("打开数据库失败");
+        (store, dir)
     }
 
     fn make_record(
@@ -363,7 +933,7 @@ mod tests {
 
     #[test]
     fn test_insert_and_retrieve() {
-        let store = setup_test_store();
+        let (store, _dir) = setup_test_store();
 
         let sid = "qq:private:user1";
         store
@@ -383,9 +953,8 @@ mod tests {
 
     #[test]
     fn test_get_recent_by_scope() {
-        let store = setup_test_store();
+        let (store, _dir) = setup_test_store();
 
-        // 插入群聊消息
         let sid_group = "qq:group:g123";
         for i in 0..5 {
             let mut rec = make_record(
@@ -401,7 +970,6 @@ mod tests {
             store.insert_message(&rec).expect("插入失败");
         }
 
-        // 插入私聊消息
         let sid_private = "qq:private:user1";
         for i in 0..3 {
             let rec = make_record(
@@ -415,13 +983,11 @@ mod tests {
             store.insert_message(&rec).expect("插入失败");
         }
 
-        // 按群聊 scope 查询
         let group_records = store
             .get_recent_by_scope("group", "g123", 10)
             .expect("查询失败");
         assert_eq!(group_records.len(), 5);
 
-        // 按私聊 scope 查询
         let private_records = store
             .get_recent_by_scope("private", "", 10)
             .expect("查询失败");
@@ -430,7 +996,7 @@ mod tests {
 
     #[test]
     fn test_limit() {
-        let store = setup_test_store();
+        let (store, _dir) = setup_test_store();
         let sid = "qq:private:user1";
 
         for i in 0..10 {
@@ -448,14 +1014,13 @@ mod tests {
 
         let records = store.get_recent_by_session(sid, 3).expect("查询失败");
         assert_eq!(records.len(), 3);
-        // 应该是最新的 3 条: msg7, msg8, msg9
         assert_eq!(records[0].text, "msg7");
         assert_eq!(records[2].text, "msg9");
     }
 
     #[test]
     fn test_batch_insert() {
-        let store = setup_test_store();
+        let (store, _dir) = setup_test_store();
         let sid = "qq:private:user1";
 
         let records: Vec<_> = (0..5)
@@ -476,5 +1041,195 @@ mod tests {
 
         let fetched = store.get_recent_by_session(sid, 10).expect("查询失败");
         assert_eq!(fetched.len(), 5);
+    }
+
+    // ── 会话生命周期测试 ──
+
+    #[tokio::test]
+    async fn test_add_turn_and_load_session() {
+        let (store, _dir) = setup_test_store();
+        let sid = store.generate_session_id("user1", "qq:private:user1");
+
+        let user_msg = MessageRecord::user("user1", "Alice", "你好", 100, "msg001");
+        let assistant_msg = MessageRecord::assistant("你好呀！", 101);
+
+        store
+            .add_turn(&sid, &user_msg, &assistant_msg)
+            .await
+            .expect("add_turn 失败");
+
+        let loaded = store.load_session(&sid).await.expect("load_session 失败");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].message_text, "你好");
+        assert_eq!(loaded[0].speaker_role, "user");
+        assert_eq!(loaded[1].message_text, "你好呀！");
+        assert_eq!(loaded[1].speaker_role, "assistant");
+    }
+
+    #[tokio::test]
+    async fn test_multiple_turns() {
+        let (store, _dir) = setup_test_store();
+        let sid = store.generate_session_id("user1", "qq:private:user1");
+
+        for i in 0..3 {
+            let user_msg = MessageRecord::user(
+                "user1",
+                "Alice",
+                &format!("用户消息{}", i),
+                100 + i * 10,
+                &format!("msg_{}", i),
+            );
+            let assistant_msg =
+                MessageRecord::assistant(&format!("助手回复{}", i), 100 + i * 10 + 1);
+            store
+                .add_turn(&sid, &user_msg, &assistant_msg)
+                .await
+                .expect("add_turn 失败");
+        }
+
+        let loaded = store.load_session(&sid).await.expect("load_session 失败");
+        assert_eq!(loaded.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn test_save_and_load_conversation() {
+        let (store, _dir) = setup_test_store();
+        let sid = store.generate_session_id("user1", "qq:private:user1");
+
+        let messages = vec![
+            MessageRecord::user("user1", "Alice", "msg1", 100, "id1"),
+            MessageRecord::assistant("reply1", 101),
+            MessageRecord::user("user1", "Alice", "msg2", 102, "id2"),
+            MessageRecord::assistant("reply2", 103),
+        ];
+
+        store
+            .save_conversation(&sid, &messages)
+            .await
+            .expect("save 失败");
+
+        let loaded = store.load_session(&sid).await.expect("load 失败");
+        assert_eq!(loaded.len(), 4);
+        assert_eq!(loaded[0].message_text, "msg1");
+        assert_eq!(loaded[3].message_text, "reply2");
+    }
+
+    #[tokio::test]
+    async fn test_active_session_ids_and_close() {
+        let (store, _dir) = setup_test_store();
+        let sid = store.generate_session_id("user1", "qq:private:user1");
+
+        let user_msg = MessageRecord::user("user1", "Alice", "你好", 100, "msg001");
+        let assistant_msg = MessageRecord::assistant("你好呀！", 101);
+        store
+            .add_turn(&sid, &user_msg, &assistant_msg)
+            .await
+            .expect("add_turn 失败");
+
+        let active = store.active_session_ids().await.expect("active 查询失败");
+        assert!(!active.is_empty());
+
+        let closed = store.close_all_sessions().await.expect("关闭失败");
+        assert!(!closed.is_empty());
+
+        let active_after = store.active_session_ids().await.expect("active 查询失败");
+        assert!(active_after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_close_session_by_user_scope() {
+        let (store, _dir) = setup_test_store();
+        let sid = store.generate_session_id("user1", "qq:private:user1");
+
+        let user_msg = MessageRecord::user("user1", "Alice", "你好", 100, "msg001");
+        let assistant_msg = MessageRecord::assistant("你好呀！", 101);
+        store
+            .add_turn(&sid, &user_msg, &assistant_msg)
+            .await
+            .expect("add_turn 失败");
+
+        let closed = store
+            .close_session("user1", "qq:private:user1")
+            .await
+            .expect("关闭失败");
+        assert!(closed.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_update_session_metadata() {
+        let (store, _dir) = setup_test_store();
+        let sid = store.generate_session_id("user1", "qq:private:user1");
+
+        let user_msg = MessageRecord::user("user1", "Alice", "你好", 100, "msg001");
+        let assistant_msg = MessageRecord::assistant("你好呀！", 101);
+        store
+            .add_turn(&sid, &user_msg, &assistant_msg)
+            .await
+            .expect("add_turn 失败");
+
+        let mut meta = HashMap::new();
+        meta.insert("latest_message_id".to_string(), "msg001".to_string());
+        meta.insert("status".to_string(), "active".to_string());
+
+        store
+            .update_session_metadata(&sid, &meta)
+            .await
+            .expect("更新元数据失败");
+    }
+
+    #[tokio::test]
+    async fn test_add_group_message() {
+        let (store, _dir) = setup_test_store();
+
+        let msg = MessageRecord::user("user1", "Alice", "群聊消息", 1000, "msg_g1");
+        store
+            .add_group_message("g123", &msg)
+            .await
+            .expect("添加群聊消息失败");
+
+        let msgs = store
+            .get_messages_after_id("g123", "0")
+            .await
+            .expect("查询失败");
+        assert!(!msgs.is_empty());
+        assert_eq!(msgs[0].message_text, "群聊消息");
+    }
+
+    #[tokio::test]
+    async fn test_add_private_message() {
+        let (store, _dir) = setup_test_store();
+
+        let msg = MessageRecord::user("user1", "Alice", "私聊消息", 1000, "msg_p1");
+        store
+            .add_private_message("user1", &msg)
+            .await
+            .expect("添加私聊消息失败");
+    }
+
+    #[tokio::test]
+    async fn test_get_messages_after_id_pagination() {
+        let (store, _dir) = setup_test_store();
+
+        for i in 0..5 {
+            let msg = MessageRecord::user(
+                "user1",
+                "Alice",
+                &format!("消息{}", i),
+                1000 + i,
+                &format!("msg_{}", i),
+            );
+            store
+                .add_group_message("g123", &msg)
+                .await
+                .expect("添加失败");
+        }
+
+        let after_msg3 = store
+            .get_messages_after_id("g123", "msg_2")
+            .await
+            .expect("查询失败");
+        assert!(!after_msg3.is_empty());
+        assert_eq!(after_msg3[0].message_text, "消息3");
+        assert_eq!(after_msg3[1].message_text, "消息4");
     }
 }

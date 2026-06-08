@@ -68,6 +68,7 @@ impl MoodStore {
                     arousal: row.get(1).unwrap_or(0.5),
                     energy: row.get(2).unwrap_or(1.0),
                     updated_at: row.get(3).unwrap_or_default(),
+                    ..Default::default()
                 })
             },
         )
@@ -90,6 +91,7 @@ impl MoodStore {
                         arousal: row.get(1).unwrap_or(0.5),
                         energy: row.get(2).unwrap_or(1.0),
                         updated_at: row.get(3).unwrap_or_default(),
+                        ..Default::default()
                     })
                 },
             )
@@ -191,6 +193,7 @@ mod tests {
             arousal: 0.3,
             energy: 0.8,
             updated_at: "2024-01-01T00:00:00+00:00".to_string(),
+            ..Default::default()
         };
 
         store.save("user:12345", &state).unwrap();
@@ -209,6 +212,7 @@ mod tests {
             arousal: 0.5,
             energy: 0.9,
             updated_at: String::new(),
+            ..Default::default()
         };
         store.save("scope:g1", &state1).unwrap();
 
@@ -217,6 +221,7 @@ mod tests {
             arousal: 0.7,
             energy: 0.4,
             updated_at: "2024-06-01T00:00:00+00:00".to_string(),
+            ..Default::default()
         };
         store.save("scope:g1", &state2).unwrap();
 
@@ -248,6 +253,7 @@ mod tests {
             arousal: 0.4,
             energy: 0.7,
             updated_at: String::new(),
+            ..Default::default()
         };
 
         store.save_async("async:key", &state).await.unwrap();
