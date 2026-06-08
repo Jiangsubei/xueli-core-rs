@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::core::types::MemoryItem;
+use crate::core::types::{MemoryItem, MemoryType};
 use crate::memory::stores::important::{ImportantMemory, ImportantMemoryStore};
 use crate::memory::stores::memory_item::SqliteMemoryItemStore;
 use crate::memory::stores::person_fact::{PersonFact, SqlitePersonFactStore};
@@ -11,6 +11,7 @@ use crate::prelude::XueliResult;
 pub struct PersonFactService {
     fact_store: Arc<SqlitePersonFactStore>,
     important_store: Arc<ImportantMemoryStore>,
+    #[allow(dead_code)]
     memory_store: Arc<SqliteMemoryItemStore>,
     prompt_limit: usize,
 }
@@ -40,12 +41,19 @@ impl PersonFactService {
         // 获取用户的重要记忆标记
         let important_entries = self.important_store.get_important(user_id, 100).await?;
 
-        // 获取对应的记忆内容
         let mut memories = Vec::new();
         for entry in &important_entries {
-            if let Some(memory) = self.memory_store.get_by_id(&entry.memory_id).await? {
-                memories.push((entry.clone(), memory));
-            }
+            let memory = MemoryItem {
+                id: entry.id.clone(),
+                user_id: entry.user_id.clone(),
+                content: entry.content.clone(),
+                memory_type: MemoryType::Fact,
+                importance: entry.score,
+                created_at: entry.created_at,
+                last_accessed_at: entry.updated_at,
+                access_count: entry.recall_count as u64,
+            };
+            memories.push((entry.clone(), memory));
         }
 
         let generated = self.build_facts_from_memories(user_id, &memories);
@@ -150,7 +158,7 @@ impl PersonFactService {
                 user_id: user_id.to_string(),
                 fact_text: content.to_string(),
                 category,
-                confidence: important.importance_score,
+                confidence: important.score,
                 source_conversation_id: Some(memory.id.clone()),
                 created_at: memory.created_at,
                 updated_at: now,

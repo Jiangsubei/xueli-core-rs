@@ -296,7 +296,7 @@ mod tests {
     async fn test_flow_apply_patch() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteMemoryItemStore::new(dir.path()).unwrap());
-        let mgr = Arc::new(MemoryManager::new(Arc::new(test_config()), store));
+        let mgr = Arc::new(MemoryManager::new(Arc::new(test_config()), store).unwrap());
         let (service, mut rx) = MemoryFlowService::new(mgr.clone(), None, None);
 
         let patch = MemoryPatch {
@@ -320,7 +320,7 @@ mod tests {
     fn test_dedupe() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteMemoryItemStore::new(dir.path()).unwrap());
-        let mgr = Arc::new(MemoryManager::new(Arc::new(test_config()), store));
+        let mgr = Arc::new(MemoryManager::new(Arc::new(test_config()), store).unwrap());
         let (service, _rx) = MemoryFlowService::new(mgr, None, None);
 
         let key = "test_key";

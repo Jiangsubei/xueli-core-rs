@@ -474,45 +474,53 @@ impl RetrievalCoordinator {
 
         let imp_records = important_store.get_important(user_id, limit * 2).await?;
         for record in &imp_records {
-            if let Some(memory_item) = self.store.get(&record.memory_id).await? {
-                if !self
-                    .access_policy
-                    .is_accessible(&memory_item, &ChatScope::Private)
-                {
-                    continue;
-                }
-                let mut entry = HashMap::new();
-                entry.insert(
-                    "content".to_string(),
-                    serde_json::Value::String(memory_item.content.clone()),
-                );
-                entry.insert(
-                    "source".to_string(),
-                    serde_json::Value::String("important".to_string()),
-                );
-                entry.insert(
-                    "priority".to_string(),
-                    serde_json::Value::Number(
-                        serde_json::Number::from_f64(record.importance_score).unwrap_or(0.into()),
-                    ),
-                );
-                entry.insert(
-                    "score".to_string(),
-                    serde_json::Value::Number(
-                        serde_json::Number::from_f64(self.score_text(query, &memory_item.content))
-                            .unwrap_or(0.into()),
-                    ),
-                );
-                entry.insert(
-                    "memory_type".to_string(),
-                    serde_json::Value::String("important".to_string()),
-                );
-                entry.insert(
-                    "memory_owner".to_string(),
-                    serde_json::Value::String(record.user_id.clone()),
-                );
-                entries.push(entry);
+            let memory_item = MemoryItem {
+                id: record.id.clone(),
+                user_id: record.user_id.clone(),
+                content: record.content.clone(),
+                memory_type: crate::core::types::MemoryType::Fact,
+                importance: record.score,
+                created_at: record.created_at,
+                last_accessed_at: record.updated_at,
+                access_count: record.recall_count as u64,
+            };
+            if !self
+                .access_policy
+                .is_accessible(&memory_item, &ChatScope::Private)
+            {
+                continue;
             }
+            let mut entry = HashMap::new();
+            entry.insert(
+                "content".to_string(),
+                serde_json::Value::String(record.content.clone()),
+            );
+            entry.insert(
+                "source".to_string(),
+                serde_json::Value::String("important".to_string()),
+            );
+            entry.insert(
+                "priority".to_string(),
+                serde_json::Value::Number(
+                    serde_json::Number::from_f64(record.score).unwrap_or(0.into()),
+                ),
+            );
+            entry.insert(
+                "score".to_string(),
+                serde_json::Value::Number(
+                    serde_json::Number::from_f64(self.score_text(query, &record.content))
+                        .unwrap_or(0.into()),
+                ),
+            );
+            entry.insert(
+                "memory_type".to_string(),
+                serde_json::Value::String("important".to_string()),
+            );
+            entry.insert(
+                "memory_owner".to_string(),
+                serde_json::Value::String(record.user_id.clone()),
+            );
+            entries.push(entry);
         }
 
         entries.sort_by(|a, b| {
@@ -581,13 +589,21 @@ impl RetrievalCoordinator {
         let records = important_store.get_important(user_id, 12).await?;
 
         for record in records {
-            if let Some(memory_item) = self.store.get(&record.memory_id).await? {
-                if self
-                    .access_policy
-                    .is_accessible(&memory_item, &ChatScope::Private)
-                {
-                    results.push((memory_item, None));
-                }
+            let memory_item = MemoryItem {
+                id: record.id.clone(),
+                user_id: record.user_id.clone(),
+                content: record.content.clone(),
+                memory_type: crate::core::types::MemoryType::Fact,
+                importance: record.score,
+                created_at: record.created_at,
+                last_accessed_at: record.updated_at,
+                access_count: record.recall_count as u64,
+            };
+            if self
+                .access_policy
+                .is_accessible(&memory_item, &ChatScope::Private)
+            {
+                results.push((memory_item, None));
             }
         }
 
