@@ -62,7 +62,7 @@ impl ReplySideEffects {
     }
 
     /// 计算反馈评分（简化版，后续可接入真实的 feedback_triage LLM）
-    async fn compute_feedback_score(
+    pub async fn compute_feedback_score(
         &self,
         pending: &crate::handlers::reply::effect_tracker::PendingEvaluation,
         user_text: &str,

@@ -4,6 +4,7 @@
 // 注意：完整的流水线编排依赖 PromptPlan 的策略字段（memory_profile 等），
 // Rust 版简化了这部分逻辑，当前实现聚焦于记忆上下文加载与格式化。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::warn;
 
@@ -28,6 +29,12 @@ pub struct MemoryContextResult {
     pub history_messages: Vec<ConversationRecord>,
     /// 是否首轮对话
     pub is_first_turn: bool,
+    /// 复用的视觉分析描述（从近期消息中提取）
+    pub reusable_vision_analysis: Option<String>,
+    /// 角色卡提示词条目
+    pub character_card_entries: Vec<HashMap<String, serde_json::Value>>,
+    /// 叙事线摘要
+    pub narrative_thread_summary: Option<String>,
 }
 
 /// Reply 流水线 — 负责在 ReplyAgent 执行前加载并格式化所有记忆上下文
@@ -61,6 +68,7 @@ impl ReplyPipeline {
     /// - dynamic_memory_context: 动态记忆
     /// - history_messages: 近期对话历史
     /// - is_first_turn: 是否首轮
+    /// - reusable_vision_analysis: 从历史消息中复用的视觉分析
     pub async fn load_memory_context(
         &self,
         user_id: &str,
@@ -128,14 +136,20 @@ impl ReplyPipeline {
                     warn!("[回复管道] 加载持久记忆失败: {}", e);
                 }
             }
+
+            // 层级3/4/5：session_restore / precise_recall / dynamic 记忆
+            self.load_retrieval_context(mm, user_id, scope_id, scope_type, &mut result)
+                .await;
         }
 
-        // 层级3/4/5 以及历史：从 conversation store 加载
+        // 历史消息：从 conversation store 加载
         if let Some(ref store) = self.conversation_store {
             match store.get_recent_by_scope(scope_type, scope_id, 30) {
                 Ok(records) => {
                     result.history_messages = records;
-                    result.is_first_turn = result.history_messages.is_empty();
+                    if result.history_messages.is_empty() {
+                        result.is_first_turn = true;
+                    }
                 }
                 Err(e) => {
                     warn!("[回复管道] 加载对话历史失败: {}", e);
@@ -143,11 +157,61 @@ impl ReplyPipeline {
             }
         }
 
-        // 会话恢复上下文通过 SessionRestoreService 提供（外部注入）
-        // precise_recall / dynamic_memory 通过 MemoryManager 的 BM25/向量检索提供（外部注入）
-        // 此处留空，由调用方按需填充
-
         result
+    }
+
+    async fn load_retrieval_context(
+        &self,
+        mm: &Arc<MemoryManager>,
+        user_id: &str,
+        _scope_id: &str,
+        _scope_type: &str,
+        result: &mut MemoryContextResult,
+    ) {
+        match mm.build_prompt_context(user_id, "").await {
+            Ok(ctx_result) => {
+                if !ctx_result.session_restore.is_empty() {
+                    let entries: Vec<String> = ctx_result
+                        .session_restore
+                        .iter()
+                        .filter_map(|e| {
+                            e.get("content")
+                                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                        })
+                        .collect();
+                    result.session_restore_context =
+                        Self::format_memory_context_and_dedupe(&entries, "");
+                }
+                if !ctx_result.dynamic_memories.is_empty() {
+                    let entries: Vec<String> = ctx_result
+                        .dynamic_memories
+                        .iter()
+                        .filter_map(|e| {
+                            e.get("content")
+                                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                        })
+                        .collect();
+                    result.dynamic_memory_context = Self::format_memory_context_and_dedupe(
+                        &entries,
+                        &result.persistent_memory_context,
+                    );
+                }
+                if !ctx_result.precise_recall.is_empty() {
+                    let entries: Vec<String> = ctx_result
+                        .precise_recall
+                        .iter()
+                        .filter_map(|e| {
+                            e.get("content")
+                                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                        })
+                        .collect();
+                    result.precise_recall_context = Self::format_memory_context(&entries);
+                }
+            }
+            Err(e) => {
+                warn!("[回复管道] 检索上下文失败: {}", e);
+            }
+        }
     }
 
     /// 设置会话恢复上下文（由外部注入，如 SessionRestoreService）
@@ -159,6 +223,70 @@ impl ReplyPipeline {
     pub fn inject_dynamic_memory_context(result: &mut MemoryContextResult, memories: &[String]) {
         result.dynamic_memory_context =
             Self::format_memory_context_and_dedupe(memories, &result.persistent_memory_context);
+    }
+
+    /// 注入角色卡提示词条目
+    pub fn inject_character_card_entries(
+        result: &mut MemoryContextResult,
+        entries: Vec<HashMap<String, serde_json::Value>>,
+    ) {
+        result.character_card_entries = entries;
+    }
+
+    /// 注入叙事线摘要
+    pub fn inject_narrative_thread_summary(result: &mut MemoryContextResult, summary: String) {
+        result.narrative_thread_summary = Some(summary);
+    }
+
+    /// 从历史图片描述列表中提取可复用的视觉分析
+    ///
+    /// 扫描近期消息的 image_description 字段，若有已分析的视觉结果则复用。
+    pub fn extract_reusable_vision_analysis(image_descriptions: &[String]) -> Option<String> {
+        let non_empty: Vec<&str> = image_descriptions
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|s| !s.trim().is_empty() && !s.contains("未成功识别"))
+            .collect();
+        if non_empty.is_empty() {
+            None
+        } else if non_empty.len() == 1 {
+            Some(format!("[图片] {}", non_empty[0]))
+        } else {
+            Some(format!(
+                "[图片] {}",
+                non_empty
+                    .iter()
+                    .enumerate()
+                    .map(|(i, desc)| format!("图{}: {}", i + 1, desc))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ))
+        }
+    }
+
+    /// 构建对话历史文本 — 格式化带身份标签的消息流
+    ///
+    /// 格式：
+    /// ```text
+    /// 用户{name}: {text}
+    /// {assistant_name}: {text}
+    /// ```
+    pub fn build_conversation_history_text(
+        records: &[ConversationRecord],
+        assistant_name: &str,
+    ) -> String {
+        let mut lines: Vec<String> = Vec::with_capacity(records.len());
+        for rec in records {
+            let label = if rec.is_bot {
+                assistant_name.to_string()
+            } else if rec.sender_name.is_empty() {
+                "用户".to_string()
+            } else {
+                format!("用户{}", rec.sender_name)
+            };
+            lines.push(format!("{}: {}", label, rec.text));
+        }
+        lines.join("\n")
     }
 
     /// 格式化记忆行列表为编号文本
@@ -284,6 +412,113 @@ mod tests {
         let new = vec!["已有记忆".into(), "新记忆".into()];
         let result = ReplyPipeline::format_memory_context_and_dedupe(&new, existing);
         assert_eq!(result, "1. 新记忆");
+    }
+
+    #[test]
+    fn test_extract_reusable_vision_analysis_single() {
+        let descs = vec!["图片显示一只猫".to_string()];
+        let result = ReplyPipeline::extract_reusable_vision_analysis(&descs);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("猫"));
+    }
+
+    #[test]
+    fn test_extract_reusable_vision_analysis_empty() {
+        let result = ReplyPipeline::extract_reusable_vision_analysis(&[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_reusable_vision_analysis_failed() {
+        let descs = vec!["未成功识别".to_string(), "".to_string()];
+        let result = ReplyPipeline::extract_reusable_vision_analysis(&descs);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_reusable_vision_analysis_multiple() {
+        let descs = vec!["图片显示一只猫".to_string(), "图片显示一只狗".to_string()];
+        let result = ReplyPipeline::extract_reusable_vision_analysis(&descs);
+        assert!(result.is_some());
+        let text = result.unwrap();
+        assert!(text.contains("图1"));
+        assert!(text.contains("图2"));
+        assert!(text.contains("猫"));
+        assert!(text.contains("狗"));
+    }
+
+    #[test]
+    fn test_build_conversation_history_text() {
+        use crate::memory::stores::conversation::ConversationRecord;
+        let records = vec![
+            ConversationRecord {
+                id: 1,
+                session_id: "s1".into(),
+                user_id: "u1".into(),
+                sender_name: "小明".into(),
+                text: "你好".into(),
+                is_bot: false,
+                scope_type: "group".into(),
+                scope_id: "g1".into(),
+                event_time: 100.0,
+                message_id: "m1".into(),
+                platform: "qq".into(),
+            },
+            ConversationRecord {
+                id: 2,
+                session_id: "s1".into(),
+                user_id: "u1".into(),
+                sender_name: "bot".into(),
+                text: "你好呀！".into(),
+                is_bot: true,
+                scope_type: "group".into(),
+                scope_id: "g1".into(),
+                event_time: 101.0,
+                message_id: "".into(),
+                platform: "".into(),
+            },
+        ];
+        let text = ReplyPipeline::build_conversation_history_text(&records, "小丽");
+        assert!(text.contains("用户小明: 你好"));
+        assert!(text.contains("小丽: 你好呀！"));
+    }
+
+    #[test]
+    fn test_build_conversation_history_text_anonymous() {
+        use crate::memory::stores::conversation::ConversationRecord;
+        let records = vec![ConversationRecord {
+            id: 1,
+            session_id: "s1".into(),
+            user_id: "u1".into(),
+            sender_name: "".into(),
+            text: "在吗".into(),
+            is_bot: false,
+            scope_type: "group".into(),
+            scope_id: "g1".into(),
+            event_time: 100.0,
+            message_id: "m1".into(),
+            platform: "qq".into(),
+        }];
+        let text = ReplyPipeline::build_conversation_history_text(&records, "小丽");
+        assert!(text.contains("用户: 在吗"));
+    }
+
+    #[test]
+    fn test_inject_character_card_and_narrative() {
+        let mut result = MemoryContextResult::default();
+        let entries = vec![{
+            let mut m = HashMap::new();
+            m.insert(
+                "content".to_string(),
+                serde_json::Value::String("用户喜欢猫".to_string()),
+            );
+            m
+        }];
+        ReplyPipeline::inject_character_card_entries(&mut result, entries);
+        assert_eq!(result.character_card_entries.len(), 1);
+
+        ReplyPipeline::inject_narrative_thread_summary(&mut result, "最近在聊宠物话题".to_string());
+        assert!(result.narrative_thread_summary.is_some());
     }
 
     #[tokio::test]

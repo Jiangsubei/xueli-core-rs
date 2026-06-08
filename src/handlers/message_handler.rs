@@ -226,7 +226,11 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
             Some(emoji_manager.clone()),
         ));
 
-        let group_collector = Arc::new(GroupMessageCollector::new(50));
+        let group_collector = Arc::new(
+            GroupMessageCollector::new(50)
+                .with_conversation_store(memory_manager.conversation_store())
+                .with_bot_name(&config.identity.name),
+        );
 
         let context_recorder = Arc::new(ContextRecorder::new(Some(db_path.clone())));
 
@@ -545,7 +549,7 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
                 .unwrap_or_default(),
             user_message: context.user_message.clone(),
             assistant_message: result.reply_text.clone(),
-            dialogue_key: conversation_key,
+            dialogue_key: conversation_key.clone(),
             scope_type: if scope.is_group() {
                 "group".to_string()
             } else {
@@ -558,9 +562,14 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
                 .map(|m| m.id.clone())
                 .unwrap_or_default(),
             image_description: context.vision_description.unwrap_or_default(),
-            narrative_summary: String::new(),
+            narrative_summary: context.narrative_thread_summary.clone().unwrap_or_default(),
             platform: event.platform.clone(),
+            warmth_guidance: String::new(),
+            user_emotion_label: String::new(),
+            intimacy_delta: 0.0,
         });
+        self._apply_mood_adjustments(event, &result.reply_text)
+            .await;
 
         Ok(Some(ReplyAction {
             scope,
@@ -682,6 +691,32 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
             .await;
     }
 
+    /// 应用心情引擎 — 记录回复作为心情增量
+    ///
+    /// 读取当前 scope 的心情状态，应用正向增量并返回可见提示。
+    pub async fn _apply_mood_adjustments(&self, event: &InboundEvent, reply_text: &str) {
+        let key = self._scope_mood_key(event);
+        let _ = self._get_or_create_mood_engine(&key);
+
+        if let Some(mut engine) = self.mood_engines.get_mut(&key) {
+            let reply_len = reply_text.trim().len() as f64;
+            let valence_delta = if reply_len > 20.0 {
+                Some(0.05)
+            } else if reply_len > 0.0 {
+                Some(0.02)
+            } else {
+                None
+            };
+
+            let deltas = crate::core::mood_engine::MoodDeltas {
+                valence_delta,
+                energy_delta: Some(-0.03),
+                arousal_delta: if reply_len > 50.0 { Some(0.04) } else { None },
+            };
+            engine.apply_deltas(&deltas);
+        }
+    }
+
     pub async fn close(&self) {
         info!("[MessageHandler] 关闭资源");
     }
@@ -743,7 +778,6 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         String::new()
     }
 
-    #[allow(dead_code)]
     fn _get_or_create_mood_engine(&self, key: &str) {
         if !self.mood_engines.contains_key(key) {
             self.mood_engines
