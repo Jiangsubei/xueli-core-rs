@@ -253,6 +253,12 @@ pub struct ChatCompletionResponse {
     /// 工具调用列表
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// 原始响应 JSON
+    #[serde(default, skip_serializing)]
+    pub raw_response: Option<serde_json::Value>,
+    /// 原始回复内容（未解析前的原始文本）
+    #[serde(default)]
+    pub raw_content: String,
 }
 
 /// Token 用量统计
@@ -293,4 +299,43 @@ pub trait AIClient: Send + Sync {
         &self,
         request: &ChatCompletionRequest,
     ) -> XueliResult<ChatCompletionResponse>;
+
+    /// 构建纯文本消息
+    fn build_text_message(&self, role: &str, content: &str) -> ChatMessage {
+        ChatMessage::text(role, content)
+    }
+
+    /// 构建多模态消息
+    fn build_multimodal_message(
+        &self,
+        role: &str,
+        text: &str,
+        images: &[String],
+        image_format: &str,
+    ) -> ChatMessage {
+        ChatMessage::multimodal(role, text, images, image_format)
+    }
+
+    /// 将消息列表转换为多模态格式，根据索引映射为指定消息插入图片
+    fn convert_to_multimodal_format(
+        &self,
+        messages: &[ChatMessage],
+        images_map: &HashMap<usize, Vec<String>>,
+    ) -> Vec<ChatMessage> {
+        let mut result = Vec::new();
+        for (index, message) in messages.iter().enumerate() {
+            if let Some(images) = images_map.get(&index) {
+                let text = message.content.text();
+                result.push(ChatMessage::multimodal(
+                    &message.role,
+                    &text,
+                    images,
+                    "image/jpeg",
+                ));
+            } else {
+                result.push(message.clone());
+            }
+        }
+        result
+    }
 }

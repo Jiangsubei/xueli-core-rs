@@ -144,11 +144,13 @@ impl DefaultAIClient {
         String::new()
     }
 
-    /// 提取 tool_calls
+    /// 提取 tool_calls（4 个候选路径）
     fn extract_tool_calls(json: &serde_json::Value) -> Option<Vec<ToolCall>> {
         let candidate_paths = [
             "choices.0.message.tool_calls",
             "output.choices.0.message.tool_calls",
+            "choices.0.message.functions",
+            "output.choices.0.message.functions",
         ];
 
         for path in &candidate_paths {
@@ -201,6 +203,7 @@ impl DefaultAIClient {
         default_model: &str,
     ) -> ChatCompletionResponse {
         let content = Self::extract_content(json, response_path);
+        let raw_content = content.clone();
         let reasoning_content = resolve_json_path(json, "choices.0.message.reasoning_content")
             .map(|v| stringify_json_value(v))
             .unwrap_or_default();
@@ -231,6 +234,8 @@ impl DefaultAIClient {
             usage,
             model,
             tool_calls,
+            raw_response: Some(json.clone()),
+            raw_content,
         }
     }
 }
