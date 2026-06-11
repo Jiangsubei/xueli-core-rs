@@ -89,7 +89,7 @@ impl CommandHandler {
 
         // 记录命令命中
         if let Some(ref metrics) = self.metrics {
-            if let Ok(mut m) = metrics.lock() {
+            if let Ok(m) = metrics.lock() {
                 m.record_reply_sent(0.0);
             }
         }
@@ -161,17 +161,25 @@ impl CommandHandler {
 
         if let Some(ref metrics) = self.metrics {
             if let Ok(m) = metrics.lock() {
+                let snap = m.snapshot();
+                let msg_recv = snap.get("total_messages_received").and_then(|v| v.as_u64()).unwrap_or(0);
+                let msg_sent = snap.get("total_replies_sent").and_then(|v| v.as_u64()).unwrap_or(0);
+                let ai_calls = snap.get("total_ai_calls").and_then(|v| v.as_u64()).unwrap_or(0);
+                let tokens = snap.get("total_tokens_used").and_then(|v| v.as_u64()).unwrap_or(0);
+                let avg_latency = snap.get("avg_response_latency_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let errors = snap.get("error_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                let ignored = snap.get("total_ignored").and_then(|v| v.as_u64()).unwrap_or(0);
                 lines.push(format!(
                     "消息接收/回复：{} / {}",
-                    m.total_messages_received, m.total_replies_sent
+                    msg_recv, msg_sent
                 ));
                 lines.push(format!(
                     "AI 调用次数/token：{} / {}",
-                    m.total_ai_calls, m.total_tokens_used
+                    ai_calls, tokens
                 ));
-                lines.push(format!("平均延迟：{:.0} ms", m.avg_response_latency_ms));
-                lines.push(format!("错误计数：{}", m.error_count));
-                lines.push(format!("忽略消息数：{}", m.total_ignored));
+                lines.push(format!("平均延迟：{:.0} ms", avg_latency));
+                lines.push(format!("错误计数：{}", errors));
+                lines.push(format!("忽略消息数：{}", ignored));
             }
         }
 

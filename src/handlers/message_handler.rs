@@ -66,12 +66,12 @@ pub struct MessageHandler<
 
     timing_gate: DefaultTimingGate<A, L>,
     conversation_planner: Arc<ConversationPlanner<A>>,
-    plan_coordinator: Arc<ConversationPlanCoordinator<A>>,
-    context_builder: Arc<ConversationContextBuilder>,
+    plan_coordinator: Arc<ConversationPlanCoordinator<A, L>>,
+    context_builder: Arc<ConversationContextBuilder<L>>,
     reply_agent: ReplyAgent<A, L>,
-    reply_pipeline: Arc<ReplyPipeline>,
+    reply_pipeline: Arc<ReplyPipeline<L>>,
 
-    memory_manager: Arc<MemoryManager>,
+    memory_manager: Arc<MemoryManager<L>>,
     memory_flow_tx: tokio::sync::mpsc::UnboundedSender<MemoryJob>,
 
     character_card_service: Arc<CharacterCardService>,
@@ -109,7 +109,7 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         config: Arc<XueliConfig>,
         ai_client: Arc<A>,
         platform: Arc<P>,
-        memory_manager: Arc<MemoryManager>,
+        memory_manager: Arc<MemoryManager<L>>,
         person_fact_store: Arc<SqlitePersonFactStore>,
         template_loader: Arc<L>,
         prompt_builder: ReplyPromptBuilder<L>,
@@ -666,7 +666,7 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         let reply_ctx = plan.map(|p| &p.reply_context).unwrap_or(&empty_ctx);
 
         self.emoji_reply_service
-            .plan_follow_up(event, &user_message, reply_text, reply_ctx, &trace_id)
+            .plan_follow_up(event, &user_message, reply_text, reply_ctx, &trace_id, "", None)
             .await
             .ok()
             .flatten()
@@ -783,6 +783,296 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         if !self.mood_engines.contains_key(key) {
             self.mood_engines
                 .insert(key.to_string(), MoodEngine::new(true));
+        }
+    }
+
+    /// 判断事件是否包含图片输入
+    pub fn has_image_input(&self, event: &InboundEvent) -> bool {
+        event.attachments.iter().any(|a| a.kind.to_lowercase() == "image")
+    }
+
+    /// 获取事件中的图片数量
+    pub fn get_image_count(&self, event: &InboundEvent) -> usize {
+        event.attachments.iter().filter(|a| a.kind.to_lowercase() == "image").count()
+    }
+
+    /// 判断视觉分析是否可用
+    pub fn vision_enabled(&self) -> bool {
+        self.image_pipeline.is_enabled()
+    }
+
+    /// 获取视觉分析状态描述
+    pub fn vision_status(&self) -> String {
+        if self.image_pipeline.is_enabled() {
+            "视觉分析已启用".to_string()
+        } else {
+            "视觉分析未配置".to_string()
+        }
+    }
+
+    /// 解析需要 @ 的用户 ID（群聊中被 @ 回复或主动回复时可能需要 @ 用户）
+    pub fn resolve_at_user(
+        &self,
+        event: &InboundEvent,
+        plan: Option<&MessageHandlingPlan>,
+    ) -> Option<String> {
+        let scope = event.message.as_ref().map(|m| m.scope.clone())?;
+        if !scope.is_group() {
+            return None;
+        }
+        let reply_context = plan.map(|p| &p.reply_context)?;
+        let reply_mode = reply_context
+            .get("reply_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+
+        if reply_mode == "at" {
+            return Some(
+                reply_context
+                    .get("effective_user_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(
+                        &event
+                            .message
+                            .as_ref()
+                            .map(|m| m.sender_id.clone())
+                            .unwrap_or_default(),
+                    )
+                    .to_string(),
+            );
+        }
+        if reply_mode == "proactive" && self.app_config.group_reply.at_user_when_proactive_reply {
+            return Some(
+                reply_context
+                    .get("effective_user_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(
+                        &event
+                            .message
+                            .as_ref()
+                            .map(|m| m.sender_id.clone())
+                            .unwrap_or_default(),
+                    )
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    /// 预分析事件中的图片，将分析结果缓存
+    pub async fn pre_analyze_images(&self, event: &InboundEvent, _trace_id: &str) {
+        if !self.has_image_input(event) || !self.vision_enabled() {
+            return;
+        }
+        let user_message = self.extract_user_message(event);
+        let is_group = event
+            .message
+            .as_ref()
+            .map(|m| m.scope.is_group())
+            .unwrap_or(false);
+        let _ = self
+            .image_pipeline
+            .analyze(event, &user_message, is_group)
+            .await;
+    }
+
+    /// 下载事件中的图片，分离普通图片和贴纸，贴纸自动入库
+    pub async fn download_images(&self, event: &InboundEvent) -> Vec<String> {
+        if !self.has_image_input(event) {
+            return Vec::new();
+        }
+        let user_message = self.extract_user_message(event);
+        let is_group = event
+            .message
+            .as_ref()
+            .map(|m| m.scope.is_group())
+            .unwrap_or(false);
+        match self
+            .image_pipeline
+            .analyze(event, &user_message, is_group)
+            .await
+        {
+            Ok(analysis) => {
+                let descriptions: Vec<String> = analysis
+                    .per_image_descriptions
+                    .iter()
+                    .filter(|s| !s.trim().is_empty())
+                    .cloned()
+                    .collect();
+                descriptions
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// 分析事件中的图片，返回视觉理解结果
+    pub async fn analyze_event_images(
+        &self,
+        event: &InboundEvent,
+        user_text: &str,
+        _trace_id: &str,
+    ) -> Option<crate::services::vision_client::ImageAnalysisResult> {
+        if !self.has_image_input(event) || !self.vision_enabled() {
+            return None;
+        }
+        let is_group = event
+            .message
+            .as_ref()
+            .map(|m| m.scope.is_group())
+            .unwrap_or(false);
+        self.image_pipeline.analyze(event, user_text, is_group).await.ok()
+    }
+
+    /// 检查并执行速率限制：若未达到发送间隔则等待
+    pub async fn get_active_conversation_count(&self) -> usize {
+        self.session_manager.count_active().await
+    }
+
+    /// 获取助手显示名称
+    pub fn get_assistant_name(&self) -> String {
+        self.app_config.identity.name.clone()
+    }
+
+    /// 获取助手别名
+    pub fn get_assistant_alias(&self) -> String {
+        self.app_config.identity.alias.clone()
+    }
+
+    /// 获取命令帮助文本
+    pub fn get_help_text(&self) -> String {
+        self.command_handler.get_help_text()
+    }
+
+    /// 获取状态文本
+    pub fn get_status_text(&self) -> String {
+        self.command_handler.get_status_text()
+    }
+
+    /// 分割长消息为多个片段
+    pub fn split_long_message(&self, message: &str) -> Vec<String> {
+        self.text_toolkit.split_long_message(message)
+    }
+
+    /// 记录群聊上下文到 ContextRecorder
+    pub async fn record_group_context(&self, event: &InboundEvent) {
+        let scope = event.message.as_ref().map(|m| m.scope.clone());
+        let is_group = scope.as_ref().map(|s| s.is_group()).unwrap_or(false);
+        if !is_group {
+            return;
+        }
+        let group_id = scope.and_then(|s| s.group_id().map(|g| g.to_string()));
+        if let (Some(gid), Some(msg)) = (group_id, &event.message) {
+            let _ = self.context_recorder.get_or_create_log(&gid).await;
+            let event_time = msg.timestamp.timestamp_millis() as f64 / 1000.0;
+            let _ = self.context_recorder.record(
+                &gid,
+                &msg.id,
+                &msg.sender_id,
+                &msg.text,
+                event_time,
+                None,
+                None,
+                &msg.sender_name,
+                &msg.text,
+            ).await;
+        }
+    }
+
+    /// 收集群聊消息到缓冲区并持久化
+    pub async fn collect_group_message(&self, event: &InboundEvent) -> Option<String> {
+        self.group_collector.collect_and_persist(event).await
+    }
+
+    /// 评估回复效果
+    pub async fn evaluate_reply_effect(
+        &self,
+        event: &InboundEvent,
+    ) -> Option<crate::handlers::reply::effect_tracker::ReplyEffectScore> {
+        let user_id = event
+            .message
+            .as_ref()
+            .map(|m| m.sender_id.clone())
+            .unwrap_or_default();
+        let scope = event
+            .message
+            .as_ref()
+            .map(|m| m.scope.clone())
+            .unwrap_or(ChatScope::Private);
+        let group_id = scope.group_id().unwrap_or("").to_string();
+        if group_id.is_empty() {
+            return None;
+        }
+        let user_text = self.extract_user_message(event);
+        self.reply_side_effects
+            .evaluate_reply_effect(&user_id, &group_id, &user_text, "")
+            .await
+    }
+
+    /// 应用回复效果评分到角色卡
+    pub async fn apply_reply_effect(
+        &self,
+        event: &InboundEvent,
+        score: &crate::handlers::reply::effect_tracker::ReplyEffectScore,
+    ) {
+        let user_id = event
+            .message
+            .as_ref()
+            .map(|m| m.sender_id.clone())
+            .unwrap_or_default();
+        if user_id.is_empty() {
+            return;
+        }
+        // 记录交互信号到角色卡
+        match score.label.as_str() {
+            "negative" => {
+                let _ = self
+                    .character_card_service
+                    .record_interaction_signal(&user_id, "reply_negative");
+            }
+            "positive" => {
+                let _ = self
+                    .character_card_service
+                    .record_interaction_signal(&user_id, "reply_positive");
+            }
+            "repair" => {
+                let _ = self
+                    .character_card_service
+                    .record_interaction_signal(&user_id, "reply_repair");
+            }
+            _ => {}
+        }
+        if !score.reply_intent.is_empty() && !score.feedback_label.is_empty() {
+            let _ = self.character_card_service.record_interaction_signal(
+                &user_id,
+                &format!("reply_effect:{}:{}", score.reply_intent, score.feedback_label),
+            );
+        }
+    }
+
+    /// 异步执行协程并设置超时，超时或失败时返回 fallback 值
+    pub async fn run_with_timeout<F, T>(
+        &self,
+        future: F,
+        timeout_seconds: f64,
+        fallback_value: T,
+        label: &str,
+    ) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        match tokio::time::timeout(
+            Duration::from_secs_f64(timeout_seconds.max(0.05)),
+            future,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                debug!("[消息处理器] {}超时，走降级", label);
+                fallback_value
+            }
         }
     }
 }

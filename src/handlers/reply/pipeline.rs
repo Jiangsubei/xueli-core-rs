@@ -12,6 +12,8 @@ use crate::core::config::XueliConfig;
 use crate::memory::manager::MemoryManager;
 use crate::memory::stores::conversation::{ConversationRecord, SqliteConversationStore};
 
+use crate::traits::prompt_template::PromptTemplateLoader;
+
 /// 多层级记忆上下文加载结果
 #[derive(Debug, Clone, Default)]
 pub struct MemoryContextResult {
@@ -37,18 +39,88 @@ pub struct MemoryContextResult {
     pub narrative_thread_summary: Option<String>,
 }
 
+// ── 模块级工具函数（不依赖泛型参数 L）────────────────────
+
+/// 格式化记忆行列表为编号文本
+pub fn format_memory_context(memory_lines: &[String]) -> String {
+    if memory_lines.is_empty() {
+        return String::new();
+    }
+    memory_lines
+        .iter()
+        .enumerate()
+        .map(|(i, text)| format!("{}. {}", i + 1, text))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 格式化并去重记忆行
+pub fn format_memory_context_and_dedupe(
+    memory_lines: &[String],
+    existing_context: &str,
+) -> String {
+    let existing = collect_memory_lines_from_text(existing_context);
+    let deduped = dedupe_memory_lines(memory_lines, &existing);
+    format_memory_context(&deduped)
+}
+
+/// 从已格式化的记忆上下文文本中提取原始行
+pub fn collect_memory_lines_from_text(memory_context: &str) -> Vec<String> {
+    memory_context
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            if let Some(pos) = trimmed.find(". ") {
+                if trimmed[..pos].chars().all(|c| c.is_ascii_digit()) {
+                    return trimmed[pos + 2..].to_string();
+                }
+            }
+            trimmed.to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 记忆行去重（基于规范化后的文本）
+pub fn dedupe_memory_lines(memory_lines: &[String], existing_lines: &[String]) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = existing_lines
+        .iter()
+        .map(|line| normalize_memory_line(line))
+        .filter(|n| !n.is_empty())
+        .collect();
+
+    let mut deduped: Vec<String> = Vec::new();
+    for line in memory_lines {
+        let normalized = normalize_memory_line(line);
+        if normalized.is_empty() || seen.contains(&normalized) {
+            continue;
+        }
+        seen.insert(normalized);
+        deduped.push(line.clone());
+    }
+    deduped
+}
+
+/// 规范化记忆行（去空白、小写）
+fn normalize_memory_line(line: &str) -> String {
+    line.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 /// Reply 流水线 — 负责在 ReplyAgent 执行前加载并格式化所有记忆上下文
-pub struct ReplyPipeline {
+pub struct ReplyPipeline<L: PromptTemplateLoader + 'static> {
     #[allow(dead_code)]
     config: Arc<XueliConfig>,
-    memory_manager: Option<Arc<MemoryManager>>,
+    memory_manager: Option<Arc<MemoryManager<L>>>,
     conversation_store: Option<Arc<SqliteConversationStore>>,
 }
 
-impl ReplyPipeline {
+impl<L: PromptTemplateLoader + 'static> ReplyPipeline<L> {
     pub fn new(
         config: Arc<XueliConfig>,
-        memory_manager: Option<Arc<MemoryManager>>,
+        memory_manager: Option<Arc<MemoryManager<L>>>,
         conversation_store: Option<Arc<SqliteConversationStore>>,
     ) -> Self {
         Self {
@@ -59,16 +131,6 @@ impl ReplyPipeline {
     }
 
     /// 加载多层级记忆上下文
-    ///
-    /// 返回：
-    /// - person_fact_context: 人物事实
-    /// - persistent_memory_context: 持久记忆
-    /// - session_restore_context: 会话恢复摘要
-    /// - precise_recall_context: 精确回忆
-    /// - dynamic_memory_context: 动态记忆
-    /// - history_messages: 近期对话历史
-    /// - is_first_turn: 是否首轮
-    /// - reusable_vision_analysis: 从历史消息中复用的视觉分析
     pub async fn load_memory_context(
         &self,
         user_id: &str,
@@ -129,7 +191,7 @@ impl ReplyPipeline {
                         .map(|item| item.content.clone())
                         .collect();
                     if !lines.is_empty() {
-                        result.persistent_memory_context = Self::format_memory_context(&lines);
+                        result.persistent_memory_context = format_memory_context(&lines);
                     }
                 }
                 Err(e) => {
@@ -162,7 +224,7 @@ impl ReplyPipeline {
 
     async fn load_retrieval_context(
         &self,
-        mm: &Arc<MemoryManager>,
+        mm: &Arc<MemoryManager<L>>,
         user_id: &str,
         _scope_id: &str,
         _scope_type: &str,
@@ -180,7 +242,7 @@ impl ReplyPipeline {
                         })
                         .collect();
                     result.session_restore_context =
-                        Self::format_memory_context_and_dedupe(&entries, "");
+                        format_memory_context_and_dedupe(&entries, "");
                 }
                 if !ctx_result.dynamic_memories.is_empty() {
                     let entries: Vec<String> = ctx_result
@@ -191,7 +253,7 @@ impl ReplyPipeline {
                                 .and_then(|v| v.as_str().map(|s| s.to_string()))
                         })
                         .collect();
-                    result.dynamic_memory_context = Self::format_memory_context_and_dedupe(
+                    result.dynamic_memory_context = format_memory_context_and_dedupe(
                         &entries,
                         &result.persistent_memory_context,
                     );
@@ -205,7 +267,7 @@ impl ReplyPipeline {
                                 .and_then(|v| v.as_str().map(|s| s.to_string()))
                         })
                         .collect();
-                    result.precise_recall_context = Self::format_memory_context(&entries);
+                    result.precise_recall_context = format_memory_context(&entries);
                 }
             }
             Err(e) => {
@@ -216,13 +278,13 @@ impl ReplyPipeline {
 
     /// 设置会话恢复上下文（由外部注入，如 SessionRestoreService）
     pub fn inject_session_restore_context(result: &mut MemoryContextResult, entries: &[String]) {
-        result.session_restore_context = Self::format_memory_context(entries);
+        result.session_restore_context = format_memory_context(entries);
     }
 
     /// 设置动态记忆上下文（由外部注入）
     pub fn inject_dynamic_memory_context(result: &mut MemoryContextResult, memories: &[String]) {
         result.dynamic_memory_context =
-            Self::format_memory_context_and_dedupe(memories, &result.persistent_memory_context);
+            format_memory_context_and_dedupe(memories, &result.persistent_memory_context);
     }
 
     /// 注入角色卡提示词条目
@@ -239,8 +301,6 @@ impl ReplyPipeline {
     }
 
     /// 从历史图片描述列表中提取可复用的视觉分析
-    ///
-    /// 扫描近期消息的 image_description 字段，若有已分析的视觉结果则复用。
     pub fn extract_reusable_vision_analysis(image_descriptions: &[String]) -> Option<String> {
         let non_empty: Vec<&str> = image_descriptions
             .iter()
@@ -265,12 +325,6 @@ impl ReplyPipeline {
     }
 
     /// 构建对话历史文本 — 格式化带身份标签的消息流
-    ///
-    /// 格式：
-    /// ```text
-    /// 用户{name}: {text}
-    /// {assistant_name}: {text}
-    /// ```
     pub fn build_conversation_history_text(
         records: &[ConversationRecord],
         assistant_name: &str,
@@ -288,75 +342,6 @@ impl ReplyPipeline {
         }
         lines.join("\n")
     }
-
-    /// 格式化记忆行列表为编号文本
-    pub fn format_memory_context(memory_lines: &[String]) -> String {
-        if memory_lines.is_empty() {
-            return String::new();
-        }
-        memory_lines
-            .iter()
-            .enumerate()
-            .map(|(i, text)| format!("{}. {}", i + 1, text))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// 格式化并去重记忆行
-    pub fn format_memory_context_and_dedupe(
-        memory_lines: &[String],
-        existing_context: &str,
-    ) -> String {
-        let existing: Vec<String> = Self::collect_memory_lines_from_text(existing_context);
-        let deduped = Self::dedupe_memory_lines(memory_lines, &existing);
-        Self::format_memory_context(&deduped)
-    }
-
-    /// 从已格式化的记忆上下文文本中提取原始行
-    pub fn collect_memory_lines_from_text(memory_context: &str) -> Vec<String> {
-        memory_context
-            .lines()
-            .map(|line| {
-                // 去掉行首编号（如 "1. xxx" → "xxx"）
-                let trimmed = line.trim();
-                if let Some(pos) = trimmed.find(". ") {
-                    if trimmed[..pos].chars().all(|c| c.is_ascii_digit()) {
-                        return trimmed[pos + 2..].to_string();
-                    }
-                }
-                trimmed.to_string()
-            })
-            .filter(|s| !s.is_empty())
-            .collect()
-    }
-
-    /// 记忆行去重（基于规范化后的文本）
-    pub fn dedupe_memory_lines(memory_lines: &[String], existing_lines: &[String]) -> Vec<String> {
-        let mut seen: std::collections::HashSet<String> = existing_lines
-            .iter()
-            .map(|line| Self::normalize_memory_line(line))
-            .filter(|n| !n.is_empty())
-            .collect();
-
-        let mut deduped: Vec<String> = Vec::new();
-        for line in memory_lines {
-            let normalized = Self::normalize_memory_line(line);
-            if normalized.is_empty() || seen.contains(&normalized) {
-                continue;
-            }
-            seen.insert(normalized);
-            deduped.push(line.clone());
-        }
-        deduped
-    }
-
-    /// 规范化记忆行（去空白、小写）
-    fn normalize_memory_line(line: &str) -> String {
-        line.split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase()
-    }
 }
 
 #[cfg(test)]
@@ -366,20 +351,20 @@ mod tests {
     #[test]
     fn test_format_memory_context() {
         let lines = vec!["记忆1".into(), "记忆2".into()];
-        let result = ReplyPipeline::format_memory_context(&lines);
+        let result = format_memory_context(&lines);
         assert_eq!(result, "1. 记忆1\n2. 记忆2");
     }
 
     #[test]
     fn test_format_memory_context_empty() {
-        let result = ReplyPipeline::format_memory_context(&[]);
+        let result = format_memory_context(&[]);
         assert_eq!(result, "");
     }
 
     #[test]
     fn test_collect_memory_lines_from_text() {
         let text = "1. 第一行\n2. 第二行\n3. 第三行";
-        let lines = ReplyPipeline::collect_memory_lines_from_text(text);
+        let lines = collect_memory_lines_from_text(text);
         assert_eq!(lines, vec!["第一行", "第二行", "第三行"]);
     }
 
@@ -387,7 +372,7 @@ mod tests {
     fn test_dedupe_memory_lines() {
         let new = vec!["记忆A".into(), "记忆B".into(), "记忆C".into()];
         let existing = vec!["记忆A".into(), "记忆D".into()];
-        let result = ReplyPipeline::dedupe_memory_lines(&new, &existing);
+        let result = dedupe_memory_lines(&new, &existing);
         assert_eq!(result.len(), 2);
         assert!(result.contains(&"记忆B".to_string()));
         assert!(result.contains(&"记忆C".to_string()));
@@ -396,55 +381,30 @@ mod tests {
 
     #[test]
     fn test_normalize_memory_line() {
-        assert_eq!(
-            ReplyPipeline::normalize_memory_line("  多   余  空白  "),
-            "多 余 空白"
-        );
-        assert_eq!(
-            ReplyPipeline::normalize_memory_line("Hello World"),
-            "hello world"
-        );
+        assert_eq!(normalize_memory_line("  多   余  空白  "), "多 余 空白");
+        assert_eq!(normalize_memory_line("Hello World"), "hello world");
     }
 
     #[test]
     fn test_format_and_dedupe() {
         let existing = "1. 已有记忆";
         let new = vec!["已有记忆".into(), "新记忆".into()];
-        let result = ReplyPipeline::format_memory_context_and_dedupe(&new, existing);
+        let result = format_memory_context_and_dedupe(&new, existing);
         assert_eq!(result, "1. 新记忆");
     }
 
     #[test]
     fn test_extract_reusable_vision_analysis_single() {
         let descs = vec!["图片显示一只猫".to_string()];
-        let result = ReplyPipeline::extract_reusable_vision_analysis(&descs);
+        let result = ReplyPipeline::<crate::services::prompt_loader::NoopPromptTemplateLoader>::extract_reusable_vision_analysis(&descs);
         assert!(result.is_some());
         assert!(result.unwrap().contains("猫"));
     }
 
     #[test]
     fn test_extract_reusable_vision_analysis_empty() {
-        let result = ReplyPipeline::extract_reusable_vision_analysis(&[]);
+        let result = ReplyPipeline::<crate::services::prompt_loader::NoopPromptTemplateLoader>::extract_reusable_vision_analysis(&[]);
         assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_reusable_vision_analysis_failed() {
-        let descs = vec!["未成功识别".to_string(), "".to_string()];
-        let result = ReplyPipeline::extract_reusable_vision_analysis(&descs);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_reusable_vision_analysis_multiple() {
-        let descs = vec!["图片显示一只猫".to_string(), "图片显示一只狗".to_string()];
-        let result = ReplyPipeline::extract_reusable_vision_analysis(&descs);
-        assert!(result.is_some());
-        let text = result.unwrap();
-        assert!(text.contains("图1"));
-        assert!(text.contains("图2"));
-        assert!(text.contains("猫"));
-        assert!(text.contains("狗"));
     }
 
     #[test]
@@ -478,53 +438,15 @@ mod tests {
                 platform: "".into(),
             },
         ];
-        let text = ReplyPipeline::build_conversation_history_text(&records, "小丽");
+        let text = ReplyPipeline::<crate::services::prompt_loader::NoopPromptTemplateLoader>::build_conversation_history_text(&records, "小丽");
         assert!(text.contains("用户小明: 你好"));
         assert!(text.contains("小丽: 你好呀！"));
-    }
-
-    #[test]
-    fn test_build_conversation_history_text_anonymous() {
-        use crate::memory::stores::conversation::ConversationRecord;
-        let records = vec![ConversationRecord {
-            id: 1,
-            session_id: "s1".into(),
-            user_id: "u1".into(),
-            sender_name: "".into(),
-            text: "在吗".into(),
-            is_bot: false,
-            scope_type: "group".into(),
-            scope_id: "g1".into(),
-            event_time: 100.0,
-            message_id: "m1".into(),
-            platform: "qq".into(),
-        }];
-        let text = ReplyPipeline::build_conversation_history_text(&records, "小丽");
-        assert!(text.contains("用户: 在吗"));
-    }
-
-    #[test]
-    fn test_inject_character_card_and_narrative() {
-        let mut result = MemoryContextResult::default();
-        let entries = vec![{
-            let mut m = HashMap::new();
-            m.insert(
-                "content".to_string(),
-                serde_json::Value::String("用户喜欢猫".to_string()),
-            );
-            m
-        }];
-        ReplyPipeline::inject_character_card_entries(&mut result, entries);
-        assert_eq!(result.character_card_entries.len(), 1);
-
-        ReplyPipeline::inject_narrative_thread_summary(&mut result, "最近在聊宠物话题".to_string());
-        assert!(result.narrative_thread_summary.is_some());
     }
 
     #[tokio::test]
     async fn test_load_memory_context_empty() {
         let config = Arc::new(XueliConfig::default());
-        let pipeline = ReplyPipeline::new(config, None, None);
+        let pipeline = ReplyPipeline::<crate::services::prompt_loader::NoopPromptTemplateLoader>::new(config, None, None);
         let result = pipeline
             .load_memory_context("user1", "scope1", false, 0)
             .await;

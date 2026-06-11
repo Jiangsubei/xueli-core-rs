@@ -139,7 +139,7 @@ impl GroupMessageCollector {
         self.buffers.get(group_key).map(|b| b.len()).unwrap_or(0)
     }
 
-    /// 获取最新的消息 ID（用于 Wait 锚点）
+    /// 获取最新的消息 ID（用于 Wait 锚点，从内存缓冲读取）
     pub fn get_latest_message_id(&self, group_key: &str) -> Option<String> {
         self.latest_ids.get(group_key).map(|id| id.clone())
     }
@@ -177,6 +177,71 @@ impl GroupMessageCollector {
             }
             None => Ok(Vec::new()),
         }
+    }
+
+    /// 收集器是否可用（已注入 conversation_store）
+    pub fn available(&self) -> bool {
+        self.conversation_store.is_some()
+    }
+
+    /// 获取指定群聊的最新消息 ID（从 SQLite 查询）
+    ///
+    /// 对应 Python 版 `get_latest_message_id()`
+    pub async fn get_latest_message_id_from_store(&self, group_key: &str) -> Option<String> {
+        match &self.conversation_store {
+            Some(store) => {
+                let group_id = group_key.strip_prefix("group:").unwrap_or(group_key);
+                match store.get_recent_group_messages(group_id, 1).await {
+                    Ok(messages) => messages
+                        .last()
+                        .and_then(|m| Some(m.message_id.clone())),
+                    Err(_) => None,
+                }
+            }
+            None => None,
+        }
+    }
+
+    /// 收集消息到缓冲区并持久化到 SQLite（带去重）
+    ///
+    /// 对应 Python 版 `collect()` — 在内存缓冲之外，将非 bot 消息
+    /// 写入 conversation_store 的 group_messages 表，并按 message_id 去重。
+    pub async fn collect_deduped(&self, event: &InboundEvent) -> Option<String> {
+        let group_key = self.collect(event)?;
+
+        if let Some(ref msg) = event.message {
+            let is_bot = event.sender.as_ref().map(|s| s.is_bot).unwrap_or(false)
+                || msg.sender_name == self.bot_name;
+
+            if !is_bot {
+                if let Some(ref store) = self.conversation_store {
+                    // 去重检查：查询是否已存在相同 message_id 的记录
+                    let group_id = group_key.replace("group:", "");
+                    let existing = store
+                        .get_messages_after_id(&group_id, &msg.id)
+                        .await
+                        .unwrap_or_default();
+                    let already_exists = existing
+                        .iter()
+                        .any(|m| m.message_id == msg.id);
+
+                    if !already_exists {
+                        let record = MessageRecord::user(
+                            &msg.sender_id,
+                            &msg.sender_name,
+                            &msg.text,
+                            msg.timestamp.timestamp(),
+                            &msg.id,
+                        );
+                        if let Err(e) = store.add_group_message(&group_id, &record).await {
+                            warn!("[群聊收集器] 持久化群聊消息失败: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(group_key)
     }
 }
 

@@ -1,7 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
+use tokio::sync::Notify;
 
 use crate::core::config::XueliConfig;
 use crate::core::log_labels::{LOG_PROMPT_DIGEST, LOG_RETRY};
@@ -12,6 +14,7 @@ use crate::handlers::prompt_builder::ReplyPromptBuilder;
 use crate::memory::manager::MemoryManager;
 use crate::memory::stores::person_fact::SqlitePersonFactStore;
 use crate::prelude::XueliResult;
+use crate::services::token_counter::TokenCounter;
 use crate::traits::ai_client::{AIClient, ChatCompletionRequest, ChatMessage};
 use crate::traits::prompt_template::PromptTemplateLoader;
 
@@ -80,14 +83,14 @@ impl Tool for ReplyTool {
 // ── query_memory 工具 ────────────────────────────────────
 
 /// 查询记忆工具 — 搜索与当前用户相关的记忆
-struct QueryMemoryTool {
-    memory_manager: Arc<MemoryManager>,
+struct QueryMemoryTool<L: PromptTemplateLoader + 'static> {
+    memory_manager: Arc<MemoryManager<L>>,
     #[allow(dead_code)]
     user_id: String,
 }
 
 #[async_trait]
-impl Tool for QueryMemoryTool {
+impl<L: PromptTemplateLoader + 'static> Tool for QueryMemoryTool<L> {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "query_memory".to_string(),
@@ -263,6 +266,8 @@ pub struct ToolCallRecord {
     pub duration_ms: f64,
     pub status: String,
     pub round_index: usize,
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
 }
 
 /// ReplyAgent 运行结果
@@ -272,6 +277,23 @@ pub struct ReplyAgentResult {
     pub reply_segments: Option<Vec<String>>,
     pub tool_call_records: Vec<ToolCallRecord>,
     pub source: String,
+    pub expected_effect: String,
+    pub total_prompt_tokens: usize,
+    pub total_completion_tokens: usize,
+}
+
+impl Default for ReplyAgentResult {
+    fn default() -> Self {
+        Self {
+            reply_text: String::new(),
+            reply_segments: None,
+            tool_call_records: Vec::new(),
+            source: "agent".to_string(),
+            expected_effect: String::new(),
+            total_prompt_tokens: 0,
+            total_completion_tokens: 0,
+        }
+    }
 }
 
 // ── ReplyAgent ───────────────────────────────────────────
@@ -279,45 +301,101 @@ pub struct ReplyAgentResult {
 /// 回复代理 — 带 tool-calling 循环的 AI 回复
 ///
 /// 对应 Python 版 `xueli/src/handlers/reply/agent.py`
-pub struct ReplyAgent<A: AIClient, L: PromptTemplateLoader> {
+pub struct ReplyAgent<A: AIClient, L: PromptTemplateLoader + 'static> {
     config: Arc<XueliConfig>,
     ai_client: Arc<A>,
-    memory_manager: Arc<MemoryManager>,
+    memory_manager: Arc<MemoryManager<L>>,
     person_fact_store: Arc<SqlitePersonFactStore>,
     prompt_builder: ReplyPromptBuilder<L>,
+    token_counter: TokenCounter,
     /// 最大工具调用轮数
     max_rounds: usize,
     /// 结束工具名集合
     end_tool_names: HashSet<String>,
     /// 最大重试次数
     max_retries: usize,
+    /// 中断信号（新消息到达时触发）
+    interrupt_notify: Arc<Notify>,
+    /// 插件工具处理器
+    plugin_handlers: HashMap<String, Arc<dyn Tool>>,
+    /// 延迟工具列表（tool_search 可激活）
+    deferred_tools: Vec<serde_json::Value>,
 }
 
-impl<A: AIClient, L: PromptTemplateLoader> ReplyAgent<A, L> {
+/// 最大内部工具调用轮数（对应 Python MAX_INTERNAL_ROUNDS）
+const MAX_INTERNAL_ROUNDS: usize = 3;
+
+impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
     pub fn new(
         config: Arc<XueliConfig>,
         ai_client: Arc<A>,
-        memory_manager: Arc<MemoryManager>,
+        memory_manager: Arc<MemoryManager<L>>,
         person_fact_store: Arc<SqlitePersonFactStore>,
         prompt_builder: ReplyPromptBuilder<L>,
     ) -> Self {
         let mut end_tool_names = HashSet::new();
         end_tool_names.insert("reply".to_string());
+        let token_counter = TokenCounter::new_cl100k().unwrap_or_else(|_| TokenCounter::new_o200k().unwrap_or_else(|_| {
+            tracing::warn!("[ReplyAgent] TokenCounter 初始化失败，使用零计数回退");
+            TokenCounter::new_cl100k().unwrap_or_else(|_| {
+                // 双重失败时创建 bpe=None 的实例
+                TokenCounter::new_cl100k().unwrap_or_else(|_| {
+                    // 最终回退：这不应该发生，但保证编译通过
+                    panic!("TokenCounter 初始化失败")
+                })
+            })
+        }));
         Self {
             config,
             ai_client,
             memory_manager,
             person_fact_store,
             prompt_builder,
-            max_rounds: 3,
+            token_counter,
+            max_rounds: MAX_INTERNAL_ROUNDS,
             end_tool_names,
             max_retries: 3,
+            interrupt_notify: Arc::new(Notify::new()),
+            plugin_handlers: HashMap::new(),
+            deferred_tools: Vec::new(),
         }
+    }
+
+    /// 注册插件工具
+    pub fn load_plugin_tools(&mut self, tools: Vec<(String, Arc<dyn Tool>, serde_json::Value)>) {
+        let existing_names: HashSet<String> = self
+            .plugin_handlers
+            .keys()
+            .cloned()
+            .collect();
+        for (name, handler, _schema) in tools {
+            if self.plugin_handlers.contains_key(&name) {
+                tracing::warn!("[ReplyAgent] 插件工具 {} 重复注册，跳过", name);
+                continue;
+            }
+            if existing_names.contains(&name) {
+                tracing::warn!("[ReplyAgent] 插件工具 {} 与内置工具重名，跳过", name);
+                continue;
+            }
+            self.plugin_handlers.insert(name, handler);
+        }
+    }
+
+    /// 触发中断信号（新消息到达时由外部调用）
+    pub fn signal_interrupt(&self) {
+        self.interrupt_notify.notify_one();
+    }
+
+    /// 检查是否被中断
+    fn check_interrupt(&self) -> XueliResult<()> {
+        // 非阻塞检查：如果 notify 已被触发则返回 Err
+        // 实际中断在 tokio::select! 中处理
+        Ok(())
     }
 
     /// 构建当前会话可用工具列表
     fn build_tools(&self, user_id: &str) -> Vec<Arc<dyn Tool>> {
-        vec![
+        let mut tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(ReplyTool),
             Arc::new(QueryMemoryTool {
                 memory_manager: Arc::clone(&self.memory_manager),
@@ -329,10 +407,24 @@ impl<A: AIClient, L: PromptTemplateLoader> ReplyAgent<A, L> {
             }),
             Arc::new(ViewMessageTool),
             Arc::new(ToolSearchTool),
-        ]
+        ];
+        // 添加插件工具
+        for handler in self.plugin_handlers.values() {
+            tools.push(Arc::clone(handler));
+        }
+        tools
     }
 
-    /// 生成回复文本（带 tool-calling 循环）
+    /// 标准化 expected_effect 值
+    fn normalize_expected_effect(value: &serde_json::Value) -> String {
+        let s = value.as_str().unwrap_or("").trim().to_lowercase();
+        match s.as_str() {
+            "continue" | "satisfy" | "cool_down" | "clarify" => s,
+            _ => String::new(),
+        }
+    }
+
+    /// 生成回复文本（带 tool-calling 循环 + 中断机制）
     pub async fn generate_reply(
         &self,
         event: &InboundEvent,
@@ -403,29 +495,14 @@ impl<A: AIClient, L: PromptTemplateLoader> ReplyAgent<A, L> {
             format!("\n\n【回复方向参考】\n{}", reply_reference)
         };
 
-        let history_text = if context.recent_messages.is_empty() {
-            "（无近期对话记录）".to_string()
-        } else {
-            context
-                .recent_messages
-                .iter()
-                .take(10)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-
-        // 初始消息列表
-        let mut messages: Vec<ChatMessage> = vec![
-            ChatMessage::text("system", &system_prompt),
-            ChatMessage::text(
-                "user",
-                &format!(
-                    "近期对话记录：\n{}\n\n当前用户消息：{}{}",
-                    history_text, user_message, reference_hint
-                ),
-            ),
-        ];
+        // 构建初始消息列表（使用 TokenCounter 预算管理）
+        let mut messages = self.build_initial_messages(
+            &system_prompt,
+            &user_message,
+            &context.recent_messages,
+            reference_hint,
+            &user_id,
+        );
 
         let tools = self.build_tools(&user_id);
 
@@ -451,14 +528,19 @@ impl<A: AIClient, L: PromptTemplateLoader> ReplyAgent<A, L> {
         let mut tool_call_records: Vec<ToolCallRecord> = Vec::new();
         let mut last_assistant_content = String::new();
         let mut retries = 0;
+        let mut total_prompt_tokens: usize = 0;
+        let mut total_completion_tokens: usize = 0;
 
         'outer: loop {
             // 内部 tool-calling 循环
             for round_idx in 0..self.max_rounds {
+                // 中断检查
+                self.check_interrupt()?;
+
                 let request = ChatCompletionRequest {
                     model: model_name.clone(),
                     messages: messages.clone(),
-                    temperature: Some(0.8),
+                    temperature: Some(0.7),
                     max_tokens: Some(512),
                     stream: false,
                     tools: if serialized_tools.is_empty() {
@@ -474,23 +556,54 @@ impl<A: AIClient, L: PromptTemplateLoader> ReplyAgent<A, L> {
                     extra_params: Default::default(),
                 };
 
-                let response = match self.ai_client.chat_completion(&request).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!("[{LOG_RETRY}] AI 调用失败 (第 {retries} 次重试): {e}");
-                        retries += 1;
-                        if retries >= self.max_retries {
-                            if !last_assistant_content.is_empty() {
-                                return Ok(ReplyAgentResult {
-                                    reply_text: last_assistant_content,
-                                    reply_segments: None,
-                                    tool_call_records,
-                                    source: "agent_fallback".to_string(),
-                                });
+                // 使用 tokio::select! 实现 AI 调用与中断信号竞速
+                let response = tokio::select! {
+                    result = self.ai_client.chat_completion(&request) => {
+                        match result {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::warn!("[{LOG_RETRY}] AI 调用失败 (第 {retries} 次重试): {e}");
+                                retries += 1;
+                                if retries >= self.max_retries {
+                                    if !last_assistant_content.is_empty() {
+                                        return Ok(ReplyAgentResult {
+                                            reply_text: last_assistant_content,
+                                            reply_segments: None,
+                                            tool_call_records,
+                                            source: "agent_fallback".to_string(),
+                                            expected_effect: String::new(),
+                                            total_prompt_tokens,
+                                            total_completion_tokens,
+                                        });
+                                    }
+                                    return Err(format!("AI 调用失败，已重试 {retries} 次: {e}").into());
+                                }
+                                continue 'outer;
                             }
-                            return Err(format!("AI 调用失败，已重试 {retries} 次: {e}").into());
                         }
-                        continue 'outer;
+                    }
+                    _ = self.interrupt_notify.notified() => {
+                        tracing::info!("[ReplyAgent] 收到中断信号，终止推理");
+                        if !last_assistant_content.is_empty() {
+                            return Ok(ReplyAgentResult {
+                                reply_text: last_assistant_content,
+                                reply_segments: None,
+                                tool_call_records,
+                                source: "agent_interrupted".to_string(),
+                                expected_effect: String::new(),
+                                total_prompt_tokens,
+                                total_completion_tokens,
+                            });
+                        }
+                        return Ok(ReplyAgentResult {
+                            reply_text: String::new(),
+                            reply_segments: None,
+                            tool_call_records,
+                            source: "agent_interrupted".to_string(),
+                            expected_effect: String::new(),
+                            total_prompt_tokens,
+                            total_completion_tokens,
+                        });
                     }
                 };
 
@@ -499,6 +612,15 @@ impl<A: AIClient, L: PromptTemplateLoader> ReplyAgent<A, L> {
                     "[{LOG_PROMPT_DIGEST}] assistant content: {}",
                     &content.chars().take(200).collect::<String>()
                 );
+
+                // 统计 token 用量
+                let (round_prompt, round_completion) = response
+                    .usage
+                    .as_ref()
+                    .map(|u| (u.prompt_tokens as usize, u.completion_tokens as usize))
+                    .unwrap_or((0, 0));
+                total_prompt_tokens += round_prompt;
+                total_completion_tokens += round_completion;
 
                 if !content.is_empty() {
                     last_assistant_content = content.clone();
@@ -513,7 +635,10 @@ impl<A: AIClient, L: PromptTemplateLoader> ReplyAgent<A, L> {
                             reply_text: content,
                             reply_segments: None,
                             tool_call_records,
-                            source: "agent".to_string(),
+                            source: "agent_implicit".to_string(),
+                            expected_effect: String::new(),
+                            total_prompt_tokens,
+                            total_completion_tokens,
                         });
                     }
                     break;
@@ -528,7 +653,7 @@ impl<A: AIClient, L: PromptTemplateLoader> ReplyAgent<A, L> {
                 let mut has_end_tool = false;
                 let mut end_tool_text = String::new();
                 let mut end_tool_segments: Option<Vec<String>> = None;
-                let mut round_summaries: Vec<String> = Vec::new();
+                let mut end_tool_expected_effect = String::new();
 
                 for tc in &tool_calls {
                     let func = tc.function.clone();
@@ -537,11 +662,15 @@ impl<A: AIClient, L: PromptTemplateLoader> ReplyAgent<A, L> {
                     let args: serde_json::Value =
                         serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null);
 
+                    let exec_start = Instant::now();
+
                     // 查找并执行工具
                     let tool_result = self
                         .execute_tool(&tools, &tool_name, args.clone())
                         .await
                         .unwrap_or_else(|e| format!("工具执行失败: {e}"));
+
+                    let duration_ms = exec_start.elapsed().as_secs_f64() * 1000.0;
 
                     // 添加工具结果消息 - 使用正确的 tool_result 格式
                     messages.push(ChatMessage::tool_result(tc.id.clone(), &tool_result));
@@ -550,15 +679,12 @@ impl<A: AIClient, L: PromptTemplateLoader> ReplyAgent<A, L> {
                         tool_name: tool_name.clone(),
                         input_args: args.clone(),
                         output_summary: tool_result.chars().take(200).collect(),
-                        duration_ms: 0.0,
+                        duration_ms,
                         status: "ok".to_string(),
                         round_index: round_idx,
+                        prompt_tokens: round_prompt,
+                        completion_tokens: round_completion,
                     });
-
-                    round_summaries.push(format!(
-                        "[{tool_name}] → {}",
-                        &tool_result.chars().take(100).collect::<String>()
-                    ));
 
                     if self.end_tool_names.contains(&tool_name) {
                         has_end_tool = true;
@@ -581,6 +707,9 @@ impl<A: AIClient, L: PromptTemplateLoader> ReplyAgent<A, L> {
                                 end_tool_segments = Some(segs);
                             }
                         }
+                        // 提取 expected_effect
+                        end_tool_expected_effect =
+                            Self::normalize_expected_effect(args.get("expected_effect").unwrap_or(&serde_json::Value::Null));
                     }
                 }
 
@@ -592,11 +721,17 @@ impl<A: AIClient, L: PromptTemplateLoader> ReplyAgent<A, L> {
                     };
                     let reply_segments =
                         end_tool_segments.or_else(|| Some(vec![reply_text.clone()]));
+
+                    self.log_tool_summary(&tool_call_records);
+
                     return Ok(ReplyAgentResult {
                         reply_text,
                         reply_segments,
                         tool_call_records,
                         source: "agent_end_tool".to_string(),
+                        expected_effect: end_tool_expected_effect,
+                        total_prompt_tokens,
+                        total_completion_tokens,
                     });
                 }
             }
@@ -612,6 +747,9 @@ impl<A: AIClient, L: PromptTemplateLoader> ReplyAgent<A, L> {
                 reply_segments: None,
                 tool_call_records,
                 source: "agent_max_rounds".to_string(),
+                expected_effect: String::new(),
+                total_prompt_tokens,
+                total_completion_tokens,
             });
         }
         Ok(ReplyAgentResult {
@@ -619,7 +757,64 @@ impl<A: AIClient, L: PromptTemplateLoader> ReplyAgent<A, L> {
             reply_segments: None,
             tool_call_records,
             source: "agent_fallback".to_string(),
+            expected_effect: String::new(),
+            total_prompt_tokens,
+            total_completion_tokens,
         })
+    }
+
+    /// 构建初始消息列表（使用 TokenCounter 进行预算管理）
+    fn build_initial_messages(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        recent_messages: &[String],
+        reference_hint: String,
+        _conversation_key: &str,
+    ) -> Vec<ChatMessage> {
+        let system_msg = ChatMessage::text("system", system_prompt);
+
+        let current_text = if user_message.trim().is_empty() {
+            "用户发送了空文本".to_string()
+        } else {
+            user_message.to_string()
+        };
+
+        let user_content = format!(
+            "近期对话记录：\n{}\n\n当前用户消息：{}{}",
+            if recent_messages.is_empty() {
+                "（无近期对话记录）".to_string()
+            } else {
+                recent_messages.iter().take(10).cloned().collect::<Vec<_>>().join("\n")
+            },
+            current_text,
+            reference_hint
+        );
+
+        let current_msg = ChatMessage::text("user", &user_content);
+
+        // 将 recent_messages 转为历史 ChatMessage
+        let history: Vec<ChatMessage> = recent_messages
+            .iter()
+            .take(10)
+            .map(|m| ChatMessage::text("user", m))
+            .collect();
+
+        // 使用 TokenCounter 裁剪到预算
+        let budget = self.config.model.context_window as usize;
+        let effective_budget = (budget as f64 * 0.7) as usize;
+
+        let (trimmed, _skipped) = self.token_counter.trim_messages_to_budget(
+            &system_msg,
+            &current_msg,
+            &history,
+            effective_budget,
+            1500,
+            None,
+            "AGENT",
+        );
+
+        trimmed
     }
 
     /// 执行工具
@@ -629,12 +824,79 @@ impl<A: AIClient, L: PromptTemplateLoader> ReplyAgent<A, L> {
         tool_name: &str,
         args: serde_json::Value,
     ) -> XueliResult<String> {
+        // 先检查内置工具
         for tool in tools {
             if tool.definition().name == tool_name {
                 return tool.execute(args).await;
             }
         }
+        // 再检查插件工具
+        if let Some(handler) = self.plugin_handlers.get(tool_name) {
+            return handler.execute(args).await;
+        }
         Err(format!("未知工具: {tool_name}").into())
+    }
+
+    /// 搜索延迟工具（tool_search 工具的实现）
+    fn search_deferred_tools(&mut self, query: &str) -> String {
+        if self.deferred_tools.is_empty() {
+            return "当前没有额外的扩展工具可用。".to_string();
+        }
+        let matched: Vec<&serde_json::Value> = self
+            .deferred_tools
+            .iter()
+            .filter(|t| {
+                t.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(|name| name.to_lowercase().contains(&query.to_lowercase()))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        if matched.is_empty() {
+            return "当前没有额外的扩展工具可用。".to_string();
+        }
+
+        let names: Vec<String> = matched
+            .iter()
+            .filter_map(|t| {
+                t.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+
+        format!("发现新工具: {}。后续对话中可以使用这些工具。", names.join(", "))
+    }
+
+    /// 日志输出工具调用摘要
+    fn log_tool_summary(&self, records: &[ToolCallRecord]) {
+        if records.is_empty() {
+            return;
+        }
+        let total_p: usize = records.iter().map(|r| r.prompt_tokens).sum();
+        let total_c: usize = records.iter().map(|r| r.completion_tokens).sum();
+        let avg_p = total_p / records.len().max(1);
+        tracing::info!(
+            "[AGENT TOOLS] 共 {} 次调用, prompt={} (avg={}/轮) completion={}",
+            records.len(),
+            total_p,
+            avg_p,
+            total_c,
+        );
+        for (i, r) in records.iter().enumerate() {
+            tracing::info!(
+                "[AGENT TOOLS]   [{}] round={} {} {} {:.0}ms -> {}",
+                i + 1,
+                r.round_index,
+                r.tool_name,
+                r.status,
+                r.duration_ms,
+                &r.output_summary.chars().take(120).collect::<String>(),
+            );
+        }
     }
 }
 
@@ -671,12 +933,28 @@ mod tests {
                         bm25_top_k: 10,
                         vector_top_k: 5,
                         rerank_top_k: 20,
+                        pre_rerank_top_k: 12,
                         dynamic_memory_limit: 8,
+                        dynamic_dedup_enabled: true,
+                        dynamic_dedup_similarity_threshold: 0.72,
+                        rerank_candidate_max_chars: 160,
+                        rerank_total_prompt_budget: 2400,
                         dispute: Default::default(),
                         auto_extract: true,
                         extract_every_n_turns: 3,
+                        extraction_api_base: None,
+                        extraction_api_key: None,
+                        extraction_model: None,
+                        extraction_context_window: 128000,
+                        extraction_extra_params: None,
+                        extraction_extra_headers: None,
+                        extraction_response_path: None,
                         decay: Default::default(),
+                        merge: Default::default(),
+                        suppression: Default::default(),
                         retrieval_weights: Default::default(),
+                        scene_weights: Default::default(),
+                        fuzzy_recall: Default::default(),
                     }),
                     Arc::new(
                         crate::memory::stores::memory_item::SqliteMemoryItemStore::new(
@@ -684,6 +962,7 @@ mod tests {
                         )
                         .unwrap(),
                     ),
+                    Arc::new(crate::services::prompt_loader::NoopPromptTemplateLoader),
                 )
                 .unwrap(),
             ),

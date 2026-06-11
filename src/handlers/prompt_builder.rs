@@ -251,6 +251,8 @@ impl<L: PromptTemplateLoader> ReplyPromptBuilder<L> {
                 "emotional_safety",
                 "tone_guidance",
                 "last_emotional_tone",
+                "trust_level",
+                "formality_distance",
             ] {
                 if let Some(val) = profile.get(*key) {
                     let val = val.trim();
@@ -270,6 +272,22 @@ impl<L: PromptTemplateLoader> ReplyPromptBuilder<L> {
                             }
                             "last_emotional_tone" => {
                                 profile_parts.push(format!("近期情绪={}", val));
+                            }
+                            "trust_level" => {
+                                // 数值型字段：格式化为两位小数
+                                if let Ok(num) = val.parse::<f64>() {
+                                    profile_parts.push(format!("信任程度={:.2}", num));
+                                } else {
+                                    profile_parts.push(format!("信任程度={}", val));
+                                }
+                            }
+                            "formality_distance" => {
+                                // 数值型字段：格式化为两位小数
+                                if let Ok(num) = val.parse::<f64>() {
+                                    profile_parts.push(format!("正式距离={:.2}", num));
+                                } else {
+                                    profile_parts.push(format!("正式距离={}", val));
+                                }
                             }
                             _ => {
                                 profile_parts.push(val.to_string());

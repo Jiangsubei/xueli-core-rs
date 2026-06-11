@@ -16,13 +16,15 @@ use crate::traits::ai_client::AIClient;
 
 const DEFAULT_UNIFIED_FETCH_LIMIT: usize = 200;
 
+use crate::traits::prompt_template::PromptTemplateLoader;
+
 /// 会话计划协调器 — 协调群聊历史、视觉增强和规划器调用。
 ///
 /// 它是群聊消息处理的核心调度枢纽，负责：构建消息上下文、调用规划器、记录对话历史。
-pub struct ConversationPlanCoordinator<A: AIClient> {
+pub struct ConversationPlanCoordinator<A: AIClient, L: PromptTemplateLoader + 'static = crate::services::prompt_loader::NoopPromptTemplateLoader> {
     pub planner: Arc<ConversationPlanner<A>>,
     pub session_manager: Arc<ConversationSessionManager>,
-    pub context_builder: Arc<ConversationContextBuilder>,
+    pub context_builder: Arc<ConversationContextBuilder<L>>,
     conversation_store: Option<Arc<SqliteConversationStore>>,
     character_card_service: Option<Arc<CharacterCardService>>,
     /// 上下文窗口大小
@@ -73,11 +75,11 @@ impl Default for MessageContext {
     }
 }
 
-impl<A: AIClient> ConversationPlanCoordinator<A> {
+impl<A: AIClient, L: PromptTemplateLoader + 'static> ConversationPlanCoordinator<A, L> {
     pub fn new(
         planner: Arc<ConversationPlanner<A>>,
         session_manager: Arc<ConversationSessionManager>,
-        context_builder: Arc<ConversationContextBuilder>,
+        context_builder: Arc<ConversationContextBuilder<L>>,
         assistant_name: impl Into<String>,
     ) -> Self {
         Self {
@@ -177,6 +179,18 @@ impl<A: AIClient> ConversationPlanCoordinator<A> {
         &self,
         event: &InboundEvent,
         reply_text: &str,
+    ) -> XueliResult<()> {
+        self.record_assistant_reply_with_group_id(event, reply_text, None).await
+    }
+
+    /// 记录助手的回复到对话历史（支持显式 group_id）
+    ///
+    /// 对应 Python 版 `record_assistant_reply()`
+    pub async fn record_assistant_reply_with_group_id(
+        &self,
+        event: &InboundEvent,
+        reply_text: &str,
+        _group_id: Option<&str>,
     ) -> XueliResult<()> {
         let text = reply_text.trim();
         if text.is_empty() {
@@ -1290,7 +1304,7 @@ mod tests {
     fn test_history_key_group() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(SqliteConversationStore::open(temp_dir.path()).unwrap());
-        let builder = Arc::new(ConversationContextBuilder::new(store));
+        let builder = Arc::new(ConversationContextBuilder::<crate::services::prompt_loader::NoopPromptTemplateLoader>::new(store));
         let planner = Arc::new(ConversationPlanner::new(
             Arc::new(crate::services::ai_client::NoopAIClient),
             "test-model",
@@ -1309,7 +1323,7 @@ mod tests {
     fn test_history_key_private() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(SqliteConversationStore::open(temp_dir.path()).unwrap());
-        let builder = Arc::new(ConversationContextBuilder::new(store));
+        let builder = Arc::new(ConversationContextBuilder::<crate::services::prompt_loader::NoopPromptTemplateLoader>::new(store));
         let planner = Arc::new(ConversationPlanner::new(
             Arc::new(crate::services::ai_client::NoopAIClient),
             "test-model",
@@ -1370,7 +1384,7 @@ mod tests {
     fn test_build_current_message() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(SqliteConversationStore::open(temp_dir.path()).unwrap());
-        let builder = Arc::new(ConversationContextBuilder::new(store));
+        let builder = Arc::new(ConversationContextBuilder::<crate::services::prompt_loader::NoopPromptTemplateLoader>::new(store));
         let planner = Arc::new(ConversationPlanner::new(
             Arc::new(crate::services::ai_client::NoopAIClient),
             "test-model",
@@ -1399,7 +1413,7 @@ mod tests {
     fn test_build_current_message_empty() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(SqliteConversationStore::open(temp_dir.path()).unwrap());
-        let builder = Arc::new(ConversationContextBuilder::new(store));
+        let builder = Arc::new(ConversationContextBuilder::<crate::services::prompt_loader::NoopPromptTemplateLoader>::new(store));
         let planner = Arc::new(ConversationPlanner::new(
             Arc::new(crate::services::ai_client::NoopAIClient),
             "test-model",
@@ -1459,7 +1473,7 @@ mod tests {
     fn test_format_window_speaker() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(SqliteConversationStore::open(temp_dir.path()).unwrap());
-        let builder = Arc::new(ConversationContextBuilder::new(store));
+        let builder = Arc::new(ConversationContextBuilder::<crate::services::prompt_loader::NoopPromptTemplateLoader>::new(store));
         let planner = Arc::new(ConversationPlanner::new(
             Arc::new(crate::services::ai_client::NoopAIClient),
             "test-model",
@@ -1485,7 +1499,7 @@ mod tests {
     fn test_format_window_context() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(SqliteConversationStore::open(temp_dir.path()).unwrap());
-        let builder = Arc::new(ConversationContextBuilder::new(store));
+        let builder = Arc::new(ConversationContextBuilder::<crate::services::prompt_loader::NoopPromptTemplateLoader>::new(store));
         let planner = Arc::new(ConversationPlanner::new(
             Arc::new(crate::services::ai_client::NoopAIClient),
             "test-model",
@@ -1511,7 +1525,7 @@ mod tests {
     fn test_format_window_context_empty() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(SqliteConversationStore::open(temp_dir.path()).unwrap());
-        let builder = Arc::new(ConversationContextBuilder::new(store));
+        let builder = Arc::new(ConversationContextBuilder::<crate::services::prompt_loader::NoopPromptTemplateLoader>::new(store));
         let planner = Arc::new(ConversationPlanner::new(
             Arc::new(crate::services::ai_client::NoopAIClient),
             "test-model",
@@ -1550,7 +1564,7 @@ mod tests {
     fn test_build_planning_signals_no_messages() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(SqliteConversationStore::open(temp_dir.path()).unwrap());
-        let builder = Arc::new(ConversationContextBuilder::new(store));
+        let builder = Arc::new(ConversationContextBuilder::<crate::services::prompt_loader::NoopPromptTemplateLoader>::new(store));
         let planner = Arc::new(ConversationPlanner::new(
             Arc::new(crate::services::ai_client::NoopAIClient),
             "test-model",

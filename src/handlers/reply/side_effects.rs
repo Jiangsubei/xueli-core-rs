@@ -1,18 +1,35 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+
 use tokio::sync::Mutex;
 
+use crate::character::card_service::CharacterCardService;
 use crate::handlers::reply::effect_tracker::{ReplyEffectScore, ReplyEffectTracker};
 
 /// 回复副作用 — 发回复后的效果评估与后续处理
 ///
-/// 对应 Python 版 `ReplySideEffects`
+/// 对应 Python 版 `ReplySideEffectHandler`
 pub struct ReplySideEffects {
     effect_tracker: Arc<Mutex<ReplyEffectTracker>>,
+    /// 角色卡服务（可选，用于 apply_reply_effect）
+    character_card_service: Option<Arc<CharacterCardService>>,
+    /// 最近一次 feedback_triage 信号缓存
+    last_feedback_triage: std::sync::Mutex<HashMap<String, HashMap<String, serde_json::Value>>>,
 }
 
 impl ReplySideEffects {
     pub fn new(effect_tracker: Arc<Mutex<ReplyEffectTracker>>) -> Self {
-        Self { effect_tracker }
+        Self {
+            effect_tracker,
+            character_card_service: None,
+            last_feedback_triage: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 设置角色卡服务
+    pub fn with_character_card_service(mut self, svc: Arc<CharacterCardService>) -> Self {
+        self.character_card_service = Some(svc);
+        self
     }
 
     /// 记录一条即将发出的回复，等待后续反馈评估
@@ -102,6 +119,118 @@ impl ReplySideEffects {
     pub async fn cleanup(&self) {
         let mut tracker = self.effect_tracker.lock().await;
         tracker.cleanup();
+    }
+
+    /// 应用回复效果到角色卡
+    ///
+    /// 对应 Python 版 `apply_reply_effect()`
+    pub async fn apply_reply_effect(
+        &self,
+        user_id: &str,
+        group_id: &str,
+        score: &ReplyEffectScore,
+    ) {
+        let ccs = match &self.character_card_service {
+            Some(s) => s,
+            None => return,
+        };
+
+        let reply_intent = score.reply_intent.trim().to_string();
+        let feedback_label = if score.feedback_label.is_empty() {
+            score.label.clone()
+        } else {
+            score.feedback_label.clone()
+        };
+
+        // 从缓存的 feedback_triage 信号中提取 style_label 和 emotion_label
+        let triage_key = format!("{}:{}", group_id, user_id);
+        let signal = self.last_feedback_triage.lock().unwrap_or_else(|e| e.into_inner()).remove(&triage_key).unwrap_or_default();
+        let style_label = signal
+            .get("style_feedback_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let emotion_label = signal
+            .get("emotion_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let prediction_met = signal
+            .get("prediction_met")
+            .and_then(|v| v.as_bool());
+
+        // 尝试调用 apply_reply_effect_bundle
+        let applied = ccs.apply_reply_effect_bundle(
+            user_id,
+            score.score,
+            &feedback_label,
+            &reply_intent,
+            &style_label,
+            &emotion_label,
+            &score.expected_effect,
+            prediction_met,
+        );
+
+        if applied.is_err() {
+            // 简化路径：记录交互信号
+            match score.label.as_str() {
+                "negative" => {
+                    let _ = ccs.record_interaction_signal(user_id, "reply_negative");
+                }
+                "positive" => {
+                    let _ = ccs.record_interaction_signal(user_id, "reply_positive");
+                }
+                "repair" => {
+                    let _ = ccs.record_interaction_signal(user_id, "reply_repair");
+                }
+                _ => {}
+            }
+
+            if !reply_intent.is_empty() && !feedback_label.is_empty() {
+                let _ = ccs.record_interaction_signal(
+                    user_id,
+                    &format!("reply_effect:{}:{}", reply_intent, feedback_label),
+                );
+            }
+
+            if !feedback_label.is_empty() {
+                let _ = ccs.record_reply_feedback(user_id, &feedback_label, score.score);
+            }
+
+            if !style_label.is_empty() {
+                let _ = ccs.record_explicit_feedback_category(user_id, &style_label);
+            }
+
+            if !emotion_label.is_empty() {
+                let _ = ccs.record_emotion(user_id, &emotion_label);
+            }
+
+            ccs.refresh_snapshot(user_id);
+        }
+    }
+
+    /// 带超时执行异步任务
+    ///
+    /// 对应 Python 版 `run_with_timeout()`
+    pub async fn run_with_timeout<F, T>(
+        future: F,
+        timeout_seconds: f64,
+        fallback_value: T,
+        label: &str,
+    ) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let timeout = std::time::Duration::from_secs_f64(timeout_seconds.max(0.05));
+        match tokio::time::timeout(timeout, future).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::debug!("[副作用] {}超时，走降级", label);
+                fallback_value
+            }
+        }
     }
 }
 

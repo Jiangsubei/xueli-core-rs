@@ -11,6 +11,7 @@ use crate::handlers::session_manager::ConversationSessionManager;
 use crate::memory::manager::MemoryManager;
 use crate::memory::stores::conversation::{ConversationRecord, SqliteConversationStore};
 use crate::prelude::XueliResult;
+use crate::traits::prompt_template::PromptTemplateLoader;
 
 /// 构建好的上下文 — 规划器和 ReplyAgent 的共享输入。
 #[derive(Debug, Clone)]
@@ -71,15 +72,15 @@ pub struct ConversationContext {
 ///
 /// 集成 MemoryManager、CharacterCardService、NarrativeService、
 /// ReplyStylePolicy 等组件，对应 Python 版 `ConversationContextBuilder`。
-pub struct ConversationContextBuilder {
+pub struct ConversationContextBuilder<L: PromptTemplateLoader + 'static = crate::services::prompt_loader::NoopPromptTemplateLoader> {
     store: Arc<SqliteConversationStore>,
     session_manager: Option<Arc<ConversationSessionManager>>,
-    memory_manager: Option<Arc<MemoryManager>>,
+    memory_manager: Option<Arc<MemoryManager<L>>>,
     character_card_service: Option<Arc<CharacterCardService>>,
     narrative_service: Option<Arc<NarrativeService>>,
 }
 
-impl ConversationContextBuilder {
+impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
     pub fn new(store: Arc<SqliteConversationStore>) -> Self {
         Self {
             store,
@@ -97,7 +98,7 @@ impl ConversationContextBuilder {
     }
 
     /// 设置记忆管理器（用于记忆上下文加载）
-    pub fn with_memory_manager(mut self, mgr: Arc<MemoryManager>) -> Self {
+    pub fn with_memory_manager(mut self, mgr: Arc<MemoryManager<L>>) -> Self {
         self.memory_manager = Some(mgr);
         self
     }
@@ -190,12 +191,18 @@ impl ConversationContextBuilder {
         let (person_facts, persistent_memory, precise_recall) =
             self.load_memory_context(&user_id).await;
 
+        // 加载视觉上下文（从事件附件中提取）
+        let vision_description = self.load_vision_context(event);
+
         // 加载角色卡快照
         let character_card_snapshot = self.load_character_card_snapshot(&user_id);
 
         // 加载叙事线
         let (narrative_thread_summary, narrative_thread_label, narrative_self) =
             self.load_narrative_thread(&user_id);
+
+        // 构建用户画像信号
+        let user_emotion_label = self.build_user_emotion_label(&user_id);
 
         // 构建谨慎度信号
         let caution_signal = self.build_caution_signal(
@@ -219,7 +226,7 @@ impl ConversationContextBuilder {
             dynamic_memory,
             session_restore,
             precise_recall,
-            vision_description: None,
+            vision_description,
             continuity_hint: continuity,
             follows_assistant_recently: follows_assistant,
             recent_message_count,
@@ -229,7 +236,7 @@ impl ConversationContextBuilder {
             narrative_self,
             caution_signal,
             planning_signals: None,
-            user_emotion_label: None,
+            user_emotion_label,
             style_guide: None,
             soft_uncertainty_signals: None,
         })
@@ -292,7 +299,7 @@ impl ConversationContextBuilder {
                     None
                 } else {
                     Some(
-                        crate::handlers::reply::pipeline::ReplyPipeline::format_memory_context(
+                        crate::handlers::reply::pipeline::format_memory_context(
                             &lines,
                         ),
                     )
@@ -460,9 +467,46 @@ impl ConversationContextBuilder {
 
         Some(map)
     }
+
+    /// 加载视觉上下文 — 从事件附件中提取图片描述
+    ///
+    /// 对应 Python 版 `_load_vision_context()`
+    fn load_vision_context(&self, event: &InboundEvent) -> Option<String> {
+        let image_attachments: Vec<&crate::core::platform_types::AttachmentRef> = event
+            .attachments
+            .iter()
+            .filter(|a| a.kind.to_lowercase() == "image")
+            .collect();
+
+        if image_attachments.is_empty() {
+            return None;
+        }
+
+        // 如果有图片但没有视觉分析结果，返回占位描述
+        let count = image_attachments.len();
+        if count == 1 {
+            Some("[图片]（视觉分析待处理）".to_string())
+        } else {
+            Some(format!("[图片] {}张图片（视觉分析待处理）", count))
+        }
+    }
+
+    /// 构建用户情绪标签 — 从角色卡快照中提取
+    ///
+    /// 对应 Python 版 `_build_user_emotion_label()`
+    fn build_user_emotion_label(&self, user_id: &str) -> Option<String> {
+        let ccs = self.character_card_service.as_ref()?;
+        let snapshot = ccs.get_snapshot(user_id);
+
+        if snapshot.emotional_trend.is_empty() {
+            None
+        } else {
+            Some(snapshot.emotional_trend.clone())
+        }
+    }
 }
 
-impl Default for ConversationContextBuilder {
+impl Default for ConversationContextBuilder<crate::services::prompt_loader::FilePromptTemplateLoader> {
     fn default() -> Self {
         let dir = std::path::PathBuf::from("data/conversations");
         let store =
