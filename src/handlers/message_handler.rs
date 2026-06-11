@@ -300,16 +300,35 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         let _session_lock = self.session_manager.get_session_lock(&execution_key).await;
         let _guard = _session_lock.lock().await;
 
+        let start = Instant::now();
+
         info!(
             trace_id = %trace_id,
             execution_key = %execution_key,
             "消息处理开始"
         );
 
+        // 记录收到消息指标
+        self._record_metrics_message_received();
+
+        // 收集群聊消息到缓冲区
+        let _ = self.collect_group_message(event).await;
+
         let plan = self.plan_message(event, &trace_id).await?;
 
         if !plan.should_reply {
             debug!(trace_id = %trace_id, reason = %plan.reason, "消息处理计划决定不回复");
+            self._record_metrics_ignored(&plan.action);
+            return Ok(None);
+        }
+
+        // 速率限制检查
+        let target_id = event
+            .message
+            .as_ref()
+            .map(|m| m.sender_id.clone())
+            .unwrap_or_default();
+        if !target_id.is_empty() && !self.check_rate_limit(&target_id).await {
             return Ok(None);
         }
 
@@ -320,6 +339,16 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         if let Some(ref action) = reply_action {
             self.record_reply_sent(event, &action.text, Some(&plan))
                 .await;
+
+            // 更新叙事线
+            self._update_narrative_thread(event, &action.text).await;
+
+            // 持久化心情状态
+            self._persist_mood_state(event).await;
+
+            // 记录回复发送指标
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            self._record_metrics_reply_sent(elapsed_ms);
         }
 
         Ok(reply_action)
@@ -639,8 +668,8 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         if let Some(last) = last_time {
             let elapsed = last.elapsed();
             if elapsed.as_secs_f64() < interval {
-                let sleep_dur = Duration::from_secs_f64(interval - elapsed.as_secs_f64());
-                tokio::time::sleep(sleep_dur).await;
+                tracing::debug!("[RATE LIMIT] {} 被限流，跳过回复", target_id);
+                return false;
             }
         }
         self.last_send_time
@@ -716,6 +745,154 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
             };
             engine.apply_deltas(&deltas);
         }
+    }
+
+    /// 记录收到消息到运行时指标
+    fn _record_metrics_message_received(&self) {
+        if let Some(ref metrics) = self.runtime_metrics {
+            if let Ok(m) = metrics.try_lock() {
+                m.record_message_received();
+            }
+        }
+    }
+
+    /// 记录忽略决策到运行时指标
+    fn _record_metrics_ignored(&self, action: &str) {
+        if let Some(ref metrics) = self.runtime_metrics {
+            if let Ok(m) = metrics.try_lock() {
+                m.record_planner_action(action);
+                if action == ACTION_IGNORE {
+                    m.record_ignored();
+                }
+            }
+        }
+    }
+
+    /// 记录回复发送到运行时指标
+    fn _record_metrics_reply_sent(&self, latency_ms: f64) {
+        if let Some(ref metrics) = self.runtime_metrics {
+            if let Ok(m) = metrics.try_lock() {
+                m.record_reply_sent(latency_ms);
+            }
+        }
+    }
+
+    /// 更新叙事线 — 记录交互事件
+    async fn _update_narrative_thread(&self, event: &InboundEvent, reply_text: &str) {
+        let user_id = event
+            .message
+            .as_ref()
+            .map(|m| m.sender_id.clone())
+            .unwrap_or_default();
+        if user_id.is_empty() {
+            return;
+        }
+        let user_message = self.extract_user_message(event);
+        if !user_message.is_empty() {
+            self.narrative_service.add_event(
+                &user_id,
+                &format!("用户: {} → 助手: {}", truncate_str(&user_message, 40), truncate_str(reply_text, 40)),
+                0.3,
+            );
+        }
+    }
+
+    /// 持久化心情状态到 MoodStore
+    async fn _persist_mood_state(&self, event: &InboundEvent) {
+        let key = self._scope_mood_key(event);
+        if let Some(engine) = self.mood_engines.get(&key) {
+            if let Some(state) = engine.current() {
+                let _ = self.mood_store.save_async(&key, state).await;
+            }
+        }
+    }
+
+    /// 从 MoodStore 恢复心情状态
+    pub async fn restore_mood_state(&self, event: &InboundEvent) {
+        let key = self._scope_mood_key(event);
+        let state = self.mood_store.load_async(&key).await;
+        self._get_or_create_mood_engine(&key);
+        if let Some(mut engine) = self.mood_engines.get_mut(&key) {
+            engine.load(state);
+        }
+    }
+
+    /// 获取角色卡快照
+    pub fn get_character_card_snapshot(
+        &self,
+        user_id: &str,
+    ) -> crate::character::card_service::CharacterCardSnapshot {
+        self.character_card_service.get_snapshot(user_id)
+    }
+
+    /// 获取叙事线程摘要
+    pub fn get_narrative_summary(&self, user_id: &str) -> String {
+        let thread = self.narrative_service.get_thread(user_id);
+        if thread.summary.is_empty() {
+            String::new()
+        } else {
+            thread.summary
+        }
+    }
+
+    /// 构建身份文本（用于提示词注入）
+    pub async fn build_identity_text(&self) -> String {
+        self.identity_provider.build_identity_text().await
+    }
+
+    /// 检查视觉客户端是否可用
+    pub fn is_vision_available(&self) -> bool {
+        self.vision_client.is_available()
+    }
+
+    /// 获取 token 计数
+    pub fn count_tokens(&self, text: &str) -> usize {
+        self.token_counter.count(text)
+    }
+
+    /// 获取 AI 客户端引用（供外部调用使用）
+    pub fn ai_client(&self) -> &Arc<A> {
+        &self.ai_client
+    }
+
+    /// 获取规划器引用
+    pub fn planner(&self) -> &Arc<ConversationPlanner<A>> {
+        &self.conversation_planner
+    }
+
+    /// 获取规划协调器引用
+    pub fn plan_coordinator(&self) -> &Arc<ConversationPlanCoordinator<A, L>> {
+        &self.plan_coordinator
+    }
+
+    /// 获取回复管线引用
+    pub fn reply_pipeline(&self) -> &Arc<ReplyPipeline<L>> {
+        &self.reply_pipeline
+    }
+
+    /// 获取记忆管理器引用
+    pub fn memory_manager(&self) -> &Arc<MemoryManager<L>> {
+        &self.memory_manager
+    }
+
+    /// 获取表情管理器引用
+    pub fn emoji_manager(&self) -> &Arc<EmojiManager<A, L>> {
+        &self.emoji_manager
+    }
+
+    /// 获取平台适配器引用
+    pub fn platform(&self) -> &Arc<P> {
+        &self.platform
+    }
+
+    /// 获取图片客户端引用
+    pub fn image_client(&self) -> &Arc<ImageClient> {
+        &self.image_client
+    }
+
+    /// 获取 token 计数器引用
+    pub fn token_counter(&self) -> &Arc<TokenCounter> {
+        &self.token_counter
     }
 
     pub async fn close(&self) {
@@ -1075,4 +1252,9 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
             }
         }
     }
+}
+
+/// 截断字符串到指定字符数
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
 }

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use parking_lot::Mutex as PlMutex;
 use tokio::sync::Notify;
 
 use crate::core::config::XueliConfig;
@@ -319,7 +320,7 @@ pub struct ReplyAgent<A: AIClient, L: PromptTemplateLoader + 'static> {
     /// 插件工具处理器
     plugin_handlers: HashMap<String, Arc<dyn Tool>>,
     /// 延迟工具列表（tool_search 可激活）
-    deferred_tools: Vec<serde_json::Value>,
+    deferred_tools: PlMutex<Vec<serde_json::Value>>,
 }
 
 /// 最大内部工具调用轮数（对应 Python MAX_INTERNAL_ROUNDS）
@@ -357,7 +358,7 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
             max_retries: 3,
             interrupt_notify: Arc::new(Notify::new()),
             plugin_handlers: HashMap::new(),
-            deferred_tools: Vec::new(),
+            deferred_tools: PlMutex::new(Vec::new()),
         }
     }
 
@@ -378,6 +379,34 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
                 continue;
             }
             self.plugin_handlers.insert(name, handler);
+        }
+    }
+
+    /// 加载延迟工具列表（tool_search 可激活）
+    pub fn load_deferred_tools(&self, tools: Vec<serde_json::Value>) {
+        let mut deferred = self.deferred_tools.lock();
+        let existing_names: HashSet<String> = deferred
+            .iter()
+            .filter_map(|t| {
+                t.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        for tool in tools {
+            if let Some(name) = tool
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .map(|s| s.to_string())
+            {
+                if existing_names.contains(&name) {
+                    tracing::warn!("[ReplyAgent] 延迟工具 {} 重复，跳过", name);
+                    continue;
+                }
+                deferred.push(tool);
+            }
         }
     }
 
@@ -507,7 +536,7 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
         let tools = self.build_tools(&user_id);
 
         // 序列化工具定义为 API 格式
-        let serialized_tools: Vec<serde_json::Value> = tools
+        let mut serialized_tools: Vec<serde_json::Value> = tools
             .iter()
             .map(|t| {
                 let def = t.definition();
@@ -666,7 +695,7 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
 
                     // 查找并执行工具
                     let tool_result = self
-                        .execute_tool(&tools, &tool_name, args.clone())
+                        .execute_tool(&tools, &tool_name, args.clone(), &mut serialized_tools)
                         .await
                         .unwrap_or_else(|e| format!("工具执行失败: {e}"));
 
@@ -823,12 +852,34 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
         tools: &[Arc<dyn Tool>],
         tool_name: &str,
         args: serde_json::Value,
+        active_tool_defs: &mut Vec<serde_json::Value>,
     ) -> XueliResult<String> {
         // 先检查内置工具
         for tool in tools {
             if tool.definition().name == tool_name {
                 return tool.execute(args).await;
             }
+        }
+        // tool_search: 搜索延迟工具
+        if tool_name == "tool_search" {
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            if query.is_empty() {
+                return Ok("请提供搜索关键词。".to_string());
+            }
+            let (result, matched) = self.search_deferred_tools(query);
+            // 将匹配的工具定义加入活跃工具列表，后续轮次可用
+            for tool_def in matched {
+                let already_exists = active_tool_defs.iter().any(|t| {
+                    t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        == tool_def.get("function").and_then(|f2| f2.get("name")).and_then(|n2| n2.as_str())
+                });
+                if !already_exists {
+                    active_tool_defs.push(tool_def);
+                }
+            }
+            return Ok(result);
         }
         // 再检查插件工具
         if let Some(handler) = self.plugin_handlers.get(tool_name) {
@@ -838,37 +889,45 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
     }
 
     /// 搜索延迟工具（tool_search 工具的实现）
-    fn search_deferred_tools(&mut self, query: &str) -> String {
-        if self.deferred_tools.is_empty() {
-            return "当前没有额外的扩展工具可用。".to_string();
+    fn search_deferred_tools(&self, query: &str) -> (String, Vec<serde_json::Value>) {
+        let deferred = self.deferred_tools.lock();
+        if deferred.is_empty() {
+            return ("当前没有额外的扩展工具可用。".to_string(), Vec::new());
         }
-        let matched: Vec<&serde_json::Value> = self
-            .deferred_tools
+        let matched_indices: Vec<usize> = deferred
             .iter()
-            .filter(|t| {
+            .enumerate()
+            .filter(|(_, t)| {
                 t.get("function")
                     .and_then(|f| f.get("name"))
                     .and_then(|n| n.as_str())
                     .map(|name| name.to_lowercase().contains(&query.to_lowercase()))
                     .unwrap_or(false)
             })
+            .map(|(i, _)| i)
             .collect();
 
-        if matched.is_empty() {
-            return "当前没有额外的扩展工具可用。".to_string();
+        if matched_indices.is_empty() {
+            return ("当前没有额外的扩展工具可用。".to_string(), Vec::new());
         }
 
-        let names: Vec<String> = matched
-            .iter()
-            .filter_map(|t| {
-                t.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-                    .map(|s| s.to_string())
-            })
-            .collect();
+        let mut matched_tools = Vec::new();
+        let mut names = Vec::new();
+        for &idx in matched_indices.iter() {
+            let tool = &deferred[idx];
+            if let Some(name) = tool
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .map(|s| s.to_string())
+            {
+                names.push(name);
+            }
+            matched_tools.push(tool.clone());
+        }
 
-        format!("发现新工具: {}。后续对话中可以使用这些工具。", names.join(", "))
+        let msg = format!("发现新工具: {}。后续对话中可以使用这些工具。", names.join(", "));
+        (msg, matched_tools)
     }
 
     /// 日志输出工具调用摘要
