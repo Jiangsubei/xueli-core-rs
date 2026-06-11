@@ -2,6 +2,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod context_recorder;
 pub mod dispatcher;
+pub mod drive;
 pub mod errors;
 pub mod immutable_message_log;
 pub mod lifecycle;

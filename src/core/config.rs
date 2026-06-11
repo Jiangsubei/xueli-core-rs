@@ -78,6 +78,10 @@ pub struct XueliConfig {
     /// 插件配置
     #[serde(default)]
     pub plugin: PluginConfig,
+
+    /// 内驱力系统配置
+    #[serde(default)]
+    pub drive: DriveConfig,
 }
 
 // ── IdentityConfig ───────────────────────────────────────
@@ -389,24 +393,91 @@ pub struct MemoryConfig {
     /// Rerank 后返回数
     #[serde(default = "default_rerank_top_k")]
     pub rerank_top_k: usize,
+    /// 预重排序数量
+    #[serde(default = "default_pre_rerank_top_k")]
+    pub pre_rerank_top_k: usize,
     /// 动态记忆限制
     #[serde(default = "default_dynamic_memory_limit")]
     pub dynamic_memory_limit: usize,
-    /// 记忆冲突解决配置
-    #[serde(default)]
-    pub dispute: MemoryDisputeConfig,
+    /// 动态去重开关
+    #[serde(default = "default_dynamic_dedup_enabled")]
+    pub dynamic_dedup_enabled: bool,
+    /// 动态去重相似度阈值
+    #[serde(default = "default_dynamic_dedup_similarity_threshold")]
+    pub dynamic_dedup_similarity_threshold: f64,
+    /// 重排序候选最大字符数
+    #[serde(default = "default_rerank_candidate_max_chars")]
+    pub rerank_candidate_max_chars: usize,
+    /// 重排序提示词总预算
+    #[serde(default = "default_rerank_total_prompt_budget")]
+    pub rerank_total_prompt_budget: usize,
     /// 自动提取
     #[serde(default = "default_auto_extract")]
     pub auto_extract: bool,
     /// 每 N 轮提取一次
     #[serde(default = "default_extract_every_n_turns")]
     pub extract_every_n_turns: usize,
+    /// 记忆提取模型 API 地址
+    #[serde(default)]
+    pub extraction_api_base: Option<String>,
+    /// 记忆提取模型 API 密钥
+    #[serde(default)]
+    pub extraction_api_key: Option<String>,
+    /// 记忆提取模型名称
+    #[serde(default)]
+    pub extraction_model: Option<String>,
+    /// 记忆提取模型上下文窗口
+    #[serde(default = "default_extraction_context_window")]
+    pub extraction_context_window: u32,
+    /// 记忆提取额外请求参数
+    #[serde(default)]
+    pub extraction_extra_params: Option<HashMap<String, serde_json::Value>>,
+    /// 记忆提取额外请求头
+    #[serde(default)]
+    pub extraction_extra_headers: Option<HashMap<String, String>>,
+    /// 记忆提取响应路径
+    #[serde(default)]
+    pub extraction_response_path: Option<String>,
     /// 衰减配置
     #[serde(default)]
     pub decay: MemoryDecayConfig,
+    /// 合并配置
+    #[serde(default)]
+    pub merge: MemoryMergeConfig,
+    /// 抑制配置
+    #[serde(default)]
+    pub suppression: MemorySuppressionConfig,
     /// 检索权重配置
     #[serde(default)]
     pub retrieval_weights: RetrievalWeightsConfig,
+    /// 场景权重配置
+    #[serde(default)]
+    pub scene_weights: SceneWeightsConfig,
+    /// 模糊回忆配置
+    #[serde(default)]
+    pub fuzzy_recall: FuzzyRecallConfig,
+    /// 记忆冲突解决配置
+    #[serde(default)]
+    pub dispute: MemoryDisputeConfig,
+}
+
+fn default_pre_rerank_top_k() -> usize {
+    12
+}
+fn default_dynamic_dedup_enabled() -> bool {
+    true
+}
+fn default_dynamic_dedup_similarity_threshold() -> f64 {
+    0.72
+}
+fn default_rerank_candidate_max_chars() -> usize {
+    160
+}
+fn default_rerank_total_prompt_budget() -> usize {
+    2400
+}
+fn default_extraction_context_window() -> u32 {
+    128000
 }
 
 fn default_storage_backend() -> String {
@@ -435,12 +506,28 @@ impl Default for MemoryConfig {
             bm25_top_k: 10,
             vector_top_k: 5,
             rerank_top_k: default_rerank_top_k(),
+            pre_rerank_top_k: default_pre_rerank_top_k(),
             dynamic_memory_limit: default_dynamic_memory_limit(),
-            dispute: MemoryDisputeConfig::default(),
+            dynamic_dedup_enabled: default_dynamic_dedup_enabled(),
+            dynamic_dedup_similarity_threshold: default_dynamic_dedup_similarity_threshold(),
+            rerank_candidate_max_chars: default_rerank_candidate_max_chars(),
+            rerank_total_prompt_budget: default_rerank_total_prompt_budget(),
             auto_extract: default_auto_extract(),
             extract_every_n_turns: default_extract_every_n_turns(),
+            extraction_api_base: None,
+            extraction_api_key: None,
+            extraction_model: None,
+            extraction_context_window: default_extraction_context_window(),
+            extraction_extra_params: None,
+            extraction_extra_headers: None,
+            extraction_response_path: None,
             decay: MemoryDecayConfig::default(),
+            merge: MemoryMergeConfig::default(),
+            suppression: MemorySuppressionConfig::default(),
             retrieval_weights: RetrievalWeightsConfig::default(),
+            scene_weights: SceneWeightsConfig::default(),
+            fuzzy_recall: FuzzyRecallConfig::default(),
+            dispute: MemoryDisputeConfig::default(),
         }
     }
 }
@@ -490,6 +577,202 @@ impl Default for MemoryDecayConfig {
             ordinary_forget_threshold: default_forget_threshold(),
             cold_memory_threshold_days: default_cold_memory_threshold(),
             cold_decay_multiplier: default_cold_decay_multiplier(),
+        }
+    }
+}
+
+// ── MemoryMergeConfig ────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryMergeConfig {
+    /// 是否启用记忆合并
+    #[serde(default = "default_merge_enabled")]
+    pub enabled: bool,
+    /// 合并最小聚类大小
+    #[serde(default = "default_merge_min_cluster_size")]
+    pub min_cluster_size: usize,
+    /// 合并最大批处理数
+    #[serde(default = "default_merge_max_batch")]
+    pub max_batch: usize,
+    /// 是否启用 LLM 辅助合并
+    #[serde(default = "default_merge_llm_enabled")]
+    pub llm_enabled: bool,
+    /// 合并间隔（小时）
+    #[serde(default = "default_consolidation_hours")]
+    pub consolidation_hours: f64,
+    /// 是否启用 LLM 辅助合并（旧字段兼容）
+    #[serde(default = "default_consolidation_llm_enabled")]
+    pub consolidation_llm_enabled: bool,
+    /// 合并批处理大小
+    #[serde(default = "default_consolidation_batch_size")]
+    pub consolidation_batch_size: usize,
+    /// 归档惩罚基数
+    #[serde(default = "default_archive_penalty_base")]
+    pub archive_penalty_base: f64,
+}
+
+fn default_merge_enabled() -> bool {
+    false
+}
+fn default_merge_min_cluster_size() -> usize {
+    2
+}
+fn default_merge_max_batch() -> usize {
+    5
+}
+fn default_merge_llm_enabled() -> bool {
+    true
+}
+fn default_consolidation_hours() -> f64 {
+    48.0
+}
+fn default_consolidation_llm_enabled() -> bool {
+    false
+}
+fn default_consolidation_batch_size() -> usize {
+    20
+}
+fn default_archive_penalty_base() -> f64 {
+    0.5
+}
+
+impl Default for MemoryMergeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_merge_enabled(),
+            min_cluster_size: default_merge_min_cluster_size(),
+            max_batch: default_merge_max_batch(),
+            llm_enabled: default_merge_llm_enabled(),
+            consolidation_hours: default_consolidation_hours(),
+            consolidation_llm_enabled: default_consolidation_llm_enabled(),
+            consolidation_batch_size: default_consolidation_batch_size(),
+            archive_penalty_base: default_archive_penalty_base(),
+        }
+    }
+}
+
+// ── MemorySuppressionConfig ──────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MemorySuppressionConfig {
+    /// 是否启用记忆抑制
+    #[serde(default = "default_suppression_enabled")]
+    pub enabled: bool,
+    /// 抑制因子
+    #[serde(default = "default_suppression_factor")]
+    pub factor: f64,
+    /// 每次查询最大抑制数
+    #[serde(default = "default_suppression_max_per_query")]
+    pub max_per_query: usize,
+    /// 抑制冷却检索次数
+    #[serde(default = "default_suppression_cooldown_retrievals")]
+    pub cooldown_retrievals: usize,
+}
+
+fn default_suppression_enabled() -> bool {
+    false
+}
+fn default_suppression_factor() -> f64 {
+    0.05
+}
+fn default_suppression_max_per_query() -> usize {
+    3
+}
+fn default_suppression_cooldown_retrievals() -> usize {
+    5
+}
+
+impl Default for MemorySuppressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_suppression_enabled(),
+            factor: default_suppression_factor(),
+            max_per_query: default_suppression_max_per_query(),
+            cooldown_retrievals: default_suppression_cooldown_retrievals(),
+        }
+    }
+}
+
+// ── SceneWeightsConfig ───────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SceneWeightsConfig {
+    /// 同群组场景权重
+    #[serde(default = "default_scene_same_group_weight")]
+    pub same_group_weight: f64,
+    /// 同类型场景权重
+    #[serde(default = "default_scene_same_type_weight")]
+    pub same_type_weight: f64,
+    /// 同用户场景权重
+    #[serde(default = "default_scene_same_user_weight")]
+    pub same_user_weight: f64,
+}
+
+fn default_scene_same_group_weight() -> f64 {
+    1.5
+}
+fn default_scene_same_type_weight() -> f64 {
+    1.0
+}
+fn default_scene_same_user_weight() -> f64 {
+    0.8
+}
+
+impl Default for SceneWeightsConfig {
+    fn default() -> Self {
+        Self {
+            same_group_weight: default_scene_same_group_weight(),
+            same_type_weight: default_scene_same_type_weight(),
+            same_user_weight: default_scene_same_user_weight(),
+        }
+    }
+}
+
+// ── FuzzyRecallConfig ────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FuzzyRecallConfig {
+    /// 是否启用模糊回忆
+    #[serde(default = "default_fuzzy_recall_enabled")]
+    pub enabled: bool,
+    /// 模糊回忆概率
+    #[serde(default = "default_fuzzy_recall_probability")]
+    pub probability: f64,
+    /// 模糊回忆置信度阈值
+    #[serde(default = "default_fuzzy_recall_confidence_threshold")]
+    pub confidence_threshold: f64,
+    /// 回忆置信度每日衰减
+    #[serde(default = "default_recall_confidence_decay_per_day")]
+    pub confidence_decay_per_day: f64,
+    /// 回忆置信度最小值
+    #[serde(default = "default_recall_confidence_minimum")]
+    pub confidence_minimum: f64,
+}
+
+fn default_fuzzy_recall_enabled() -> bool {
+    false
+}
+fn default_fuzzy_recall_probability() -> f64 {
+    0.3
+}
+fn default_fuzzy_recall_confidence_threshold() -> f64 {
+    0.7
+}
+fn default_recall_confidence_decay_per_day() -> f64 {
+    0.01
+}
+fn default_recall_confidence_minimum() -> f64 {
+    0.3
+}
+
+impl Default for FuzzyRecallConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_fuzzy_recall_enabled(),
+            probability: default_fuzzy_recall_probability(),
+            confidence_threshold: default_fuzzy_recall_confidence_threshold(),
+            confidence_decay_per_day: default_recall_confidence_decay_per_day(),
+            confidence_minimum: default_recall_confidence_minimum(),
         }
     }
 }
@@ -1316,6 +1599,60 @@ impl Default for PluginConfig {
     }
 }
 
+// ── DriveConfig ──────────────────────────────────────────
+
+/// 内驱力系统配置
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DriveConfig {
+    /// 是否启用内驱力系统
+    #[serde(default)]
+    pub enabled: bool,
+    /// 反思触发轮次数
+    #[serde(default = "default_reflection_trigger_rounds")]
+    pub reflection_trigger_rounds: usize,
+    /// 反思触发间隔（秒）
+    #[serde(default = "default_reflection_trigger_interval")]
+    pub reflection_trigger_interval_secs: u64,
+    /// 事件衰减 tick 间隔（秒）
+    #[serde(default = "default_event_decay_tick_interval")]
+    pub event_decay_tick_interval_secs: u64,
+    /// 规则权重最大调整幅度
+    #[serde(default = "default_max_rule_weight_adjustment")]
+    pub max_rule_weight_adjustment: f64,
+    /// 内驱力状态存储目录
+    #[serde(default = "default_drive_data_dir")]
+    pub data_dir: String,
+}
+
+fn default_reflection_trigger_rounds() -> usize {
+    5
+}
+fn default_reflection_trigger_interval() -> u64 {
+    3600
+}
+fn default_event_decay_tick_interval() -> u64 {
+    10
+}
+fn default_max_rule_weight_adjustment() -> f64 {
+    0.3
+}
+fn default_drive_data_dir() -> String {
+    "data".to_string()
+}
+
+impl Default for DriveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reflection_trigger_rounds: default_reflection_trigger_rounds(),
+            reflection_trigger_interval_secs: default_reflection_trigger_interval(),
+            event_decay_tick_interval_secs: default_event_decay_tick_interval(),
+            max_rule_weight_adjustment: default_max_rule_weight_adjustment(),
+            data_dir: default_drive_data_dir(),
+        }
+    }
+}
+
 // ── XueliConfig 默认值实现 ───────────────────────────────
 
 impl Default for XueliConfig {
@@ -1355,6 +1692,7 @@ impl Default for XueliConfig {
             adapter_connection: AdapterConnectionConfig::default(),
             content_sections: Vec::new(),
             plugin: PluginConfig::default(),
+            drive: DriveConfig::default(),
         }
     }
 }
@@ -1429,5 +1767,192 @@ impl XueliConfig {
         } else {
             "unconfigured"
         }
+    }
+
+    /// 验证配置完整性，返回验证错误列表
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        // AI 主服务检查
+        if self.model.api_base.trim().is_empty() {
+            errors.push("model.api_base 不能为空".to_string());
+        }
+        if self.model.primary_model.trim().is_empty() {
+            errors.push("model.primary_model 不能为空".to_string());
+        }
+
+        // 上下文预算比例范围
+        if self.bot_behavior.context_token_budget_ratio < 0.1
+            || self.bot_behavior.context_token_budget_ratio > 1.0
+        {
+            errors.push(format!(
+                "bot_behavior.context_token_budget_ratio ({}) 应在 [0.1, 1.0] 范围内",
+                self.bot_behavior.context_token_budget_ratio
+            ));
+        }
+
+        // 延迟参数一致性
+        if self.bot_behavior.first_segment_delay_min_ms > self.bot_behavior.first_segment_delay_max_ms {
+            errors.push(
+                "bot_behavior.first_segment_delay_min_ms 不能大于 first_segment_delay_max_ms"
+                    .to_string(),
+            );
+        }
+        if self.bot_behavior.followup_delay_min_seconds > self.bot_behavior.followup_delay_max_seconds {
+            errors.push(
+                "bot_behavior.followup_delay_min_seconds 不能大于 followup_delay_max_seconds"
+                    .to_string(),
+            );
+        }
+
+        // 记忆冲突阈值一致性
+        if self.memory_dispute.normal_confidence_threshold > self.memory_dispute.high_confidence_threshold {
+            errors.push(
+                "memory_dispute.normal_confidence_threshold 不能大于 high_confidence_threshold"
+                    .to_string(),
+            );
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// 从文件重新加载配置
+    pub fn reload(path: &str) -> XueliResult<Self> {
+        Self::from_file(path)
+    }
+
+    /// 检查群聊回复决策模型是否已配置
+    pub fn is_group_reply_decision_configured(&self) -> bool {
+        let base = self.group_reply_decision.api_base.as_deref().unwrap_or("");
+        let model = self.group_reply_decision.model.as_str();
+        !base.trim().is_empty() && !model.trim().is_empty()
+    }
+
+    /// 检查记忆重排序模型是否已配置
+    pub fn is_memory_rerank_configured(&self) -> bool {
+        let base = self.memory_rerank.api_base.as_deref().unwrap_or("");
+        let model = self.memory_rerank.model.as_str();
+        !base.trim().is_empty() && !model.trim().is_empty()
+    }
+
+    /// 检查记忆提取模型是否已配置
+    pub fn is_memory_extraction_configured(&self) -> bool {
+        let base = self.memory.extraction_api_base.as_deref().unwrap_or("");
+        let model = self.memory.extraction_model.as_deref().unwrap_or("");
+        !base.trim().is_empty() && !model.trim().is_empty()
+    }
+
+    /// 获取助手名称
+    pub fn get_assistant_name(&self) -> &str {
+        let name = self.identity.name.trim();
+        if name.is_empty() { "AI助手" } else { name }
+    }
+
+    /// 获取助手别名
+    pub fn get_assistant_alias(&self) -> &str {
+        self.identity.alias.trim()
+    }
+
+    /// 获取 AI 主服务的客户端配置
+    pub fn get_ai_service_client_config(&self) -> HashMap<String, serde_json::Value> {
+        let mut map = HashMap::new();
+        map.insert("api_base".to_string(), serde_json::Value::String(self.model.api_base.clone()));
+        map.insert("api_key".to_string(), serde_json::Value::String(self.model.api_key.clone()));
+        map.insert("model".to_string(), serde_json::Value::String(self.model.primary_model.clone()));
+        map.insert("context_window".to_string(), serde_json::Value::Number(self.model.context_window.into()));
+        map.insert("response_path".to_string(), serde_json::Value::String(self.model.response_path.clone()));
+        map
+    }
+
+    /// 获取记忆提取模型的客户端配置
+    pub fn get_memory_extraction_client_config(&self) -> HashMap<String, serde_json::Value> {
+        let mut map = HashMap::new();
+        map.insert("api_base".to_string(), serde_json::Value::String(
+            self.memory.extraction_api_base.clone().unwrap_or_default(),
+        ));
+        map.insert("api_key".to_string(), serde_json::Value::String(
+            self.memory.extraction_api_key.clone().unwrap_or_default(),
+        ));
+        map.insert("model".to_string(), serde_json::Value::String(
+            self.memory.extraction_model.clone().unwrap_or_default(),
+        ));
+        map.insert("context_window".to_string(), serde_json::Value::Number(
+            self.memory.extraction_context_window.into(),
+        ));
+        map.insert("response_path".to_string(), serde_json::Value::String(
+            self.memory.extraction_response_path.clone().unwrap_or_else(|| self.model.response_path.clone()),
+        ));
+        map
+    }
+
+    /// 获取记忆重排序模型的客户端配置
+    pub fn get_memory_rerank_client_config(&self) -> HashMap<String, serde_json::Value> {
+        let mut map = HashMap::new();
+        map.insert("api_base".to_string(), serde_json::Value::String(
+            self.memory_rerank.api_base.clone().unwrap_or_default(),
+        ));
+        map.insert("api_key".to_string(), serde_json::Value::String(
+            self.memory_rerank.api_key.clone().unwrap_or_default(),
+        ));
+        map.insert("model".to_string(), serde_json::Value::String(
+            self.memory_rerank.model.clone(),
+        ));
+        map.insert("context_window".to_string(), serde_json::Value::Number(
+            self.memory_rerank.context_window.into(),
+        ));
+        map.insert("response_path".to_string(), serde_json::Value::String(
+            self.memory_rerank.extra_params.get("response_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&self.model.response_path)
+                .to_string(),
+        ));
+        map
+    }
+
+    /// 获取群聊回复决策模型的客户端配置
+    pub fn get_group_reply_decision_client_config(&self) -> HashMap<String, serde_json::Value> {
+        let mut map = HashMap::new();
+        map.insert("api_base".to_string(), serde_json::Value::String(
+            self.group_reply_decision.api_base.clone().unwrap_or_default(),
+        ));
+        map.insert("api_key".to_string(), serde_json::Value::String(
+            self.group_reply_decision.api_key.clone().unwrap_or_default(),
+        ));
+        map.insert("model".to_string(), serde_json::Value::String(
+            self.group_reply_decision.model.clone(),
+        ));
+        map.insert("context_window".to_string(), serde_json::Value::Number(
+            self.group_reply_decision.context_window.into(),
+        ));
+        map.insert("response_path".to_string(), serde_json::Value::String(
+            self.model.response_path.clone(),
+        ));
+        map
+    }
+
+    /// 获取视觉服务的客户端配置
+    pub fn get_vision_client_config(&self) -> HashMap<String, serde_json::Value> {
+        let mut map = HashMap::new();
+        map.insert("enabled".to_string(), serde_json::Value::Bool(self.vision.enabled));
+        map.insert("api_base".to_string(), serde_json::Value::String(
+            self.vision.api_base.clone().unwrap_or_default(),
+        ));
+        map.insert("api_key".to_string(), serde_json::Value::String(
+            self.vision.api_key.clone().unwrap_or_default(),
+        ));
+        map.insert("model".to_string(), serde_json::Value::String(
+            self.vision.model.clone().unwrap_or_default(),
+        ));
+        map.insert("context_window".to_string(), serde_json::Value::Number(
+            self.vision.context_window.into(),
+        ));
+        map.insert("response_path".to_string(), serde_json::Value::String(
+            self.vision.response_path.clone().unwrap_or_else(|| self.model.response_path.clone()),
+        ));
+        map
     }
 }
