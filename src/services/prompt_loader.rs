@@ -42,6 +42,11 @@ impl FilePromptTemplateLoader {
         cache.clear();
     }
 
+    /// 克隆内部缓存 Arc（用于跨 async 边界的安全访问）
+    pub fn cache_arc(&self) -> Arc<RwLock<HashMap<String, PromptTemplateMap>>> {
+        self.cache.clone()
+    }
+
     /// 扫描并返回所有可用的 locale
     pub async fn available_locales(&self) -> XueliResult<Vec<String>> {
         let mut locales = Vec::new();

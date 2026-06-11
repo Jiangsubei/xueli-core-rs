@@ -23,12 +23,16 @@ impl ImageClient {
     }
 
     pub fn fix_url(url: &str) -> String {
+        // 完整 HTML unescape
         url.replace("&amp;", "&")
             .replace("&lt;", "<")
             .replace("&gt;", ">")
             .replace("&#39;", "'")
             .replace("&quot;", "\"")
             .replace("&#x27;", "'")
+            .replace("&#x2F;", "/")
+            .replace("&apos;", "'")
+            .replace("&nbsp;", " ")
     }
 
     pub async fn download(&self, url: &str) -> XueliResult<Vec<u8>> {
@@ -85,9 +89,9 @@ impl ImageClient {
         }
     }
 
-    pub async fn get_mface_image_url(&self, file_id: &str) -> XueliResult<String> {
+    pub async fn get_mface_image_url(&self, key: &str) -> XueliResult<String> {
         let url = format!("{}/get_image", self.base_url.trim_end_matches('/'));
-        let body = serde_json::json!({"file_id": file_id});
+        let body = serde_json::json!({"file": key});
         let response = self
             .client
             .post(&url)

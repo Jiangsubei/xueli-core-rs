@@ -1203,6 +1203,8 @@ mod tests {
                 usage: None,
                 model: "test".to_string(),
                 tool_calls: None,
+                raw_content: String::new(),
+                raw_response: None,
             })
         }
     }
