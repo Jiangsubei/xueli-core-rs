@@ -185,6 +185,7 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         let db_path = config.memory.db_path.clone();
         let db_dir = std::path::Path::new(&db_path)
             .parent()
+            .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(std::path::Path::new("."));
         let emoji_db = EmojiDB::new(&db_dir.to_string_lossy());
         let emoji_manager =

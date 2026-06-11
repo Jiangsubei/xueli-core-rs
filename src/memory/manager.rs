@@ -49,6 +49,7 @@ impl MemoryManager {
     ) -> XueliResult<Self> {
         let base_dir = Path::new(&config.db_path)
             .parent()
+            .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
 
         let important_store = Arc::new(ImportantMemoryStore::new(base_dir)?);
