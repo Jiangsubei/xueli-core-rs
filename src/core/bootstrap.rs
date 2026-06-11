@@ -11,6 +11,7 @@ use tracing::{info, warn};
 
 use crate::core::config::XueliConfig;
 use crate::core::lifecycle::LifecycleManager;
+use crate::core::log_labels::LOG_STARTUP_INFO;
 use crate::core::metrics::RuntimeMetrics;
 use crate::handlers::message_handler::MessageHandler;
 use crate::handlers::prompt_builder::ReplyPromptBuilder;
@@ -20,6 +21,7 @@ use crate::memory::stores::person_fact::SqlitePersonFactStore;
 use crate::prelude::XueliResult;
 use crate::services::ai_client::DefaultAIClient;
 use crate::services::prompt_loader::NoopPromptTemplateLoader;
+use crate::services::token_counter::TokenCounter;
 use crate::traits::platform_adapter::PlatformAdapter;
 
 /// 组装完成的运行时组件
@@ -27,13 +29,15 @@ pub struct BotRuntimeComponents<P: PlatformAdapter> {
     /// 消息处理器
     pub message_handler: Arc<MessageHandler<DefaultAIClient, P, NoopPromptTemplateLoader>>,
     /// 记忆管理器
-    pub memory_manager: Option<Arc<MemoryManager>>,
+    pub memory_manager: Option<Arc<MemoryManager<NoopPromptTemplateLoader>>>,
     /// 人格事实存储
     pub person_fact_store: Option<Arc<SqlitePersonFactStore>>,
     /// 指标收集器
     pub metrics: Arc<RuntimeMetrics>,
     /// 生命周期管理器
     pub lifecycle: LifecycleManager,
+    /// Token 计数器
+    pub token_counter: Arc<TokenCounter>,
 }
 
 /// 启动引导器 — 验证配置并组装运行时组件。
@@ -70,6 +74,9 @@ impl<P: PlatformAdapter> BotBootstrapper<P> {
         let metrics = Arc::new(RuntimeMetrics::default());
         let lifecycle = LifecycleManager::new();
 
+        // 初始化 TokenCounter
+        let token_counter = self.initialize_token_counter();
+
         // 初始化 AI 客户端
         let model_config = Arc::new(self.config.model.clone());
         let ai_client = Arc::new(DefaultAIClient::new(model_config)?);
@@ -81,24 +88,8 @@ impl<P: PlatformAdapter> BotBootstrapper<P> {
         let prompt_builder =
             ReplyPromptBuilder::<NoopPromptTemplateLoader>::new(template_loader.clone(), "zh-CN");
 
-        // 初始化内存存储（使用 MemoryItemStore 实现 MemoryStore trait）
-        let mem_store = Arc::new(SqliteMemoryItemStore::new(data_path)?);
-
         // 初始化记忆管理器
-        let memory_config = &self.config.memory;
-        let memory_manager: Option<Arc<MemoryManager>> =
-            if memory_config.extraction_min_messages > 0 {
-                info!("[启动] 记忆模块：已启用");
-                let mgr = Arc::new(MemoryManager::new(
-                    Arc::new(memory_config.clone()),
-                    mem_store.clone(),
-                )?);
-                info!("[启动] 记忆管理器初始化完成");
-                Some(mgr)
-            } else {
-                info!("[启动] 记忆模块：未启用（extraction_min_messages <= 0）");
-                None
-            };
+        let memory_manager = self.initialize_memory_manager(&metrics)?;
 
         // 初始化人格事实存储
         let person_fact_store: Option<Arc<SqlitePersonFactStore>> = {
@@ -111,8 +102,9 @@ impl<P: PlatformAdapter> BotBootstrapper<P> {
         let mgr_for_handler = match memory_manager.clone() {
             Some(mgr) => mgr,
             None => Arc::new(MemoryManager::new(
-                Arc::new(memory_config.clone()),
+                Arc::new(self.config.memory.clone()),
                 Arc::new(SqliteMemoryItemStore::new(data_path)?),
+                Arc::new(NoopPromptTemplateLoader),
             )?),
         };
 
@@ -135,23 +127,114 @@ impl<P: PlatformAdapter> BotBootstrapper<P> {
             person_fact_store,
             metrics,
             lifecycle,
+            token_counter: Arc::new(token_counter),
         })
+    }
+
+    /// 初始化 TokenCounter
+    fn initialize_token_counter(&self) -> TokenCounter {
+        let encoding = &self.config.bot_behavior.token_encoding;
+        let counter = match encoding.as_str() {
+            "o200k_base" => TokenCounter::new_o200k(),
+            _ => TokenCounter::new_cl100k(),
+        };
+        match counter {
+            Ok(c) => {
+                if c.available() {
+                    info!(target: LOG_STARTUP_INFO, "[启动] TokenCounter 初始化完成，编码={}", encoding);
+                } else {
+                    warn!("[启动] TokenCounter 初始化失败，token 感知上下文管理将回退");
+                }
+                c
+            }
+            Err(e) => {
+                warn!("[启动] TokenCounter 初始化失败: {}，使用 cl100k 回退", e);
+                TokenCounter::new_cl100k().unwrap_or_else(|e2| {
+                    warn!("[启动] TokenCounter cl100k 回退也失败: {}", e2);
+                    panic!("TokenCounter 初始化完全失败，无法继续");
+                })
+            }
+        }
+    }
+
+    /// 初始化记忆管理器
+    fn initialize_memory_manager(
+        &self,
+        _metrics: &Arc<RuntimeMetrics>,
+    ) -> XueliResult<Option<Arc<MemoryManager<NoopPromptTemplateLoader>>>> {
+        let memory_config = &self.config.memory;
+
+        if !memory_config.enabled {
+            info!("[启动] 记忆模块：未启用");
+            return Ok(None);
+        }
+
+        info!("[启动] 记忆模块：已启用");
+
+        let data_path = Path::new(&self.data_dir);
+        let mem_store = Arc::new(SqliteMemoryItemStore::new(data_path)?);
+
+        // 记忆提取模型配置日志
+        if self.config.is_memory_extraction_configured() {
+            info!("[启动] 记忆提取运行策略：优先使用专用提取模型，失败时回退主模型");
+        } else if self.config.is_ai_service_configured() {
+            info!("[启动] 记忆提取运行策略：未配置专用提取模型，当前直接使用主模型");
+        } else {
+            warn!("[启动] 记忆提取运行策略：主模型与专用提取模型均不可用");
+        }
+
+        info!(
+            "[启动] 记忆配置：自动提取={}，每{}轮提取一次",
+            memory_config.auto_extract, memory_config.extract_every_n_turns,
+        );
+
+        let mgr = Arc::new(MemoryManager::new(
+            Arc::new(memory_config.clone()),
+            mem_store,
+            Arc::new(NoopPromptTemplateLoader),
+        )?);
+
+        info!("[启动] 记忆管理器初始化完成");
+        Ok(Some(mgr))
     }
 
     /// 输出运行时配置摘要
     fn log_runtime_config(&self) {
+        let vision_status = self.config.vision_service_status();
+        let decision_configured = self.config.is_group_reply_decision_configured();
+        let rerank_configured = self.config.is_memory_rerank_configured();
+
         info!(
+            target: LOG_STARTUP_INFO,
             "[启动] 运行配置：助手={}，回复模型={}，地址={}",
-            self.config.identity.name, self.config.model.primary_model, self.config.model.api_base,
+            self.config.get_assistant_name(),
+            self.config.model.primary_model,
+            self.config.model.api_base,
         );
 
-        if let Some(ref vision_model) = self.config.model.vision_model {
-            info!("[启动] 视觉服务：模型={}", vision_model);
+        info!(
+            "[启动] 视觉服务：状态={}，模型={}",
+            vision_status,
+            self.config.vision.model.as_deref().unwrap_or("未配置"),
+        );
+
+        info!(
+            "[启动] 群聊规划：已配置={}，模型={}，仅@回复={}，兴趣回复={}，上下文预算比例={:.1}",
+            decision_configured,
+            self.config.group_reply_decision.model,
+            self.config.group_reply.only_reply_when_at,
+            self.config.group_reply.interest_reply_enabled,
+            self.config.bot_behavior.context_token_budget_ratio,
+        );
+
+        if rerank_configured {
+            info!(
+                "[启动] 记忆重排序：已配置，模型={}",
+                self.config.memory_rerank.model,
+            );
         }
 
-        info!("[启动] 群聊规划：仅@回复={}", true);
-
-        if self.config.memory.extraction_min_messages > 0 {
+        if self.config.memory.enabled {
             info!(
                 "[启动] 记忆提取：已配置，每{}条消息提取",
                 self.config.memory.extraction_min_messages

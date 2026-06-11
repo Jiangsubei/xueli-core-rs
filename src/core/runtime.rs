@@ -7,9 +7,11 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::core::config::{ProactiveShareConfig, XueliConfig};
 use crate::core::log_labels::{LOG_RETRY, LOG_STARTUP_INFO};
+use crate::core::log_text::preview_text_for_log;
 use crate::core::metrics::RuntimeMetrics;
 use crate::core::platform_types::{GroupState, InboundEvent, ReplyAction};
 use crate::core::scope::ChatScope;
+use crate::core::errors::XueliError;
 use crate::handlers::message_handler::MessageHandler;
 use crate::prelude::XueliResult;
 use crate::proactive_share::scheduler::ProactiveShareScheduler;
@@ -65,7 +67,6 @@ pub struct BotRuntime<P: PlatformAdapter + 'static> {
     /// STOPPED 冷却标记
     group_stopped_at: Arc<Mutex<HashMap<String, f64>>>,
     /// 最大中断次数
-    #[allow(dead_code)]
     max_interrupt_count: usize,
     /// 已处理消息 ID（去重）
     processed_message_ids: Arc<Mutex<VecDeque<String>>>,
@@ -83,6 +84,26 @@ pub struct BotRuntime<P: PlatformAdapter + 'static> {
     proactive_scheduler: Option<Arc<ProactiveShareScheduler>>,
     /// 平台适配器
     adapter: Option<Arc<P>>,
+    /// 群聊中断标记（group_key → 中断信号）
+    group_interrupt_flags: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    /// 群聊中断计数
+    group_interrupt_counts: Arc<Mutex<HashMap<String, usize>>>,
+    /// 回复开始时间（用于延迟追踪）
+    group_reply_start_times: Arc<Mutex<HashMap<String, f64>>>,
+    /// 烦恼事件记录（group_key → 时间戳列表）
+    annoyance_events: Arc<Mutex<HashMap<String, VecDeque<f64>>>>,
+    /// 运行时状态缓存
+    status_cache: Arc<RwLock<StatusCache>>,
+}
+
+/// 运行时状态缓存
+#[derive(Debug, Clone, Default)]
+struct StatusCache {
+    connected: bool,
+    ready: bool,
+    messages_received: u64,
+    messages_sent: u64,
+    errors: u64,
 }
 
 /// 运行时生命周期状态
@@ -120,6 +141,11 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
             proactive_share_store: None,
             proactive_scheduler: None,
             adapter: None,
+            group_interrupt_flags: Arc::new(Mutex::new(HashMap::new())),
+            group_interrupt_counts: Arc::new(Mutex::new(HashMap::new())),
+            group_reply_start_times: Arc::new(Mutex::new(HashMap::new())),
+            annoyance_events: Arc::new(Mutex::new(HashMap::new())),
+            status_cache: Arc::new(RwLock::new(StatusCache::default())),
         }
     }
 
@@ -926,6 +952,573 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
             .get(group_key)
             .copied()
             .unwrap_or(0)
+    }
+
+    // ── 消息处理主链 ──
+
+    /// 完整消息处理链：去重 → 缓冲 → 状态机检查 → Agent 循环 → 中断处理 → 副作用
+    pub async fn handle_message(
+        &self,
+        event: &InboundEvent,
+        trace_id: &str,
+        deferred_trigger: bool,
+        from_wait: bool,
+    ) -> XueliResult<()> {
+        let dedup_key = &event.id;
+        // 去重（延迟触发跳过去重）
+        if !deferred_trigger {
+            if !self.check_and_mark_processed(dedup_key).await {
+                tracing::warn!("[运行时] 跳过重复消息");
+                return Ok(());
+            }
+        }
+
+        self.record_user_interaction().await;
+        {
+            let metrics = self.metrics.read().await;
+            metrics.record_message_received();
+        }
+        self.sync_status_cache().await;
+
+        let session_key = self.get_session_key(event);
+        let group_key = self.get_group_key(event);
+        let is_private = self.is_private_message(event);
+        let is_mention = self.is_direct_mention(event);
+
+        // P0：非@群聊消息 → 缓冲并检查阈值
+        if !is_private && !is_mention && !deferred_trigger {
+            let should_process = self.register_pending_message(&group_key, Some(event.clone())).await;
+            if !should_process {
+                // P3 中断：若 Agent 正在运行，发送中断信号
+                let flags = self.group_interrupt_flags.lock().await;
+                if let Some(flag) = flags.get(&group_key) {
+                    let mut counts = self.group_interrupt_counts.lock().await;
+                    let count = counts.get(&group_key).copied().unwrap_or(0);
+                    if count < self.max_interrupt_count {
+                        counts.insert(group_key.clone(), count + 1);
+                        flag.notify_one();
+                        tracing::info!("[中断] key={} 通知中断 count={}", group_key, count + 1);
+                    }
+                }
+                return Ok(());
+            }
+        }
+
+        // 执行处理（含回复锁）
+        match self.handle_message_inner(event, &group_key, &session_key, trace_id, is_private, is_mention, from_wait).await {
+            Ok(()) => Ok(()),
+            Err(XueliError::ReqAbort) => {
+                tracing::info!("[中断] key={} 推理被中断, 重新收集消息", group_key);
+                // 中断后重试逻辑由调用方处理
+                Err(XueliError::ReqAbort)
+            }
+            Err(e) => {
+                tracing::error!("[运行时] 处理消息失败: {}", e);
+                {
+                    let metrics = self.metrics.read().await;
+                    metrics.record_error();
+                }
+                self.sync_status_cache().await;
+                self.cleanup_after_processing(&group_key).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// 消息处理内部逻辑（含回复锁）
+    async fn handle_message_inner(
+        &self,
+        event: &InboundEvent,
+        group_key: &str,
+        _session_key: &str,
+        trace_id: &str,
+        is_private: bool,
+        is_mention: bool,
+        from_wait: bool,
+    ) -> XueliResult<()> {
+        // P2：处理前消抖等待
+        if !is_private && !is_mention {
+            self.debounce_wait(group_key).await;
+        }
+
+        // P4：状态机检查
+        let state = self.get_group_state(group_key).await;
+        if state == GroupState::Waiting {
+            tracing::info!("[状态机] key={} 处于等待状态, 消息仅缓冲", group_key);
+            return Ok(());
+        }
+        if state == GroupState::Stopped {
+            self.set_group_state(group_key, GroupState::Running).await;
+            tracing::info!("[状态机] key={} 从 STOPPED 唤醒", group_key);
+        }
+
+        tracing::info!("[运行时] 开始处理消息");
+        self.record_reply_start(group_key).await;
+
+        // 第一阶段：plan_message（Timing Gate）
+        let handler = match &self.message_handler {
+            Some(h) => h.clone(),
+            None => {
+                tracing::debug!("[处理] 未配置消息处理器");
+                self.cleanup_after_processing(group_key).await;
+                return Ok(());
+            }
+        };
+
+        let response_timeout = self.config.bot_behavior.response_timeout as u64;
+        let plan_result = tokio::time::timeout(
+            Duration::from_secs(response_timeout.max(1)),
+            handler.handle(event),
+        )
+        .await;
+
+        let plan_result = match plan_result {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::error!("[运行时] 处理消息超时");
+                {
+                    let metrics = self.metrics.read().await;
+                    metrics.record_error();
+                }
+                self.cleanup_after_processing(group_key).await;
+                return Err(XueliError::AIService(crate::core::errors::AIServiceError::Timeout));
+            }
+        };
+
+        match plan_result {
+            Ok(Some(action)) => {
+                // 发送回复
+                if let Some(adapter) = &self.adapter {
+                    match adapter.send_action(&action).await {
+                        Ok(()) => {
+                            tracing::info!("[处理] key={} 回复发送成功", group_key);
+                            self.log_reply_preview(&action.text, "");
+                        }
+                        Err(e) => {
+                            tracing::error!("[处理] key={} 发送回复失败: {}", group_key, e);
+                        }
+                    }
+                }
+                self.record_reply_completion(group_key).await;
+                self.record_group_reply(group_key).await;
+                self.cleanup_after_processing(group_key).await;
+                Ok(())
+            }
+            Ok(None) => {
+                // 决策不回复（wait/ignore）
+                let action_str = "ignore";
+                {
+                    let metrics = self.metrics.read().await;
+                    metrics.record_planner_action(action_str);
+                }
+
+                // WAIT 处理
+                if !is_private {
+                    self.set_group_waiting(group_key).await;
+                    self.handle_agent_wait(event, group_key, trace_id, from_wait).await;
+                } else {
+                    self.set_group_stopped(group_key).await;
+                }
+                self.cleanup_after_processing(group_key).await;
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!("[处理] key={} AI 调用失败: {}", group_key, e);
+                self.record_reply_completion(group_key).await;
+                self.cleanup_after_processing(group_key).await;
+                Err(e)
+            }
+        }
+    }
+
+    // ── 事件入口 ──
+
+    /// 入站事件入口 — 将事件分发到消息处理器
+    pub async fn ingest_inbound_event(&self, event: InboundEvent) -> XueliResult<()> {
+        let trace_id = uuid::Uuid::new_v4().to_string();
+        self.handle_message(&event, &trace_id, false, false).await
+    }
+
+    /// 适配器载荷入口 — 解析原始载荷后分发
+    pub async fn ingest_adapter_payload(&self, payload: &str) -> XueliResult<()> {
+        let adapter = match &self.adapter {
+            Some(a) => a.clone(),
+            None => return Err(XueliError::platform("平台适配器未初始化")),
+        };
+
+        match adapter.parse_event(payload) {
+            Ok(event) => self.ingest_inbound_event(event).await,
+            Err(e) => {
+                tracing::debug!("[运行时] 解析事件失败: {}", e);
+                Err(e)
+            }
+        }
+    }
+
+    // ── WAIT 状态处理 ──
+
+    /// 处理 Timing Gate 的 WAIT — 安排延迟重新评估（非阻塞）
+    async fn handle_agent_wait(
+        &self,
+        event: &InboundEvent,
+        group_key: &str,
+        trace_id: &str,
+        from_wait: bool,
+    ) {
+        // 计算等待时长
+        let wait_seconds = self.calculate_wait_seconds(group_key);
+
+        // 前一次 wait 任务再判：仍为 WAIT，转为 STOPPED 防止无限循环
+        if from_wait {
+            // 需要异步设置状态
+            let states = Arc::clone(&self.group_states);
+            let gk = group_key.to_string();
+            tokio::spawn(async move {
+                let mut gs = states.write().await;
+                gs.insert(gk.clone(), GroupState::Stopped);
+                tracing::info!("[Wait] Timing Gate 再判: 仍为 WAIT, 转为 STOPPED");
+            });
+            return;
+        }
+
+        // 调度延迟重新评估（非阻塞——回复锁立即释放）
+        let _event = event.clone();
+        let gk = group_key.to_string();
+        let _tid = trace_id.to_string();
+        let group_states = Arc::clone(&self.group_states);
+        let group_pending_events = Arc::clone(&self.group_pending_events);
+        let group_pending_counts = Arc::clone(&self.group_pending_counts);
+        let group_turn_scheduled = Arc::clone(&self.group_turn_scheduled);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs_f64(wait_seconds)).await;
+
+            // 恢复为 RUNNING 以便重新评估
+            {
+                let mut gs = group_states.write().await;
+                gs.insert(gk.clone(), GroupState::Running);
+            }
+
+            tracing::info!("[Wait] 到期, 重新运行 Timing Gate");
+
+            // 使用最新的待处理事件
+            let latest_event = {
+                let events = group_pending_events.lock().await;
+                events.get(&gk).cloned()
+            };
+
+            if let Some(_latest_event) = latest_event {
+                // 标记为已调度
+                group_pending_counts.lock().await.insert(gk.clone(), 0);
+                group_turn_scheduled.lock().await.insert(gk.clone(), true);
+                // 注意：这里无法直接调用 handle_message，因为 self 不在 spawn 中
+                // 实际实现中应通过 trigger_tx 通知主循环
+            }
+        });
+    }
+
+    /// 计算等待时长
+    fn calculate_wait_seconds(&self, group_key: &str) -> f64 {
+        // 优先使用 LLM 推荐的等待时长
+        if let Some(ref cb) = self.hooks.llm_recommendation {
+            if let Some(wait) = cb(group_key, "preferred_wait_seconds") {
+                return wait.clamp(5.0, 120.0);
+            }
+        }
+
+        // 回退到基于配置的公式
+        let base_wait = self.config.group_reply.group_wait_window_seconds;
+        let sat_mult = 1.0; // 简化：在同步上下文中无法获取异步饱和度
+        let wait_seconds = base_wait * sat_mult;
+        wait_seconds.clamp(5.0, 120.0)
+    }
+
+    // ── 辅助方法 ──
+
+    /// 判断是否为私聊消息
+    fn is_private_message(&self, event: &InboundEvent) -> bool {
+        event
+            .message
+            .as_ref()
+            .map(|m| m.scope.is_private())
+            .or_else(|| event.session.as_ref().map(|s| s.scope.is_private()))
+            .unwrap_or(true)
+    }
+
+    /// 判断是否为直接 @ 提及
+    fn is_direct_mention(&self, event: &InboundEvent) -> bool {
+        if let Some(_) = self.message_handler {
+            let bot_name = &self.config.identity.name;
+            let text = &event.text;
+            text.contains(bot_name) || !event.mentioned_user_ids.is_empty()
+        } else {
+            !event.mentioned_user_ids.is_empty()
+        }
+    }
+
+    /// 获取会话键
+    fn get_session_key(&self, event: &InboundEvent) -> String {
+        event.get_session().session_id.clone()
+    }
+
+    /// 获取群聊键
+    fn get_group_key(&self, event: &InboundEvent) -> String {
+        event
+            .message
+            .as_ref()
+            .and_then(|m| match &m.scope {
+                ChatScope::Group(gid) => Some(gid.clone()),
+                _ => None,
+            })
+            .or_else(|| event.session.as_ref().and_then(|s| match &s.scope {
+                ChatScope::Group(gid) => Some(gid.clone()),
+                _ => None,
+            }))
+            .unwrap_or_else(|| self.get_session_key(event))
+    }
+
+    /// 记录回复开始时间
+    async fn record_reply_start(&self, group_key: &str) {
+        self.group_reply_start_times
+            .lock()
+            .await
+            .insert(group_key.to_string(), now_secs());
+    }
+
+    /// 记录用户交互（通知主动分享调度器）
+    async fn record_user_interaction(&self) {
+        // 主动分享调度器记录交互
+        if let Some(scheduler) = &self.proactive_scheduler {
+            scheduler.record_interaction().await;
+        }
+    }
+
+    /// 获取烦恼事件阈值加成
+    pub async fn get_annoyance_threshold_bonus(&self, group_key: &str) -> f64 {
+        if group_key.is_empty() {
+            return 0.0;
+        }
+        let events = self.annoyance_events.lock().await;
+        let now = now_secs();
+        let all_events = events.get(group_key);
+        match all_events {
+            None => 0.0,
+            Some(ts_vec) => {
+                let recent = ts_vec.iter().filter(|t| now - **t < 600.0).count();
+                match recent {
+                    0 => 0.0,
+                    1 => 1.0,
+                    2 => 2.5,
+                    _ => 5.0,
+                }
+            }
+        }
+    }
+
+    /// 记录烦恼事件
+    pub async fn record_annoyance_event(&self, group_key: &str) {
+        let mut events = self.annoyance_events.lock().await;
+        let ts_vec = events.entry(group_key.to_string()).or_default();
+        ts_vec.push_back(now_secs());
+        // 保留 10 分钟内的记录
+        let now = now_secs();
+        while ts_vec.front().map_or(false, |t| now - t > 600.0) {
+            ts_vec.pop_front();
+        }
+    }
+
+    /// 回复预览日志
+    fn log_reply_preview(&self, reply_text: &str, source: &str) {
+        let preview = preview_text_for_log(reply_text.trim(), 200);
+        if preview.is_empty() {
+            return;
+        }
+        let normalized_source = if source.trim().is_empty() {
+            "unknown"
+        } else {
+            source.trim()
+        };
+        tracing::info!(
+            "[运行时] 回复预览 source={} preview={}",
+            normalized_source,
+            preview
+        );
+    }
+
+    /// 规划器日志上下文
+    pub fn build_planner_log_context(&self) -> HashMap<String, String> {
+        let mut ctx = HashMap::new();
+        ctx.insert("batch_mode".to_string(), "unknown".to_string());
+        ctx.insert("batch_size".to_string(), "1".to_string());
+        ctx.insert("is_latest".to_string(), "true".to_string());
+        ctx.insert("merged_into_latest".to_string(), "false".to_string());
+        ctx
+    }
+
+    /// 同步运行时计数器
+    pub async fn sync_runtime_counters(&self) {
+        let snapshot = {
+            let metrics = self.metrics.read().await;
+            metrics.snapshot()
+        };
+        let mut cache = self.status_cache.write().await;
+        cache.messages_received = snapshot.get("total_messages_received")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        cache.messages_sent = snapshot.get("reply_parts_sent")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        cache.errors = snapshot.get("message_errors")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+    }
+
+    /// 同步状态缓存
+    async fn sync_status_cache(&self) {
+        self.sync_runtime_counters().await;
+    }
+
+    /// 获取运行时综合状态快照
+    pub async fn get_status(&self) -> HashMap<String, serde_json::Value> {
+        let mut status = HashMap::new();
+        let cache = self.status_cache.read().await;
+        status.insert("connected".to_string(), serde_json::Value::Bool(cache.connected));
+        status.insert("ready".to_string(), serde_json::Value::Bool(cache.ready));
+        status.insert(
+            "messages_received".to_string(),
+            serde_json::Value::Number(cache.messages_received.into()),
+        );
+        status.insert(
+            "messages_sent".to_string(),
+            serde_json::Value::Number(cache.messages_sent.into()),
+        );
+        status.insert(
+            "errors".to_string(),
+            serde_json::Value::Number(cache.errors.into()),
+        );
+
+        // 合并指标快照
+        let metrics_snapshot = {
+            let metrics = self.metrics.read().await;
+            metrics.snapshot()
+        };
+        for (key, value) in metrics_snapshot {
+            status.insert(key, value);
+        }
+
+        status
+    }
+
+    /// 记忆消化 insight 回调
+    pub async fn on_digestion_insight(&self, user_id: &str, insight: &str) {
+        let store = match &self.proactive_share_store {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        let content = insight.to_string();
+        let uid = user_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let record = crate::proactive_share::store::ShareRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                user_id: uid,
+                content,
+                share_type: crate::proactive_share::store::ShareType::Insight,
+                source: "digestion".to_string(),
+                sent: false,
+                created_at: chrono::Utc::now(),
+                expires_at: None,
+                last_sent_at: None,
+                target_user_id: String::new(),
+                target_group_id: String::new(),
+            };
+            if let Err(e) = store.save(record) {
+                tracing::debug!("[主动分享] 写入 insight 分享失败: {}", e);
+            }
+        })
+        .await
+        .ok();
+    }
+
+    /// 设置连接状态
+    pub async fn set_connected(&self, connected: bool) {
+        {
+            let metrics = self.metrics.read().await;
+            metrics.set_connected(connected);
+            metrics.set_ready(connected);
+        }
+        {
+            let mut cache = self.status_cache.write().await;
+            cache.connected = connected;
+            cache.ready = connected;
+        }
+    }
+
+    /// 运行可中断 AI 调用 — AI 任务与中断信号竞速
+    pub async fn run_interruptible_ai_call<F, R>(
+        &self,
+        group_key: &str,
+        ai_call: F,
+        response_timeout: u64,
+    ) -> XueliResult<R>
+    where
+        F: std::future::Future<Output = XueliResult<R>> + Send,
+        R: Send,
+    {
+        let notify = {
+            let flags = self.group_interrupt_flags.lock().await;
+            flags.get(group_key).cloned()
+        };
+
+        match notify {
+            Some(flag) => {
+                // 有中断标记 → 竞速
+                tokio::select! {
+                    result = tokio::time::timeout(
+                        Duration::from_secs(response_timeout.max(1)),
+                        ai_call
+                    ) => {
+                        match result {
+                            Ok(inner) => inner,
+                            Err(_) => Err(XueliError::AIService(crate::core::errors::AIServiceError::Timeout)),
+                        }
+                    }
+                    _ = flag.notified() => {
+                        Err(XueliError::ReqAbort)
+                    }
+                }
+            }
+            None => {
+                // 无中断标记 → 直接调用
+                match tokio::time::timeout(
+                    Duration::from_secs(response_timeout.max(1)),
+                    ai_call,
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(XueliError::AIService(crate::core::errors::AIServiceError::Timeout)),
+                }
+            }
+        }
+    }
+
+    /// 设置群聊中断标记
+    pub async fn set_interrupt_flag(&self, group_key: &str) {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        self.group_interrupt_flags
+            .lock()
+            .await
+            .insert(group_key.to_string(), notify);
+        self.group_interrupt_counts
+            .lock()
+            .await
+            .insert(group_key.to_string(), 0);
+    }
+
+    /// 清除群聊中断标记
+    pub async fn clear_interrupt_flag(&self, group_key: &str) {
+        self.group_interrupt_flags.lock().await.remove(group_key);
+        self.group_interrupt_counts.lock().await.remove(group_key);
     }
 }
 

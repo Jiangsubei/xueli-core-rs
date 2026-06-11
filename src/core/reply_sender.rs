@@ -1,9 +1,12 @@
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::Rng;
 use rand::SeedableRng;
 
+use crate::core::metrics::RuntimeMetrics;
 use crate::core::platform_types::ReplyAction;
+use crate::core::scope::ChatScope;
 use crate::prelude::XueliResult;
 use crate::traits::platform_adapter::PlatformAdapter;
 
@@ -117,6 +120,7 @@ impl Default for ReplySendOrchestrator {
 pub struct ReplySender<P: PlatformAdapter> {
     adapter: Arc<P>,
     orchestrator: ReplySendOrchestrator,
+    metrics: Option<Arc<RuntimeMetrics>>,
 }
 
 impl<P: PlatformAdapter> ReplySender<P> {
@@ -124,7 +128,14 @@ impl<P: PlatformAdapter> ReplySender<P> {
         Self {
             adapter,
             orchestrator: ReplySendOrchestrator::new(),
+            metrics: None,
         }
+    }
+
+    /// 设置运行时指标
+    pub fn with_metrics(mut self, metrics: Arc<RuntimeMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// 发送回复
@@ -144,7 +155,7 @@ impl<P: PlatformAdapter> ReplySender<P> {
     pub async fn send_segmented(
         &self,
         plans: &[ReplyPartPlan],
-        scope: crate::core::scope::ChatScope,
+        scope: ChatScope,
         _reply_to: Option<&str>,
     ) -> XueliResult<()> {
         for plan in plans {
@@ -163,6 +174,9 @@ impl<P: PlatformAdapter> ReplySender<P> {
             };
             self.adapter.send_action(&action).await?;
         }
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_reply_parts_sent(plans.len() as u64);
+        }
         Ok(())
     }
 
@@ -170,7 +184,7 @@ impl<P: PlatformAdapter> ReplySender<P> {
     pub async fn send_with_auto_segments(
         &mut self,
         text: &str,
-        scope: crate::core::scope::ChatScope,
+        scope: ChatScope,
         max_segments: usize,
     ) -> XueliResult<()> {
         // 按空行切分
@@ -186,11 +200,73 @@ impl<P: PlatformAdapter> ReplySender<P> {
 
         self.send_segmented(&plans, scope, None).await
     }
+
+    /// 检查窗口是否已过期
+    pub fn is_window_expired(expires_at: f64) -> bool {
+        if expires_at <= 0.0 {
+            return false;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        now > expires_at
+    }
+
+    /// 构建引用回复段（通用格式，下游适配器可覆盖）
+    pub fn build_quote_segment(message_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "reply",
+            "data": { "id": message_id }
+        })
+    }
+
+    /// 构建 @ 提及段（通用格式，下游适配器可覆盖）
+    pub fn build_mention_payload(user_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "mention",
+            "data": { "user_id": user_id }
+        })
+    }
+
+    /// 确保出站消息中没有普通图片段
+    pub fn ensure_no_outbound_images(segments: &[serde_json::Value]) -> XueliResult<()> {
+        for segment in segments {
+            let seg_type = segment
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
+            if seg_type == "image" {
+                return Err("当前运行模式禁止主动发送普通 image 段".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+
+    /// 测试用空实现 PlatformAdapter
+    struct NoopPlatformAdapter;
+
+    #[async_trait]
+    impl PlatformAdapter for NoopPlatformAdapter {
+        async fn send_action(&self, _action: &ReplyAction) -> crate::prelude::XueliResult<()> {
+            Ok(())
+        }
+        fn strip_mentions(&self, text: &str) -> String { text.to_string() }
+        fn extract_mentions(&self, _event: &crate::core::platform_types::InboundEvent) -> Vec<String> { vec![] }
+        fn resolve_mention_placeholders(&self, text: &str, _mentions: &[String]) -> String { text.to_string() }
+        fn platform_name(&self) -> &str { "test" }
+        fn parse_event(&self, _raw: &str) -> crate::prelude::XueliResult<crate::core::platform_types::InboundEvent> {
+            unimplemented!()
+        }
+    }
 
     #[test]
     fn test_normalize_segments_dedup() {
@@ -229,5 +305,63 @@ mod tests {
         // 第一段延迟应在 0~0.6 秒，后续段在 3~10 秒
         assert!(plans[0].delay_before_seconds <= 0.6);
         assert!(plans[1].delay_before_seconds >= 3.0);
+    }
+
+    #[test]
+    fn test_build_quote_segment() {
+        let seg = ReplySender::<NoopPlatformAdapter>::build_quote_segment("12345");
+        assert_eq!(seg["type"], "reply");
+        assert_eq!(seg["data"]["id"], "12345");
+    }
+
+    #[test]
+    fn test_build_mention_payload() {
+        let seg = ReplySender::<NoopPlatformAdapter>::build_mention_payload("user_001");
+        assert_eq!(seg["type"], "mention");
+        assert_eq!(seg["data"]["user_id"], "user_001");
+    }
+
+    #[test]
+    fn test_ensure_no_outbound_images_ok() {
+        let segments = vec![
+            serde_json::json!({"type": "text", "data": {"text": "hello"}}),
+            serde_json::json!({"type": "mention", "data": {"user_id": "123"}}),
+        ];
+        assert!(ReplySender::<NoopPlatformAdapter>::ensure_no_outbound_images(&segments).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_no_outbound_images_reject() {
+        let segments = vec![
+            serde_json::json!({"type": "image", "data": {"url": "http://example.com/img.png"}}),
+        ];
+        assert!(ReplySender::<NoopPlatformAdapter>::ensure_no_outbound_images(&segments).is_err());
+    }
+
+    #[test]
+    fn test_is_window_expired_not_set() {
+        assert!(!ReplySender::<NoopPlatformAdapter>::is_window_expired(0.0));
+    }
+
+    #[test]
+    fn test_is_window_expired_past() {
+        // 使用一个过去的时间戳
+        let past = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+            - 100.0;
+        assert!(ReplySender::<NoopPlatformAdapter>::is_window_expired(past));
+    }
+
+    #[test]
+    fn test_is_window_expired_future() {
+        // 使用一个未来的时间戳
+        let future = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+            + 3600.0;
+        assert!(!ReplySender::<NoopPlatformAdapter>::is_window_expired(future));
     }
 }
