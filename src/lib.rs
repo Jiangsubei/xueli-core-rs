@@ -1,4 +1,3 @@
-pub mod adapters;
 pub mod character;
 pub mod core;
 pub mod emoji;

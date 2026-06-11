@@ -2,7 +2,10 @@
 //!
 //! 演示如何使用 xueli-core 库构建一个 QQ Bot
 
-use xueli_core::adapters::napcat::NapCatAdapter;
+#[path = "napcat_adapter/mod.rs"]
+mod napcat_adapter;
+
+use napcat_adapter::NapCatAdapter;
 use xueli_core::core::config::XueliConfig;
 use xueli_core::core::runtime::BotRuntime;
 

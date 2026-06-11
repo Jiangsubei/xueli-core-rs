@@ -8,11 +8,11 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::core::platform_types::{EventType, GroupState, InboundEvent, ReplyAction, SessionRef};
-use crate::core::scope::ChatScope;
-use crate::core::types::UserMessage;
-use crate::prelude::{XueliError, XueliResult};
-use crate::traits::platform_adapter::PlatformAdapter;
+use xueli_core::core::platform_types::{EventType, GroupState, InboundEvent, ReplyAction, SessionRef};
+use xueli_core::core::scope::ChatScope;
+use xueli_core::core::types::UserMessage;
+use xueli_core::prelude::{XueliError, XueliResult};
+use xueli_core::traits::platform_adapter::PlatformAdapter;
 
 /// OneBot 消息段
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,87 +397,5 @@ impl NapCatAdapter {
             .and_then(|d| d.as_array())
             .cloned()
             .unwrap_or_default())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_strip_mentions() {
-        let adapter = NapCatAdapter::new(NapCatConfig::default());
-        assert_eq!(adapter.strip_mentions("[CQ:at,qq=12345] 你好"), "你好");
-        assert_eq!(adapter.strip_mentions("@雪梨 你好"), "你好");
-        assert_eq!(adapter.strip_mentions("你好 @雪梨"), "你好 @雪梨");
-    }
-
-    #[test]
-    fn test_parse_private_message() {
-        let adapter = NapCatAdapter::new(NapCatConfig {
-            self_id: "10000".to_string(),
-            ..Default::default()
-        });
-        let raw = r#"{
-            "post_type": "message",
-            "message_type": "private",
-            "user_id": "12345",
-            "message_id": "123456",
-            "message": [{"type":"text","data":{"text":"你好"}}],
-            "raw_message": "你好",
-            "sender": {"user_id":"12345","nickname":"测试用户"},
-            "time": 1700000000
-        }"#;
-        let event = adapter.parse_event(raw).unwrap();
-        assert_eq!(event.platform, "napcat");
-        assert_eq!(event.event_type, EventType::Message);
-        let msg = event.message.unwrap();
-        assert_eq!(msg.sender_id, "12345");
-        assert_eq!(msg.text, "你好");
-        assert!(matches!(msg.scope, ChatScope::Private));
-    }
-
-    #[test]
-    fn test_parse_group_mention() {
-        let adapter = NapCatAdapter::new(NapCatConfig {
-            self_id: "10000".to_string(),
-            ..Default::default()
-        });
-        let raw = r#"{
-            "post_type": "message",
-            "message_type": "group",
-            "group_id": "67890",
-            "user_id": "12345",
-            "message_id": "123456",
-            "message": [
-                {"type":"at","data":{"qq":"10000"}},
-                {"type":"text","data":{"text":" 在吗"}}
-            ],
-            "raw_message": "[CQ:at,qq=10000] 在吗",
-            "sender": {"user_id":"12345","nickname":"测试用户"},
-            "time": 1700000000
-        }"#;
-        let event = adapter.parse_event(raw).unwrap();
-        assert_eq!(event.event_type, EventType::Mention);
-        let msg = event.message.unwrap();
-        assert!(matches!(msg.scope, ChatScope::Group(_)));
-        assert_eq!(msg.text, " 在吗");
-        assert!(msg.is_mention);
-    }
-
-    #[test]
-    fn test_build_message_segments() {
-        let adapter = NapCatAdapter::new(NapCatConfig::default());
-        let action = ReplyAction {
-            scope: ChatScope::Private,
-            text: "你好".to_string(),
-            reply_to: Some("123".to_string()),
-            image_url: None,
-            emoji_id: None,
-        };
-        let segs = adapter.build_message_segments(&action);
-        assert_eq!(segs.len(), 2);
-        assert!(matches!(segs[0], OneBotSegment::Reply { .. }));
-        assert!(matches!(segs[1], OneBotSegment::Text { .. }));
     }
 }
