@@ -889,10 +889,6 @@ impl CharacterCardService {
 
     // ── 载荷管理 ──
 
-    fn payload_suffix(&self) -> String {
-        "payload.json".to_string()
-    }
-
     fn load_payload(&self, user_id: &str) -> UserPayload {
         let path = build_scope_payload_path(&self.storage_dir, user_id, "payload.json");
         match std::fs::read_to_string(&path) {
@@ -921,10 +917,6 @@ impl CharacterCardService {
     }
 
     // ── 快照文件读写 ──
-
-    fn snapshot_path(&self, user_id: &str) -> String {
-        build_scope_payload_path(&self.storage_dir, user_id, "card.json")
-    }
 
     fn save_one(&self, snapshot: &CharacterCardSnapshot) {
         let path = build_scope_payload_path(&self.storage_dir, &snapshot.user_id, "card.json");

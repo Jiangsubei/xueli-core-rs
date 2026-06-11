@@ -246,7 +246,6 @@ fn parse_reply_reference_from_json(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn test_build_system_prompt() {

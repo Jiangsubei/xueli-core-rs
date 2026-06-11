@@ -466,7 +466,7 @@ mod tests {
     #[test]
     fn test_default_prompt_plan_comfort() {
         let pp = PromptPlanner::default();
-        let plan = pp.default_prompt_plan(true, "unknown", false, false);
+        let _plan = pp.default_prompt_plan(true, "unknown", false, false);
         // "comfort" reply_goal from a specific path - let's test old_topic_resume
         let plan2 = pp.default_prompt_plan(false, "old_topic_resume", false, false);
         assert_eq!(plan2.reply_goal, "recall");

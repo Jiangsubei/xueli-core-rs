@@ -1183,7 +1183,7 @@ mod tests {
 
     // ── 测试用桩 ──
 
-    use crate::traits::ai_client::{ChatCompletionResponse, TokenUsage};
+    use crate::traits::ai_client::ChatCompletionResponse;
     use async_trait::async_trait;
     use std::collections::HashMap as StdHashMap;
 
