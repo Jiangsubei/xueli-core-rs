@@ -138,6 +138,19 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<MemoryItemRecord> {
     })
 }
 
+fn row_to_memory_item_from_record(rec: &MemoryItemRecord) -> MemoryItem {
+    MemoryItem {
+        id: rec.id.clone(),
+        user_id: rec.user_id.clone(),
+        content: rec.content.clone(),
+        memory_type: str_to_memory_type(&rec.memory_type_str),
+        importance: rec.importance,
+        created_at: rec.created_at_str.parse().unwrap_or_default(),
+        last_accessed_at: rec.last_accessed_at_str.parse().unwrap_or_default(),
+        access_count: rec.access_count as u64,
+    }
+}
+
 fn parse_ts_opt(s: &Option<String>) -> Option<DateTime<Utc>> {
     s.as_ref().and_then(|v| v.parse().ok())
 }
@@ -155,6 +168,12 @@ const CATEGORY_FORGET_THRESHOLDS: &[(&str, f64)] = &[
     ("casual", 0.8),
 ];
 
+/// 类别归档阈值（归档阈值应高于遗忘阈值，先归档再遗忘）
+const CATEGORY_ARCHIVE_THRESHOLDS: &[(&str, f64)] = &[
+    ("core_fact", 0.2),
+    ("casual", 0.9),
+];
+
 /// 抑制因子（对应 Python 版 suppression_factor）
 const SUPPRESSION_FACTOR: f64 = 0.05;
 
@@ -168,6 +187,14 @@ fn category_half_life_modifier(category: &str) -> f64 {
 
 fn category_forget_threshold(category: &str, default: f64) -> f64 {
     CATEGORY_FORGET_THRESHOLDS
+        .iter()
+        .find(|(k, _)| *k == category)
+        .map(|(_, v)| *v)
+        .unwrap_or(default)
+}
+
+fn category_archive_threshold(category: &str, default: f64) -> f64 {
+    CATEGORY_ARCHIVE_THRESHOLDS
         .iter()
         .find(|(k, _)| *k == category)
         .map(|(_, v)| *v)
@@ -474,11 +501,17 @@ impl SqliteMemoryItemStore {
                 .collect();
 
             let now = Utc::now();
-            let threshold = 0.1;
+            let default_archive_threshold = 0.1;
             let mut archived_count = 0usize;
 
             for rec in &records {
                 let eff = calc_effective_importance(rec, now);
+                let meta = parse_metadata(&rec.metadata_json);
+                let category = meta_get_str(&meta, "memory_category")
+                    .unwrap_or("")
+                    .trim()
+                    .to_lowercase();
+                let threshold = category_archive_threshold(&category, default_archive_threshold);
                 let should_archive = eff < threshold;
                 let currently_archived = rec.is_archived;
 
@@ -527,7 +560,13 @@ impl SqliteMemoryItemStore {
                 Some(r) => {
                     let now = Utc::now();
                     let eff = calc_effective_importance(&r, now);
-                    if eff < 0.05 {
+                    let meta = parse_metadata(&r.metadata_json);
+                    let category = meta_get_str(&meta, "memory_category")
+                        .unwrap_or("")
+                        .trim()
+                        .to_lowercase();
+                    let threshold = category_forget_threshold(&category, 0.1);
+                    if eff < threshold {
                         return Ok(true);
                     }
                     if r.is_archived {
@@ -542,6 +581,84 @@ impl SqliteMemoryItemStore {
                 }
                 None => Ok(false),
             }
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
+    }
+
+    /// 按衰减状态分区记忆（对应 Python 版 _partition_memories_by_decay）
+    /// 返回 (to_keep, to_archive, to_forget)
+    pub async fn partition_memories_by_decay(
+        &self,
+        user_id: &str,
+    ) -> XueliResult<(Vec<MemoryItem>, Vec<MemoryItem>, Vec<String>)> {
+        let user_id = user_id.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<(Vec<MemoryItem>, Vec<MemoryItem>, Vec<String>)> {
+            let conn = conn.lock().map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, user_id, content, memory_type, importance, created_at, last_accessed_at,
+                            access_count, is_archived, half_life_hours, archived_at, consolidation_version,
+                            consolidated_at, half_life_modifier, suppressed_at, merge_status, merged_into_id, metadata_json
+                     FROM memory_items WHERE user_id = ?1",
+                )
+                .map_err(|e| XueliError::Database(format!("准备查询失败: {e}")))?;
+
+            let records: Vec<MemoryItemRecord> = stmt
+                .query_map(params![user_id], row_to_record)
+                .map_err(|e| XueliError::Database(format!("查询失败: {e}")))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            let now = Utc::now();
+            let default_forget_threshold = 0.1;
+            let default_archive_threshold = 0.1;
+            let mut to_keep = Vec::new();
+            let mut to_archive = Vec::new();
+            let mut to_forget = Vec::new();
+
+            for rec in &records {
+                let eff = calc_effective_importance(rec, now);
+                let meta = parse_metadata(&rec.metadata_json);
+                let category = meta_get_str(&meta, "memory_category")
+                    .unwrap_or("")
+                    .trim()
+                    .to_lowercase();
+
+                // 检查是否应遗忘
+                let forget_threshold = category_forget_threshold(&category, default_forget_threshold);
+                if eff < forget_threshold {
+                    to_forget.push(rec.id.clone());
+                    continue;
+                }
+
+                // 检查是否应归档
+                let archive_threshold = category_archive_threshold(&category, default_archive_threshold);
+                if rec.is_archived {
+                    // 已归档且超过 90 天则遗忘
+                    if let Some(archived_at) = parse_ts_opt(&rec.archived_at) {
+                        let days_archived = (now - archived_at).num_days();
+                        if days_archived > 90 {
+                            to_forget.push(rec.id.clone());
+                            continue;
+                        }
+                    }
+                    // 已归档但仍在安全期内，保留归档状态
+                    let item = row_to_memory_item_from_record(rec);
+                    to_archive.push(item);
+                } else if eff < archive_threshold {
+                    // 需要归档
+                    let item = row_to_memory_item_from_record(rec);
+                    to_archive.push(item);
+                } else {
+                    // 保留
+                    let item = row_to_memory_item_from_record(rec);
+                    to_keep.push(item);
+                }
+            }
+
+            Ok((to_keep, to_archive, to_forget))
         })
         .await
         .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?

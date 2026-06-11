@@ -786,8 +786,109 @@ impl<L: PromptTemplateLoader + 'static> MemoryManager<L> {
         self.retrieval_coordinator.clone()
     }
 
+    pub fn fact_evidence_store(&self) -> Arc<SqliteFactEvidenceStore> {
+        self.fact_evidence_store.clone()
+    }
+
+    pub fn signal_store(&self) -> Arc<SignalStore> {
+        self.signal_store.clone()
+    }
+
+    pub fn chat_summary_service(&self) -> Arc<ChatSummaryService> {
+        self.chat_summary_service.clone()
+    }
+
+    pub fn recall_service(&self) -> Arc<ConversationRecallService> {
+        self.recall_service.clone()
+    }
+
+    pub fn dispute_resolver(&self) -> Arc<MemoryDisputeResolver> {
+        self.dispute_resolver.clone()
+    }
+
     pub fn background_coordinator(&self) -> Option<Arc<MemoryBackgroundCoordinator<L>>> {
         self.background_coordinator.clone()
+    }
+
+    // ── Dispute Resolution ──
+
+    /// 解析记忆争议（使用 dispute_resolver + fact_evidence_store）
+    pub async fn resolve_memory_dispute(
+        &self,
+        user_id: &str,
+        memory_id: &str,
+        memory_metadata: &serde_json::Value,
+    ) -> XueliResult<Option<crate::memory::stores::fact_evidence::FactEvidence>> {
+        let decision = self.dispute_resolver.resolve_from_memory_metadata(memory_metadata);
+        if decision.level == "ignore" {
+            return Ok(None);
+        }
+        let record = crate::memory::stores::fact_evidence::FactEvidence {
+            id: format!("ev_{}_{}", user_id, memory_id),
+            fact_id: memory_id.to_string(),
+            source_memory_id: memory_id.to_string(),
+            conversation_id: String::new(),
+            message_id: String::new(),
+            evidence_text: decision.summary.clone(),
+            created_at: chrono::Utc::now(),
+        };
+        self.fact_evidence_store.store(record.clone()).await?;
+        Ok(Some(record))
+    }
+
+    // ── Recall Context ──
+
+    /// 获取对话回溯上下文（使用 recall_service）
+    pub async fn get_recall_context(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        query: &str,
+    ) -> XueliResult<Vec<MemoryItem>> {
+        self.recall_service.recall(user_id, session_id, query).await
+    }
+
+    // ── Chat Summary ──
+
+    /// 刷新会话摘要（使用 chat_summary_service）
+    pub async fn refresh_chat_summary(
+        &self,
+        session_id: &str,
+        user_id: &str,
+    ) -> XueliResult<Option<String>> {
+        self.chat_summary_service
+            .refresh_session_summary(&self.conversation_store, session_id, user_id)
+            .await
+    }
+
+    // ── Signal Store ──
+
+    /// 设置信号（使用 signal_store）
+    pub async fn set_signal(
+        &self,
+        signal_key: &str,
+        signal_type: &str,
+        prompt_version: &str,
+        payload: &serde_json::Value,
+        confidence: f64,
+        ttl_seconds: f64,
+    ) -> XueliResult<()> {
+        self.signal_store
+            .set(signal_key, signal_type, prompt_version, payload, confidence, ttl_seconds)
+            .await
+    }
+
+    /// 获取信号（使用 signal_store）
+    pub async fn get_signal(&self, signal_key: &str) -> Option<serde_json::Value> {
+        self.signal_store.get(signal_key).await
+    }
+
+    /// 获取信号元数据（使用 signal_store）
+    pub async fn get_signal_meta(
+        &self,
+        signal_key: &str,
+    ) -> Option<crate::memory::stores::signal_store::SignalMeta> {
+        self.signal_store.get_meta(signal_key).await
     }
 
     pub async fn close(&self) {
