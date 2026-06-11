@@ -27,6 +27,25 @@ pub struct NarrativeEvent {
     pub significance: f64,
 }
 
+/// 结构化叙事自我描述
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NarrativeSelf {
+    #[serde(default)]
+    pub relationship_story: String,
+    #[serde(default)]
+    pub recurring_themes: Vec<String>,
+    #[serde(default)]
+    pub recent_turning_points: Vec<String>,
+    #[serde(default)]
+    pub reply_guidance: String,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct NarrativeSelfPayload {
     #[serde(default)]
@@ -146,11 +165,120 @@ impl NarrativeService {
         turn_ok && time_ok
     }
 
+    /// 判断是否需要更新叙事自我（基于轮次或时间间隔）
+    pub fn should_update_narrative_self(
+        &self,
+        user_id: &str,
+        min_turns: usize,
+        min_interval_seconds: f64,
+    ) -> bool {
+        let thread = self.get_thread(user_id);
+        let effective_min_turns = min_turns.max(1);
+        if thread.turn_count_since_last_update >= effective_min_turns {
+            return true;
+        }
+        let ns = self.narrative_self.lock().unwrap();
+        if ns.is_none() {
+            // 没有叙事自我，检查是否有摘要
+            return !thread.summary.trim().is_empty();
+        }
+        drop(ns);
+
+        // 检查叙事自我的更新时间
+        let path = build_scope_payload_path(&self.storage_dir, user_id, "narrative_self.json");
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(payload) = serde_json::from_str::<NarrativeSelfPayload>(&data) {
+                if !payload.updated_at.is_empty() {
+                    if let Ok(last) = chrono::DateTime::parse_from_rfc3339(&payload.updated_at) {
+                        let elapsed = Utc::now().signed_duration_since(last).num_seconds() as f64;
+                        return elapsed >= min_interval_seconds.max(1.0);
+                    }
+                }
+            }
+        }
+        true
+    }
+
     pub fn mark_updated(&self, user_id: &str) {
         let mut threads = self.threads.lock().unwrap();
         if let Some(thread) = threads.get_mut(user_id) {
             thread.turn_count_since_last_update = 0;
         }
+    }
+
+    /// 归一化叙事自我数据，提取有效字段并限制长度
+    pub fn normalize_narrative_self(value: &serde_json::Value) -> Option<NarrativeSelf> {
+        let story = value
+            .get("relationship_story")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let guidance = value
+            .get("reply_guidance")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let themes: Vec<String> = value
+            .get("recurring_themes")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| {
+                        let s = v.as_str().unwrap_or("").trim().to_string();
+                        if s.is_empty() { None } else { Some(s) }
+                    })
+                    .take(8)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let turning_points: Vec<String> = value
+            .get("recent_turning_points")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| {
+                        let s = v.as_str().unwrap_or("").trim().to_string();
+                        if s.is_empty() { None } else { Some(s) }
+                    })
+                    .take(8)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if story.is_empty() && themes.is_empty() && turning_points.is_empty() && guidance.is_empty()
+        {
+            return None;
+        }
+
+        let confidence = value
+            .get("confidence")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        let reason = value
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        Some(NarrativeSelf {
+            relationship_story: story,
+            recurring_themes: themes,
+            recent_turning_points: turning_points,
+            reply_guidance: guidance,
+            confidence,
+            reason,
+            updated_at: String::new(),
+        })
+    }
+
+    /// 提取标签（当前未实现，始终返回空字符串）
+    #[allow(dead_code)]
+    pub fn pick_label(_user_message: &str) -> String {
+        String::new()
     }
 
     pub fn update_narrative_self(&self, user_id: &str, signal_text: &str) -> XueliResult<()> {

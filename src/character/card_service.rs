@@ -3,8 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::character::{build_scope_payload_path, legacy_payload_path};
+use crate::core::config::{CharacterGrowthConfig, IntimacyThresholdConfig};
 use crate::prelude::XueliResult;
 
 /// 角色卡 — 定义 bot 的角色身份及其对特定用户的适应
@@ -138,7 +140,7 @@ struct EmotionEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct RelationshipProfileInternal {
+pub struct RelationshipProfileInternal {
     intimacy_level: f64,
     total_interactions: u64,
     reply_positive_count: u64,
@@ -153,14 +155,14 @@ struct RelationshipProfileInternal {
 }
 
 impl RelationshipProfileInternal {
-    fn resolve_stage(intimacy: f64) -> String {
-        if intimacy >= 0.9 {
+    fn resolve_stage_with_thresholds(intimacy: f64, thresholds: &IntimacyThresholdConfig) -> String {
+        if intimacy >= thresholds.trusted {
             "intimate"
-        } else if intimacy >= 0.8 {
+        } else if intimacy >= thresholds.close_friend {
             "close_friend"
-        } else if intimacy >= 0.5 {
+        } else if intimacy >= thresholds.friend {
             "friend"
-        } else if intimacy >= 0.2 {
+        } else if intimacy >= thresholds.acquaintance {
             "acquaintance"
         } else if intimacy >= 0.1 {
             "met_before"
@@ -170,8 +172,16 @@ impl RelationshipProfileInternal {
         .into()
     }
 
+    fn resolve_stage(intimacy: f64) -> String {
+        Self::resolve_stage_with_thresholds(intimacy, &IntimacyThresholdConfig::default())
+    }
+
     fn update_stage(&mut self) {
         self.relationship_stage = Self::resolve_stage(self.intimacy_level);
+    }
+
+    fn update_stage_with_thresholds(&mut self, thresholds: &IntimacyThresholdConfig) {
+        self.relationship_stage = Self::resolve_stage_with_thresholds(self.intimacy_level, thresholds);
     }
 }
 
@@ -197,6 +207,9 @@ pub struct CharacterCardService {
     storage_dir: String,
     signal_orchestrator: Option<Arc<dyn PersonaHintProvider>>,
     persona_hints_cache: Mutex<HashMap<String, PersonaHints>>,
+    config: CharacterGrowthConfig,
+    adaptation_last_update: Mutex<HashMap<String, Instant>>,
+    adaptation_last_signal_count: Mutex<HashMap<String, i32>>,
 }
 
 impl CharacterCardService {
@@ -207,9 +220,17 @@ impl CharacterCardService {
             storage_dir: storage_dir.to_string(),
             signal_orchestrator: None,
             persona_hints_cache: Mutex::new(HashMap::new()),
+            config: CharacterGrowthConfig::default(),
+            adaptation_last_update: Mutex::new(HashMap::new()),
+            adaptation_last_signal_count: Mutex::new(HashMap::new()),
         };
         svc.load_all();
         svc
+    }
+
+    pub fn with_config(mut self, config: CharacterGrowthConfig) -> Self {
+        self.config = config;
+        self
     }
 
     pub fn default_card() -> CharacterCard {
@@ -304,6 +325,9 @@ impl CharacterCardService {
         user_id: &str,
         category: &str,
     ) -> XueliResult<()> {
+        if !self.config.enabled {
+            return Ok(());
+        }
         let normalized = category.trim();
         if normalized.is_empty() {
             return Ok(());
@@ -319,6 +343,18 @@ impl CharacterCardService {
     }
 
     pub fn record_interaction_signal(&self, user_id: &str, signal_name: &str) -> XueliResult<()> {
+        self.record_interaction_signal_weighted(user_id, signal_name, 1)
+    }
+
+    pub fn record_interaction_signal_weighted(
+        &self,
+        user_id: &str,
+        signal_name: &str,
+        weight: i32,
+    ) -> XueliResult<()> {
+        if !self.config.enabled {
+            return Ok(());
+        }
         let normalized = signal_name.trim();
         if normalized.is_empty() {
             return Ok(());
@@ -326,7 +362,7 @@ impl CharacterCardService {
         let mut payload = self.load_payload(user_id);
         payload.stable_signals.push(SignalEntry {
             signal: normalized.to_string(),
-            weight: 1,
+            weight: weight.max(1),
             created_at: chrono::Utc::now().to_rfc3339(),
         });
         self.save_payload(user_id, &payload);
@@ -400,6 +436,85 @@ impl CharacterCardService {
         }
         self.save_payload(user_id, &payload);
         Ok(())
+    }
+
+    /// 更新用户亲密度并返回关系画像
+    pub fn update_intimacy(
+        &self,
+        user_id: &str,
+        delta: f64,
+        is_friction: bool,
+    ) -> RelationshipProfileInternal {
+        if !self.config.relationship_tracking_enabled {
+            return RelationshipProfileInternal::default();
+        }
+        let mut profile = self.get_relationship_profile(user_id);
+        let previous_stage = if profile.relationship_stage.is_empty() {
+            "stranger".to_string()
+        } else {
+            profile.relationship_stage.clone()
+        };
+        profile.intimacy_level = (profile.intimacy_level + delta).clamp(0.0, 1.0);
+        profile.total_interactions += 1;
+        let now = chrono::Utc::now().to_rfc3339();
+        profile.last_interaction_at = now.clone();
+        profile.last_intimacy_change = now;
+        if is_friction {
+            profile.friction_signals += 1;
+        } else {
+            profile.friction_signals = profile.friction_signals.saturating_sub(1);
+        }
+        self.save_relationship_profile(user_id, &profile);
+        let current_stage = profile.relationship_stage.clone();
+        if previous_stage != current_stage {
+            tracing::info!(
+                "[关系] 用户 {} 关系阶段变更: {} → {} (亲密度{:.2} 互动{}次)",
+                user_id,
+                previous_stage,
+                current_stage,
+                profile.intimacy_level,
+                profile.total_interactions,
+            );
+        }
+        profile
+    }
+
+    /// 获取用户的关系画像
+    pub fn get_relationship_profile(&self, user_id: &str) -> RelationshipProfileInternal {
+        let payload = self.load_payload(user_id);
+        payload.relationship_profile.unwrap_or_default()
+    }
+
+    /// 保存关系画像
+    pub fn save_relationship_profile(
+        &self,
+        user_id: &str,
+        profile: &RelationshipProfileInternal,
+    ) {
+        if !self.config.relationship_tracking_enabled {
+            return;
+        }
+        let mut payload = self.load_payload(user_id);
+        let mut profile = profile.clone();
+        profile.update_stage_with_thresholds(&self.config.intimacy_thresholds);
+        profile.last_intimacy_change = chrono::Utc::now().to_rfc3339();
+        payload.relationship_profile = Some(profile);
+        self.save_payload(user_id, &payload);
+    }
+
+    /// 归一化预期效果值到允许的集合 {continue, satisfy, cool_down, clarify, none}
+    pub fn normalize_expected_effect(raw_effect: &str, allow_none: bool) -> String {
+        let allowed: &[&str] = if allow_none {
+            &["continue", "satisfy", "cool_down", "clarify", "none"]
+        } else {
+            &["continue", "satisfy", "cool_down", "clarify"]
+        };
+        let normalized = raw_effect.trim().to_lowercase();
+        if allowed.contains(&normalized.as_str()) {
+            normalized
+        } else {
+            String::new()
+        }
     }
 
     pub fn update_snapshot_signals(
@@ -552,6 +667,30 @@ impl CharacterCardService {
             None => return,
         };
 
+        // Incremental signal detection: skip if signal count delta < 3 and within 300s cooldown
+        {
+            let last_total = self
+                .adaptation_last_signal_count
+                .lock()
+                .unwrap()
+                .get(user_id)
+                .copied()
+                .unwrap_or(0);
+            let last_time = self
+                .adaptation_last_update
+                .lock()
+                .unwrap()
+                .get(user_id)
+                .copied();
+            let elapsed = last_time.map_or(f64::MAX, |t| t.elapsed().as_secs_f64());
+            if elapsed < 300.0 {
+                let current_total = self.get_total_raw_signals(user_id);
+                if current_total - last_total < 3 {
+                    return;
+                }
+            }
+        }
+
         let payload = self.build_adaptation_payload(user_id);
         let result = orchestrator
             .compute_character_adaptation_signal(&payload)
@@ -585,6 +724,22 @@ impl CharacterCardService {
             let mut cache = self.persona_hints_cache.lock().unwrap();
             cache.insert(user_id.to_string(), hints);
         }
+
+        // Update adaptation tracking
+        {
+            let current_total = self.get_total_raw_signals(user_id);
+            let mut counts = self.adaptation_last_signal_count.lock().unwrap();
+            counts.insert(user_id.to_string(), current_total);
+        }
+        {
+            let mut times = self.adaptation_last_update.lock().unwrap();
+            times.insert(user_id.to_string(), Instant::now());
+        }
+    }
+
+    fn get_total_raw_signals(&self, user_id: &str) -> i32 {
+        let payload = self.load_payload(user_id);
+        (payload.stable_signals.len() + payload.explicit_feedback.len()) as i32
     }
 
     pub fn get_cached_persona_hints(&self, user_id: &str) -> Option<PersonaHints> {
@@ -670,11 +825,14 @@ impl CharacterCardService {
         expected_effect: &str,
         prediction_met: Option<bool>,
     ) -> XueliResult<()> {
+        if !self.config.enabled {
+            return Ok(());
+        }
         let mut payload = self.load_payload(user_id);
         let now = chrono::Utc::now().to_rfc3339();
 
         let normalized_feedback = feedback_label.trim().to_lowercase();
-        let normalized_intent = intent_label.trim();
+        let normalized_intent = intent_label.trim().to_lowercase();
         let score_label = if score > 0.3 {
             "positive"
         } else if score < -0.3 {
@@ -713,14 +871,27 @@ impl CharacterCardService {
             });
         }
 
-        let normalized_expected = expected_effect.trim().to_lowercase();
+        let normalized_expected = Self::normalize_expected_effect(expected_effect, false);
         if !normalized_expected.is_empty() {
-            let actual = if score > 0.0 { "satisfy" } else { "clarify" };
-            payload.stable_signals.push(SignalEntry {
-                signal: format!("expected_actual:{}:{}", normalized_expected, actual),
-                weight: 1,
-                created_at: now.clone(),
-            });
+            if let Some(met) = prediction_met {
+                let suffix = if met { "met" } else { "failed" };
+                payload.stable_signals.push(SignalEntry {
+                    signal: format!("expected_effect:{}:{}", normalized_expected, suffix),
+                    weight: 1,
+                    created_at: now.clone(),
+                });
+            }
+            let actual = Self::normalize_expected_effect(
+                if score > 0.0 { "satisfy" } else { "clarify" },
+                true,
+            );
+            if !actual.is_empty() {
+                payload.stable_signals.push(SignalEntry {
+                    signal: format!("expected_actual:{}:{}", normalized_expected, actual),
+                    weight: 1,
+                    created_at: now.clone(),
+                });
+            }
         }
 
         if let Some(met) = prediction_met {
@@ -845,17 +1016,6 @@ impl CharacterCardService {
             FeedbackCategory::Preference
         } else {
             FeedbackCategory::Other
-        }
-    }
-
-    pub fn normalize_expected_effect(&self, raw_effect: &str) -> f64 {
-        match raw_effect.trim().to_lowercase().as_str() {
-            "very_positive" => 0.8,
-            "positive" => 0.5,
-            "neutral" => 0.0,
-            "negative" => -0.3,
-            "very_negative" => -0.6,
-            _ => 0.0,
         }
     }
 
@@ -1197,13 +1357,34 @@ mod tests {
 
     #[test]
     fn test_normalize_expected_effect() {
-        let (svc, _dir) = make_svc();
-        assert!((svc.normalize_expected_effect("very_positive") - 0.8).abs() < 0.001);
-        assert!((svc.normalize_expected_effect("positive") - 0.5).abs() < 0.001);
-        assert!((svc.normalize_expected_effect("neutral") - 0.0).abs() < 0.001);
-        assert!((svc.normalize_expected_effect("negative") - (-0.3)).abs() < 0.001);
-        assert!((svc.normalize_expected_effect("very_negative") - (-0.6)).abs() < 0.001);
-        assert!((svc.normalize_expected_effect("unknown") - 0.0).abs() < 0.001);
+        assert_eq!(
+            CharacterCardService::normalize_expected_effect("continue", false),
+            "continue"
+        );
+        assert_eq!(
+            CharacterCardService::normalize_expected_effect("satisfy", false),
+            "satisfy"
+        );
+        assert_eq!(
+            CharacterCardService::normalize_expected_effect("cool_down", false),
+            "cool_down"
+        );
+        assert_eq!(
+            CharacterCardService::normalize_expected_effect("clarify", false),
+            "clarify"
+        );
+        assert_eq!(
+            CharacterCardService::normalize_expected_effect("none", false),
+            ""
+        );
+        assert_eq!(
+            CharacterCardService::normalize_expected_effect("none", true),
+            "none"
+        );
+        assert_eq!(
+            CharacterCardService::normalize_expected_effect("unknown", false),
+            ""
+        );
     }
 
     #[test]
