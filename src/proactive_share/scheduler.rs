@@ -64,37 +64,6 @@ impl ProactiveShareScheduler {
         self
     }
 
-    /// 检查当前时间是否在可发送时间窗口内
-    fn within_time_range(&self) -> bool {
-        let (start_min, end_min) = match self.parse_time_range() {
-            Some(v) => v,
-            None => return true,
-        };
-        let now = chrono::Local::now().time();
-        let current_minutes = now.hour() as i32 * 60 + now.minute() as i32;
-        if end_min < start_min {
-            current_minutes >= start_min || current_minutes <= end_min
-        } else {
-            start_min <= current_minutes && current_minutes <= end_min
-        }
-    }
-
-    fn parse_time_range(&self) -> Option<(i32, i32)> {
-        let parts: Vec<&str> = self.time_range_start.split(':').collect();
-        if parts.len() != 2 {
-            return None;
-        }
-        let start_h: i32 = parts[0].parse().ok()?;
-        let start_m: i32 = parts[1].parse().ok()?;
-        let parts: Vec<&str> = self.time_range_end.split(':').collect();
-        if parts.len() != 2 {
-            return None;
-        }
-        let end_h: i32 = parts[0].parse().ok()?;
-        let end_m: i32 = parts[1].parse().ok()?;
-        Some((start_h * 60 + start_m, end_h * 60 + end_m))
-    }
-
     /// 启动定时调度循环
     pub async fn start(&self) {
         {
