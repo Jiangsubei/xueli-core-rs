@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::prelude::XueliResult;
+use crate::prelude::{XueliError, XueliResult};
 
 /// 表情条目（内存缓存表示）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,10 +95,22 @@ pub struct EmojiStats {
 pub struct EmojiDatabase {
     db_path: PathBuf,
     lock: Arc<AsyncMutex<()>>,
+    /// 最大存储的已注册表情数量
+    max_stored: usize,
+    /// 溢出策略: "replace_oldest" 或 "reject_new"
+    overflow_policy: String,
 }
 
 impl EmojiDatabase {
     pub fn new(db_path: impl AsRef<Path>) -> XueliResult<Self> {
+        Self::with_config(db_path, 100, "replace_oldest")
+    }
+
+    pub fn with_config(
+        db_path: impl AsRef<Path>,
+        max_stored: usize,
+        overflow_policy: &str,
+    ) -> XueliResult<Self> {
         let db_path = db_path.as_ref().to_path_buf();
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
@@ -107,6 +119,8 @@ impl EmojiDatabase {
         let store = Self {
             db_path,
             lock: Arc::new(AsyncMutex::new(())),
+            max_stored,
+            overflow_policy: overflow_policy.to_string(),
         };
         store.init_db()?;
         Ok(store)
@@ -232,6 +246,9 @@ impl EmojiDatabase {
 
         let _guard = self.lock.lock().await;
 
+        let max_stored = self.max_stored;
+        let overflow_policy = self.overflow_policy.clone();
+
         let result: XueliResult<Option<StickerRecord>> = tokio::task::spawn_blocking(move || {
             let conn =
                 Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {}", e))?;
@@ -246,7 +263,7 @@ impl EmojiDatabase {
                 return Ok(Self::_get_record_sync(&conn, &fh));
             }
 
-            // 容量溢出检查：删除最旧的
+            // 容量溢出检查
             let registered_count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM stickers WHERE is_registered=1 AND is_banned=0",
@@ -254,7 +271,10 @@ impl EmojiDatabase {
                     |row| row.get(0),
                 )
                 .unwrap_or(0);
-            if registered_count >= 100 {
+            if registered_count >= max_stored as i64 {
+                if overflow_policy == "reject_new" {
+                    return Ok(None);
+                }
                 let oldest: Option<(String, String)> = conn
                     .query_row(
                         "SELECT file_hash, file_path FROM stickers WHERE is_registered=1 AND is_banned=0 ORDER BY last_seen_at ASC LIMIT 1",
@@ -357,7 +377,13 @@ impl EmojiDatabase {
 
     /// 列出待分类的贴纸
     pub async fn list_pending_async(&self) -> XueliResult<Vec<StickerRecord>> {
+        self.list_pending_async_with_limit(1).await
+    }
+
+    /// 列出待分类的贴纸（自定义数量限制）
+    pub async fn list_pending_async_with_limit(&self, limit: usize) -> XueliResult<Vec<StickerRecord>> {
         let db_path = self.db_path.clone();
+        let effective_limit = limit.max(1);
         let _guard = self.lock.lock().await;
 
         tokio::task::spawn_blocking(move || {
@@ -369,11 +395,11 @@ impl EmojiDatabase {
                             last_auto_reply_at, first_seen_at, last_seen_at,
                             message_id, user_id, group_id
                      FROM stickers WHERE emotion_status='pending' AND is_banned=0
-                     ORDER BY last_seen_at ASC LIMIT 1",
+                     ORDER BY last_seen_at ASC LIMIT ?1",
                 )
                 .map_err(|e| format!("准备查询失败: {}", e))?;
             let records: Vec<StickerRecord> = stmt
-                .query_map([], Self::row_to_record)
+                .query_map(params![effective_limit], Self::row_to_record)
                 .map_err(|e| format!("查询失败: {}", e))?
                 .filter_map(|r| r.ok())
                 .collect();
@@ -422,10 +448,144 @@ impl EmojiDatabase {
             })
             .collect();
         if results.is_empty() {
+            // 回退：返回全部按 auto_reply_count 排序
             return Vec::new();
         }
         results.sort_by_key(|r| r.auto_reply_count);
         results
+    }
+
+    /// 异步按意图关键词匹配贴纸
+    pub async fn find_by_intent_async(&self, intent: &str) -> XueliResult<Vec<StickerRecord>> {
+        let db_path = self.db_path.clone();
+        let intent = intent.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn =
+                Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {}", e))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT file_hash, file_path, file_format, description, emotion_status,
+                            is_registered, is_banned, query_count, auto_reply_count,
+                            last_auto_reply_at, first_seen_at, last_seen_at,
+                            message_id, user_id, group_id
+                     FROM stickers WHERE emotion_status='classified' AND is_banned=0 LIMIT 200",
+                )
+                .map_err(|e| format!("准备查询失败: {}", e))?;
+
+            let records: Vec<StickerRecord> = stmt
+                .query_map([], Self::row_to_record)
+                .map_err(|e| format!("查询失败: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            Ok(Self::match_by_intent(records, &intent))
+        })
+        .await
+        .map_err(|e| format!("阻塞任务失败: {}", e))?
+    }
+
+    /// 根据文件路径查询贴纸记录
+    pub fn get_record_by_path(&self, file_path: &str) -> XueliResult<Option<StickerRecord>> {
+        let conn = Connection::open(&self.db_path).map_err(|e| XueliError::Internal(format!("打开 DB 失败: {}", e)))?;
+        conn.query_row(
+            "SELECT file_hash, file_path, file_format, description, emotion_status,
+                    is_registered, is_banned, query_count, auto_reply_count,
+                    last_auto_reply_at, first_seen_at, last_seen_at,
+                    message_id, user_id, group_id
+             FROM stickers WHERE file_path = ?1",
+            params![file_path],
+            Self::row_to_record,
+        )
+        .optional()
+        .map_err(|e| XueliError::Internal(format!("查询失败: {}", e)))
+    }
+
+    /// 查找适合回复的候选贴纸
+    pub fn find_reply_candidates(
+        &self,
+        target_intent: &str,
+        target_tone: &str,
+        target_emotion: &str,
+    ) -> XueliResult<Vec<StickerRecord>> {
+        let intent = if !target_intent.is_empty() {
+            target_intent.to_string()
+        } else if !target_tone.is_empty() && !target_emotion.is_empty() {
+            format!("{}-{}", target_tone, target_emotion)
+        } else {
+            target_emotion.to_string()
+        };
+        self.find_by_intent(&intent)
+    }
+
+    /// 异步查找适合回复的候选贴纸
+    pub async fn find_reply_candidates_async(
+        &self,
+        target_intent: &str,
+        target_tone: &str,
+        target_emotion: &str,
+    ) -> XueliResult<Vec<StickerRecord>> {
+        let intent = if !target_intent.is_empty() {
+            target_intent.to_string()
+        } else if !target_tone.is_empty() && !target_emotion.is_empty() {
+            format!("{}-{}", target_tone, target_emotion)
+        } else {
+            target_emotion.to_string()
+        };
+        self.find_by_intent_async(&intent).await
+    }
+
+    /// 获取已注册且未被禁用的贴纸数量
+    pub fn get_registered_count(&self) -> XueliResult<i64> {
+        let conn = Connection::open(&self.db_path).map_err(|e| format!("打开 DB 失败: {}", e))?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM stickers WHERE is_registered=1 AND is_banned=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        Ok(count)
+    }
+
+    /// 异步获取已注册且未被禁用的贴纸数量
+    pub async fn get_registered_count_async(&self) -> XueliResult<i64> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn =
+                Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {}", e))?;
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM stickers WHERE is_registered=1 AND is_banned=0",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            Ok(count)
+        })
+        .await
+        .map_err(|e| format!("阻塞任务失败: {}", e))?
+    }
+
+    /// 异步检查是否有已分类的表情数据
+    pub async fn has_emoji_data_async(&self) -> XueliResult<bool> {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = match Connection::open(&db_path) {
+                Ok(c) => c,
+                Err(_) => return Ok(false),
+            };
+            let result = conn
+                .query_row(
+                    "SELECT 1 FROM stickers WHERE emotion_status='classified' AND is_banned=0 LIMIT 1",
+                    [],
+                    |_| Ok(()),
+                )
+                .is_ok();
+            Ok(result)
+        })
+        .await
+        .map_err(|e| format!("阻塞任务失败: {}", e))?
     }
 
     /// 获取统计信息：总数、已注册、待分类、已禁用

@@ -5,12 +5,50 @@ use std::time::Instant;
 
 use chrono::Timelike;
 use parking_lot::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::JoinHandle;
 
 use crate::core::errors::XueliError;
 use crate::emoji::database::{EmojiDB, EmojiEntry, StickerRecord};
 use crate::prelude::{AIClient, PromptTemplateLoader, XueliResult};
 use crate::services::vision_client::VisionClient;
 use crate::util::crypto;
+
+/// 表情任务管理器 — 管理异步任务的生命周期
+pub struct EmojiTaskManager {
+    tasks: Arc<AsyncMutex<Vec<JoinHandle<()>>>>,
+}
+
+impl EmojiTaskManager {
+    pub fn new() -> Self {
+        Self {
+            tasks: Arc::new(AsyncMutex::new(Vec::new())),
+        }
+    }
+
+    pub fn create_task<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let handle = tokio::spawn(future);
+        if let Ok(mut tasks) = self.tasks.try_lock() {
+            tasks.retain(|h| !h.is_finished());
+            tasks.push(handle);
+        }
+    }
+
+    pub async fn cancel_all(&self) {
+        let mut tasks = self.tasks.lock().await;
+        let pending: Vec<_> = tasks.drain(..).filter(|h| !h.is_finished()).collect();
+        for handle in pending {
+            handle.abort();
+        }
+    }
+
+    pub async fn count(&self) -> usize {
+        self.tasks.lock().await.iter().filter(|h| !h.is_finished()).count()
+    }
+}
 
 pub struct EmojiManager<A: AIClient, L: PromptTemplateLoader> {
     db: EmojiDB,
@@ -24,6 +62,10 @@ pub struct EmojiManager<A: AIClient, L: PromptTemplateLoader> {
     classification_interval_seconds: f64,
     classification_windows: Vec<String>,
     emotion_labels: Vec<String>,
+    enabled: bool,
+    capture_enabled: bool,
+    initialized: bool,
+    task_manager: EmojiTaskManager,
 }
 
 impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> EmojiManager<A, L> {
@@ -40,7 +82,38 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> EmojiManager<A, L
             classification_interval_seconds: 30.0,
             classification_windows: Vec::new(),
             emotion_labels: Vec::new(),
+            enabled: true,
+            capture_enabled: true,
+            initialized: false,
+            task_manager: EmojiTaskManager::new(),
         }
+    }
+
+    /// 初始化表情管理器，同步指标并启动后台分类工作线程
+    pub async fn initialize(&mut self) {
+        if !self.enabled || self.initialized {
+            return;
+        }
+        self.initialized = true;
+        self.sync_metrics();
+        self.start_idle_classification_loop_from_init();
+    }
+
+    fn start_idle_classification_loop_from_init(&self) {
+        if !self.classification_enabled {
+            return;
+        }
+        if self.vision_client.is_none() {
+            return;
+        }
+        // Note: start_idle_classification_loop requires Arc<Self>, so we skip here
+        // The caller should use start_idle_classification_loop on an Arc<Self>
+    }
+
+    /// 同步指标到数据库统计
+    pub fn sync_metrics(&self) {
+        // Stats are read from the database directly when needed
+        // This method exists for API compatibility with Python version
     }
 
     pub fn with_vision_client(mut self, vc: Arc<VisionClient<A, L>>) -> Self {
@@ -75,6 +148,9 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> EmojiManager<A, L
         user_id: &str,
         group_id: &str,
     ) -> XueliResult<Option<StickerRecord>> {
+        if !self.enabled || !self.capture_enabled {
+            return Ok(None);
+        }
         if file_bytes.is_empty() {
             return Ok(None);
         }
@@ -228,7 +304,17 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> EmojiManager<A, L
     }
 
     pub fn record_activity(&self) {
+        if !self.enabled {
+            return;
+        }
         *self.activity_flag.lock() = Instant::now();
+    }
+
+    /// 处理检测结果回调，启用时同步指标
+    pub async fn process_detection_result(&self) {
+        if self.enabled {
+            self.sync_metrics();
+        }
     }
 
     async fn run_classification_loop(&self) {

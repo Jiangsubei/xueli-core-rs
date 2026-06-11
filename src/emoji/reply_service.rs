@@ -101,6 +101,8 @@ impl<L: PromptTemplateLoader> EmojiReplyService<L> {
         assistant_reply: &str,
         reply_context: &HashMap<String, serde_json::Value>,
         trace_id: &str,
+        intent_reference: &str,
+        window_messages: Option<&Vec<serde_json::Value>>,
     ) -> XueliResult<Option<EmojiReplySelection>> {
         if !self.enabled() {
             return Ok(Some(EmojiReplySelection {
@@ -141,7 +143,7 @@ impl<L: PromptTemplateLoader> EmojiReplyService<L> {
         }
 
         let decision = self
-            .decide_reply_intent(user_message, assistant_reply, reply_context, trace_id)
+            .decide_reply_intent(user_message, assistant_reply, reply_context, trace_id, intent_reference, window_messages)
             .await?;
 
         if !decision.should_send {
@@ -212,6 +214,24 @@ impl<L: PromptTemplateLoader> EmojiReplyService<L> {
         session: &SessionRef,
     ) -> Option<ReplyAction> {
         let emoji_id = selection.file_ids.first()?;
+        // 尝试读取贴纸文件获取路径
+        let record = self.emoji_database.sync_get_record(emoji_id);
+        if let Some(ref rec) = record {
+            if !rec.file_path.is_empty() && std::path::Path::new(&rec.file_path).exists() {
+                match std::fs::read(&rec.file_path) {
+                    Ok(_file_bytes) => {
+                        return Some(ReplyAction {
+                            scope: session.scope.clone(),
+                            text: String::new(),
+                            reply_to: None,
+                            image_url: None,
+                            emoji_id: Some(format!("sticker:{}", emoji_id)),
+                        });
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
         Some(ReplyAction {
             scope: session.scope.clone(),
             text: String::new(),
@@ -262,14 +282,20 @@ impl<L: PromptTemplateLoader> EmojiReplyService<L> {
         assistant_reply: &str,
         reply_context: &HashMap<String, serde_json::Value>,
         _trace_id: &str,
+        intent_reference: &str,
+        window_messages: Option<&Vec<serde_json::Value>>,
     ) -> XueliResult<EmojiReplyDecision> {
-        let window_messages = reply_context
-            .get("window_messages")
-            .and_then(|v| v.as_array())
-            .map(|a| a.to_vec())
+        let window_messages_val = window_messages
+            .cloned()
+            .or_else(|| {
+                reply_context
+                    .get("window_messages")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.to_vec())
+            })
             .unwrap_or_default();
         let recent_window: Vec<&serde_json::Value> =
-            window_messages.iter().rev().take(4).rev().collect();
+            window_messages_val.iter().rev().take(4).rev().collect();
 
         let mut context_parts = Vec::new();
         for item in &recent_window {
@@ -288,6 +314,10 @@ impl<L: PromptTemplateLoader> EmojiReplyService<L> {
         let mut parts: Vec<String> = Vec::new();
         parts.push(format!("【用户消息】\n{}", user_message));
         parts.push(format!("【助手回复】\n{}", assistant_reply));
+
+        if !intent_reference.is_empty() {
+            parts.push(format!("【表情参考】\n{}", intent_reference));
+        }
 
         if !recent_window.is_empty() {
             let mut context_lines = Vec::new();
