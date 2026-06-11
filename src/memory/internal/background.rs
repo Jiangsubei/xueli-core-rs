@@ -15,8 +15,9 @@ use crate::memory::stores::memory_item::SqliteMemoryItemStore;
 use crate::memory::stores::traits::MemoryStore;
 use crate::prelude::XueliResult;
 use crate::traits::ai_client::{AIClient, ChatCompletionRequest, ChatMessage};
+use crate::traits::prompt_template::PromptTemplateLoader;
 
-pub struct MemoryBackgroundCoordinator {
+pub struct MemoryBackgroundCoordinator<L: PromptTemplateLoader + 'static> {
     config: Arc<MemoryConfig>,
 
     conversation_store: Option<Arc<SqliteConversationStore>>,
@@ -27,6 +28,7 @@ pub struct MemoryBackgroundCoordinator {
     person_fact_service: Option<Arc<PersonFactService>>,
     summary_service: Option<Arc<ChatSummaryService>>,
     llm_client: Option<Arc<dyn AIClient>>,
+    prompt_loader: Arc<L>,
 
     on_digest_tick: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>>,
     on_memory_changed: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>>,
@@ -47,8 +49,8 @@ pub struct MemoryBackgroundCoordinator {
     self_weak: Weak<Self>,
 }
 
-impl MemoryBackgroundCoordinator {
-    pub fn new(config: Arc<MemoryConfig>, task_manager: Arc<MemoryTaskManager>) -> Self {
+impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
+    pub fn new(config: Arc<MemoryConfig>, task_manager: Arc<MemoryTaskManager>, prompt_loader: Arc<L>) -> Self {
         Self {
             auto_extract_memory: config.auto_extract,
             config,
@@ -60,6 +62,7 @@ impl MemoryBackgroundCoordinator {
             person_fact_service: None,
             summary_service: None,
             llm_client: None,
+            prompt_loader,
             on_digest_tick: Arc::new(Mutex::new(None)),
             on_memory_changed: Arc::new(Mutex::new(None)),
             on_insight_generated: Arc::new(Mutex::new(None)),
@@ -283,24 +286,42 @@ impl MemoryBackgroundCoordinator {
         narrative_summary: &str,
         source_platform: &str,
     ) {
-        if let Some(ref store) = self.conversation_store {
+        let registration = if let Some(ref store) = self.conversation_store {
             let timestamp = chrono::Utc::now().timestamp();
             let user_msg =
                 MessageRecord::user(user_id, user_id, user_message, timestamp, message_id);
             let assistant_msg = MessageRecord::assistant(assistant_message, timestamp);
-            if let Err(e) = store.add_turn(session_id, &user_msg, &assistant_msg).await {
-                tracing::warn!("[后台协调] 添加对话轮次失败: {}", e);
+            match store.add_turn(session_id, &user_msg, &assistant_msg).await {
+                Ok(reg) => Some(reg),
+                Err(e) => {
+                    tracing::warn!("[后台协调] 添加对话轮次失败: {}", e);
+                    None
+                }
             }
-        }
+        } else {
+            None
+        };
 
         if let Ok(mut buf) = self.extractor_buffer.lock() {
+            let resolved_session_id = registration
+                .as_ref()
+                .map(|r| r.session_id.as_str())
+                .unwrap_or(session_id);
+            let resolved_dialogue_key = registration
+                .as_ref()
+                .map(|r| r.dialogue_key.as_str())
+                .unwrap_or(dialogue_key);
+            let resolved_turn_id = registration
+                .as_ref()
+                .map(|r| r.turn_id as usize)
+                .unwrap_or(turn_id);
             buf.add_dialogue_turn(
                 user_id,
                 user_message,
                 assistant_message,
-                session_id,
-                turn_id,
-                dialogue_key,
+                resolved_session_id,
+                resolved_turn_id,
+                resolved_dialogue_key,
                 message_type,
                 group_id,
                 message_id,
@@ -309,15 +330,53 @@ impl MemoryBackgroundCoordinator {
             );
         }
 
+        // 若会话关闭则触发保存
+        if let Some(ref reg) = registration {
+            if !reg.closed_session_id.is_empty() {
+                let closed_user_id = if reg.closed_session_user_id.is_empty() {
+                    user_id.to_string()
+                } else {
+                    reg.closed_session_user_id.clone()
+                };
+                self.schedule_conversation_save(
+                    closed_user_id,
+                    reg.closed_session_id.clone(),
+                );
+            }
+        }
+
         tracing::info!(
             "[后台协调] 已登记对话轮次：用户={}，会话={}，轮次={}",
             user_id,
-            session_id,
-            turn_id,
+            registration.as_ref().map(|r| r.session_id.as_str()).unwrap_or(session_id),
+            registration.as_ref().map(|r| r.turn_id).unwrap_or(turn_id as i64),
         );
     }
 
     // ── Memory Extraction ───────────────────────────────────────
+
+    /// 解析会话 ID：优先使用传入值，否则从会话存储获取活跃会话 ID
+    pub fn resolve_session_id(
+        &self,
+        user_id: &str,
+        dialogue_key: Option<&str>,
+        message_type: &str,
+        group_id: Option<&str>,
+        session_id: Option<&str>,
+        platform: &str,
+    ) -> String {
+        if let Some(sid) = session_id {
+            let trimmed = sid.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        if let Some(ref store) = self.conversation_store {
+            store.get_active_session_id(user_id, dialogue_key, message_type, group_id, platform)
+        } else {
+            String::new()
+        }
+    }
 
     pub async fn maybe_extract_memories(&self, user_id: &str, session_id: &str) -> Vec<MemoryItem> {
         if !self.auto_extract_memory {
@@ -445,8 +504,8 @@ impl MemoryBackgroundCoordinator {
         }
 
         let conversation = messages.join("\n");
-        let system_prompt = build_extraction_system_prompt();
-        let user_prompt = build_extraction_user_prompt(&conversation);
+        let system_prompt = self.build_extraction_system_prompt().await;
+        let user_prompt = self.build_extraction_user_prompt(&conversation).await;
 
         let chat_messages = vec![
             ChatMessage::text("system", &system_prompt),
@@ -719,7 +778,7 @@ impl MemoryBackgroundCoordinator {
             .collect();
 
         let user_prompt = format!("【近期记忆】\n{}", memory_lines.join("\n"));
-        let system_prompt = INSIGHT_SYSTEM_PROMPT.to_string();
+        let system_prompt = self.build_insight_system_prompt().await;
 
         let chat_messages = vec![
             ChatMessage::text("system", &system_prompt),
@@ -1009,12 +1068,16 @@ impl MemoryBackgroundCoordinator {
             }
         }
     }
-}
 
-// ── Helpers ──────────────────────────────────────────────────────
+    // ── Prompt Building (using PromptTemplateLoader) ────────────
 
-fn build_extraction_system_prompt() -> String {
-    r#"你是一个记忆提取助手。从对话中提取关于用户的有意义信息。
+    /// 构建记忆提取系统提示词 — 优先从模板加载，失败则兜底
+    async fn build_extraction_system_prompt(&self) -> String {
+        if let Ok(template) = self.prompt_loader.get_template("zh-CN", "memory_extraction").await {
+            return template;
+        }
+        // 兜底
+        r#"你是一个记忆提取助手。从对话中提取关于用户的有意义信息。
 
 提取规则：
 - 只提取关于用户的事实、偏好、经历或观点
@@ -1038,15 +1101,46 @@ fn build_extraction_system_prompt() -> String {
 ```
 
 只输出 JSON，不要额外说明。"#
-    .to_string()
+        .to_string()
+    }
+
+    /// 构建记忆提取用户提示词 — 优先从模板加载，失败则兜底
+    async fn build_extraction_user_prompt(&self, conversation: &str) -> String {
+        if let Ok(template) = self.prompt_loader.get_template("zh-CN", "memory_extraction_user").await {
+            let vars = std::collections::HashMap::from([("conversation", conversation)]);
+            return self.prompt_loader.render(&template, &vars);
+        }
+        // 兜底
+        format!(
+            "请从以下对话中提取关于用户的值得记住的信息：\n\n```\n{}\n```\n\n请输出 JSON。",
+            conversation
+        )
+    }
+
+    /// 构建 insight 消化系统提示词 — 优先从模板加载，失败则兜底
+    async fn build_insight_system_prompt(&self) -> String {
+        if let Ok(template) = self.prompt_loader.get_template("zh-CN", "insight_digestion").await {
+            return template;
+        }
+        // 兜底
+        r#"你是记忆分析助手。分析近期记忆，判断是否有可提炼的深层洞察。
+
+输出 JSON 格式：
+```json
+{
+  "has_insight": true,
+  "content": "洞察内容（一句简洁的陈述）",
+  "confidence": 0.8
+}
+```
+
+如果近期记忆中没有值得提炼的洞察，has_insight 设为 false。
+只输出 JSON，不要额外说明。"#
+        .to_string()
+    }
 }
 
-fn build_extraction_user_prompt(conversation: &str) -> String {
-    format!(
-        "请从以下对话中提取关于用户的值得记住的信息：\n\n```\n{}\n```\n\n请输出 JSON。",
-        conversation
-    )
-}
+// ── Helpers ──────────────────────────────────────────────────────
 
 fn parse_extraction_response(content: &str, user_id: &str) -> XueliResult<MemoryPatch> {
     let text = content.trim();
@@ -1237,25 +1331,18 @@ fn cluster_by_topic(memories: &[MemoryItem], min_similarity: f64) -> Vec<Vec<Mem
     clusters
 }
 
-// ── Hardcoded prompt fallbacks ──────────────────────────────────
-
-const INSIGHT_SYSTEM_PROMPT: &str = r#"你是记忆分析助手。分析近期记忆，判断是否有可提炼的深层洞察。
-
-输出 JSON 格式：
-```json
-{
-  "has_insight": true,
-  "content": "洞察内容（一句简洁的陈述）",
-  "confidence": 0.8
-}
-```
-
-如果近期记忆中没有值得提炼的洞察，has_insight 设为 false。
-只输出 JSON，不要额外说明。"#;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::prompt_loader::NoopPromptTemplateLoader;
+
+    type TestCoordinator = MemoryBackgroundCoordinator<NoopPromptTemplateLoader>;
+
+    fn make_coordinator() -> TestCoordinator {
+        let config = Arc::new(MemoryConfig::default());
+        let task_mgr = Arc::new(MemoryTaskManager::new());
+        MemoryBackgroundCoordinator::new(config, task_mgr, Arc::new(NoopPromptTemplateLoader))
+    }
 
     #[test]
     fn test_extract_json_from_text_plain() {
@@ -1395,17 +1482,13 @@ mod tests {
 
     #[test]
     fn test_coordinator_construction() {
-        let config = Arc::new(MemoryConfig::default());
-        let task_mgr = Arc::new(MemoryTaskManager::new());
-        let coordinator = MemoryBackgroundCoordinator::new(config, task_mgr);
+        let coordinator = make_coordinator();
         assert!(!coordinator.is_running());
     }
 
     #[test]
     fn test_coordinator_builder() {
-        let config = Arc::new(MemoryConfig::default());
-        let task_mgr = Arc::new(MemoryTaskManager::new());
-        let coordinator = MemoryBackgroundCoordinator::new(config, task_mgr)
+        let coordinator = make_coordinator()
             .with_auto_extract(true)
             .with_consolidation_enabled(true)
             .with_merge_enabled(true)
@@ -1420,9 +1503,7 @@ mod tests {
 
     #[test]
     fn test_coordinator_callbacks() {
-        let config = Arc::new(MemoryConfig::default());
-        let task_mgr = Arc::new(MemoryTaskManager::new());
-        let coordinator = MemoryBackgroundCoordinator::new(config, task_mgr);
+        let coordinator = make_coordinator();
 
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let f1 = flag.clone();
@@ -1435,9 +1516,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_start_stop() {
-        let config = Arc::new(MemoryConfig::default());
-        let task_mgr = Arc::new(MemoryTaskManager::new());
-        let coordinator = MemoryBackgroundCoordinator::new(config, task_mgr).into_arc();
+        let coordinator = make_coordinator().into_arc();
         assert!(!coordinator.is_running());
         coordinator.start(60);
         tokio::time::sleep(Duration::from_millis(50)).await;

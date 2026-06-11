@@ -116,6 +116,29 @@ fn score_match(query: &str, content: &str) -> f64 {
     substring_score.max(overlap_score)
 }
 
+/// 判断两条记忆是否为同一内容（归一化后子串包含且重叠率足够高）
+fn is_same_memory(left: &str, right: &str) -> bool {
+    let nl = normalize_text(left);
+    let nr = normalize_text(right);
+    if nl.is_empty() || nr.is_empty() {
+        return false;
+    }
+    if nl == nr {
+        return true;
+    }
+    // 较短者至少 3 字符，否则不认为相同
+    let shorter_len = nl.chars().count().min(nr.chars().count());
+    if shorter_len < 3 {
+        return false;
+    }
+    // 子串包含关系
+    if nl.contains(&nr) || nr.contains(&nl) {
+        let longer_len = nl.chars().count().max(nr.chars().count());
+        return shorter_len as f64 / longer_len.max(1) as f64 >= 0.5;
+    }
+    false
+}
+
 impl ImportantMemoryStore {
     pub fn new(db_dir: &std::path::Path) -> XueliResult<Self> {
         std::fs::create_dir_all(db_dir).map_err(|e| format!("无法创建目录: {e}"))?;
@@ -226,6 +249,57 @@ impl ImportantMemoryStore {
         let priority = priority.max(1);
         let metadata_json = metadata_json.unwrap_or("{}").to_string();
         let now = Utc::now();
+
+        // 去重检查
+        let existing = self.get_memories(&user_id, 1).await?;
+        for mem in &existing {
+            if is_same_memory(&mem.content, &content) {
+                // 合并：保留较高优先级和较长内容
+                let new_priority = mem.priority.max(priority);
+                let new_content = if content.len() > mem.content.len() {
+                    content.clone()
+                } else {
+                    mem.content.clone()
+                };
+                let new_source = if source.is_empty() || mem.source == "unknown" {
+                    source.clone()
+                } else {
+                    mem.source.clone()
+                };
+                // 更新现有记录
+                let conn = Arc::clone(&self.conn);
+                let mem_id = mem.id.clone();
+                let now_iso = now.to_rfc3339();
+                let new_content_clone = new_content.clone();
+                let new_source_clone = new_source.clone();
+                tokio::task::spawn_blocking(move || -> XueliResult<()> {
+                    let conn = conn.lock().map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+                    conn.execute(
+                        "UPDATE important_memories SET content=?1, source=?2, priority=?3, updated_at=?4 WHERE id=?5",
+                        params![new_content_clone, new_source_clone, new_priority, now_iso, mem_id],
+                    )
+                    .map_err(|e| XueliError::Database(format!("更新失败: {e}")))?;
+                    Ok(())
+                })
+                .await
+                .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))??;
+                return Ok(Some(ImportantMemory {
+                    id: mem.id.clone(),
+                    user_id: user_id.clone(),
+                    content: new_content,
+                    priority: new_priority,
+                    score: mem.score,
+                    created_at: mem.created_at,
+                    updated_at: now,
+                    source: new_source,
+                    metadata_json: mem.metadata_json.clone(),
+                    recall_count: mem.recall_count,
+                    last_recalled_at: mem.last_recalled_at,
+                }));
+            }
+        }
+
+        // 新建记忆
         let mem_id = format!(
             "imp_{}_{:04x}",
             now.format("%Y%m%d%H%M%S"),
@@ -467,6 +541,133 @@ impl ImportantMemoryStore {
                 )
                 .map_err(|e| XueliError::Database(format!("更新失败: {e}")))?;
             Ok(affected > 0)
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
+    }
+
+    /// 按内容子串删除记忆（对应 Python 版 delete_memory by content_substring）
+    pub async fn delete_memory_by_content(&self, user_id: &str, content_substring: &str) -> XueliResult<bool> {
+        let user_id = user_id.to_string();
+        let pattern = format!("%{}%", content_substring);
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            let affected = conn
+                .execute(
+                    "DELETE FROM important_memories WHERE user_id = ?1 AND content LIKE ?2",
+                    params![user_id, pattern],
+                )
+                .map_err(|e| XueliError::Database(format!("删除失败: {e}")))?;
+            Ok(affected > 0)
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
+    }
+
+    /// 按 ID 删除记忆（对应 Python 版 delete_memory_by_id）
+    pub async fn delete_memory_by_id(&self, user_id: &str, mem_id: &str) -> XueliResult<bool> {
+        let user_id = user_id.to_string();
+        let mem_id = mem_id.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            let affected = conn
+                .execute(
+                    "DELETE FROM important_memories WHERE user_id = ?1 AND id = ?2",
+                    params![user_id, mem_id],
+                )
+                .map_err(|e| XueliError::Database(format!("删除失败: {e}")))?;
+            Ok(affected > 0)
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
+    }
+
+    /// 获取所有用户 ID（对应 Python 版 get_user_ids）
+    pub async fn get_user_ids(&self) -> XueliResult<Vec<String>> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<Vec<String>> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            let mut stmt = conn
+                .prepare("SELECT DISTINCT user_id FROM important_memories ORDER BY user_id")
+                .map_err(|e| XueliError::Database(format!("准备查询失败: {e}")))?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| XueliError::Database(format!("查询失败: {e}")))?
+                .filter_map(|r| r.ok())
+                .filter(|s| !s.is_empty())
+                .collect();
+            Ok(ids)
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
+    }
+
+    /// 搜索记忆（支持 min_score/min_priority 过滤，对应 Python 版完整签名）
+    pub async fn search_memories_filtered(
+        &self,
+        user_id: &str,
+        query: &str,
+        top_k: usize,
+        min_priority: i32,
+        min_score: f64,
+    ) -> XueliResult<Vec<ImportantMemory>> {
+        let memories = self.get_memories(user_id, min_priority).await?;
+        let mut matched: Vec<ImportantMemory> = Vec::new();
+        for memory in memories {
+            let score = score_match(query, &memory.content);
+            if score < min_score {
+                continue;
+            }
+            matched.push(ImportantMemory {
+                score,
+                ..memory
+            });
+        }
+        matched.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.priority.cmp(&a.priority))
+                .then_with(|| b.created_at.cmp(&a.created_at))
+        });
+        matched.truncate(top_k);
+        Ok(matched)
+    }
+
+    /// 批量标记重要记忆被召回（对应 Python 版 mark_recalled with user_id）
+    pub async fn mark_recalled_batch(&self, user_id: &str, memory_ids: &[String]) -> XueliResult<usize> {
+        let user_id = user_id.to_string();
+        let ids: Vec<String> = memory_ids.iter().filter(|s| !s.trim().is_empty()).cloned().collect();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<usize> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            let now = Utc::now().to_rfc3339();
+            let mut updated = 0usize;
+            for mem_id in &ids {
+                let affected = conn
+                    .execute(
+                        "UPDATE important_memories SET recall_count = recall_count + 1, last_recalled_at = ?1, updated_at = ?2 WHERE id = ?3 AND user_id = ?4",
+                        params![now, now, mem_id, user_id],
+                    )
+                    .map_err(|e| XueliError::Database(format!("标记召回失败: {e}")))?;
+                if affected > 0 {
+                    updated += 1;
+                }
+            }
+            Ok(updated)
         })
         .await
         .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?

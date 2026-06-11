@@ -125,10 +125,69 @@ impl MessageRecord {
     }
 }
 
+/// add_turn 返回的注册信息 — 对应 Python 版 ConversationTurnRegistration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationTurnRegistration {
+    pub session_id: String,
+    pub turn_id: i64,
+    pub turn_count: i64,
+    pub user_id: String,
+    pub dialogue_key: String,
+    #[serde(default)]
+    pub closed_session_id: String,
+    #[serde(default)]
+    pub closed_session_user_id: String,
+}
+
+/// 内存中的会话 turn 数据
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationTurnData {
+    pub turn_id: i64,
+    pub user_message: String,
+    pub assistant_message: String,
+    pub timestamp: String,
+    pub source_message_id: String,
+    pub source_group_id: String,
+    pub source_platform: String,
+    pub owner_user_id: String,
+    pub source_message_type: String,
+    pub dialogue_key: String,
+    pub image_description: String,
+}
+
+/// 内存中的会话记录 — 对应 Python 版 ConversationRecord
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRecord {
+    pub session_id: String,
+    pub dialogue_key: String,
+    pub user_id: String,
+    pub message_type: String,
+    pub group_id: String,
+    pub started_at: String,
+    pub updated_at: String,
+    pub closed_at: String,
+    pub turns: Vec<ConversationTurnData>,
+    pub metadata: HashMap<String, String>,
+    #[serde(default)]
+    pub dirty_turns: i64,
+}
+
+impl SessionRecord {
+    pub fn turn_count(&self) -> i64 {
+        self.turns.len() as i64
+    }
+}
+
 pub struct SqliteConversationStore {
     conn: Mutex<Connection>,
     db_path: PathBuf,
     _write_sem: Semaphore,
+    /// 内存中的活跃会话缓存（session_id → SessionRecord）
+    sessions: Mutex<HashMap<String, SessionRecord>>,
+    /// dialogue_key → 活跃 session_id 的映射
+    active_session_by_dialogue: Mutex<HashMap<String, String>>,
+    /// 会话超时秒数
+    session_timeout_seconds: u64,
 }
 
 const INIT_SCHEMA: &str = r#"
@@ -229,6 +288,10 @@ CREATE INDEX IF NOT EXISTS idx_pm_message_id
 
 impl SqliteConversationStore {
     pub fn open(db_dir: &Path) -> XueliResult<Self> {
+        Self::open_with_timeout(db_dir, 3600)
+    }
+
+    pub fn open_with_timeout(db_dir: &Path, session_timeout_seconds: u64) -> XueliResult<Self> {
         std::fs::create_dir_all(db_dir).map_err(|e| format!("无法创建目录: {e}"))?;
         let db_path = db_dir.join("conversations.db");
 
@@ -246,6 +309,9 @@ impl SqliteConversationStore {
             conn: Mutex::new(conn),
             db_path,
             _write_sem: Semaphore::new(5),
+            sessions: Mutex::new(HashMap::new()),
+            active_session_by_dialogue: Mutex::new(HashMap::new()),
+            session_timeout_seconds: session_timeout_seconds.max(1),
         })
     }
 
@@ -460,8 +526,8 @@ impl SqliteConversationStore {
         session_id: &str,
         user_msg: &MessageRecord,
         assistant_msg: &MessageRecord,
-    ) -> XueliResult<()> {
-        let session_id = session_id.to_string();
+    ) -> XueliResult<ConversationTurnRegistration> {
+        let session_id_owned = session_id.to_string();
         let user_id = user_msg.user_id.clone();
         let user_json = serde_json::to_string(user_msg).map_err(|e| format!("序列化失败: {e}"))?;
         let assistant_json =
@@ -470,45 +536,279 @@ impl SqliteConversationStore {
         let source_msg_id = user_msg.message_id.clone();
         let db_path = self.db_path.clone();
 
+        // 更新内存缓存
+        let (turn_id, turn_count, dialogue_key) = {
+            let mut sessions = self.sessions.lock().map_err(|e| format!("锁错误: {e}"))?;
+            let mut by_dialogue = self
+                .active_session_by_dialogue
+                .lock()
+                .map_err(|e| format!("锁错误: {e}"))?;
+
+            let now = chrono::Utc::now().to_rfc3339();
+            let resolved_dk = Self::parse_session_id(&session_id_owned)
+                .map(|(_, dk, _, _)| dk)
+                .unwrap_or_else(|| session_id_owned.clone());
+
+            let session = sessions.entry(session_id_owned.clone()).or_insert_with(|| {
+                by_dialogue.insert(resolved_dk.clone(), session_id_owned.clone());
+                SessionRecord {
+                    session_id: session_id_owned.clone(),
+                    dialogue_key: resolved_dk,
+                    user_id: user_id.clone(),
+                    message_type: "private".to_string(),
+                    group_id: String::new(),
+                    started_at: now.clone(),
+                    updated_at: now.clone(),
+                    closed_at: String::new(),
+                    turns: Vec::new(),
+                    metadata: HashMap::new(),
+                    dirty_turns: 0,
+                }
+            });
+
+            let tid = session.turns.len() as i64 + 1;
+            let dk = session.dialogue_key.clone();
+            session.turns.push(ConversationTurnData {
+                turn_id: tid,
+                user_message: user_msg.message_text.clone(),
+                assistant_message: assistant_msg.message_text.clone(),
+                timestamp: now.clone(),
+                source_message_id: source_msg_id.clone(),
+                source_group_id: String::new(),
+                source_platform: String::new(),
+                owner_user_id: user_id.clone(),
+                source_message_type: "private".to_string(),
+                dialogue_key: dk.clone(),
+                image_description: String::new(),
+            });
+            session.updated_at = now;
+            session.metadata.insert(
+                "latest_message_id".to_string(),
+                source_msg_id.clone(),
+            );
+            session.dirty_turns += 1;
+
+            (tid, session.turn_count(), dk)
+        };
+
+        // 持久化到 SQLite
+        let sid_for_db = session_id_owned.clone();
+        let user_id_for_db = user_id.clone();
+        let user_id_for_result = user_id.clone();
         tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
 
             let now = chrono::Utc::now().to_rfc3339();
-            let (scope_key, dialogue_key) = Self::parse_session_id(&session_id)
+            let (scope_key, dk) = Self::parse_session_id(&sid_for_db)
                 .map(|(_, dk, _, _)| (dk.clone(), dk))
-                .unwrap_or((session_id.clone(), session_id.clone()));
+                .unwrap_or((sid_for_db.clone(), sid_for_db.clone()));
             conn.execute(
                 "INSERT OR IGNORE INTO conversation_sessions
                  (session_id, user_id, scope_key, message_type, group_id, platform, created_at, closed_at, turn_count, metadata, dialogue_key)
                  VALUES (?1, ?2, ?3, 'private', '', '', ?4, '', 0, '{}', ?5)",
-                params![session_id, user_id, scope_key, now, dialogue_key],
+                params![sid_for_db, user_id_for_db, scope_key, now, dk],
             )
             .map_err(|e| format!("创建会话失败: {e}"))?;
-
-            let current_count: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(MAX(turn_id), 0) FROM conversation_turns WHERE session_id = ?1",
-                    params![session_id],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-            let turn_id = current_count + 1;
 
             conn.execute(
                 "INSERT OR REPLACE INTO conversation_turns
                  (turn_id, session_id, user_msg_json, assistant_msg_json, timestamp, source_message_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![turn_id, session_id, user_json, assistant_json, timestamp, source_msg_id],
+                params![turn_id, sid_for_db, user_json, assistant_json, timestamp, source_msg_id],
             )
             .map_err(|e| format!("插入 turn 失败: {e}"))?;
 
             conn.execute(
                 "UPDATE conversation_sessions SET turn_count = ?1 WHERE session_id = ?2",
-                params![turn_id, session_id],
+                params![turn_id, sid_for_db],
             )
             .map_err(|e| format!("更新 turn_count 失败: {e}"))?;
 
-            Ok(())
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))??;
+
+        Ok(ConversationTurnRegistration {
+            session_id: session_id_owned,
+            turn_id,
+            turn_count,
+            user_id: user_id_for_result,
+            dialogue_key,
+            closed_session_id: String::new(),
+            closed_session_user_id: String::new(),
+        })
+    }
+
+    /// 注册对话轮次 — 对应 Python 版 add_turn，自动解析会话
+    pub fn register_turn(
+        &self,
+        user_id: &str,
+        user_message: &str,
+        assistant_message: &str,
+        dialogue_key: Option<&str>,
+        message_type: &str,
+        group_id: Option<&str>,
+        message_id: Option<&str>,
+        image_description: &str,
+        source_platform: &str,
+    ) -> ConversationTurnRegistration {
+        let resolved_dk = self.build_dialogue_key(
+            user_id,
+            dialogue_key,
+            message_type,
+            group_id,
+            source_platform,
+        );
+
+        let (session_id, closed_session_id) = self.ensure_session(
+            user_id,
+            &resolved_dk,
+            message_type,
+            group_id.unwrap_or(""),
+        );
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let (turn_id, turn_count, sid, dk) = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let session = sessions.get_mut(&session_id).expect("session must exist after ensure");
+
+            let tid = session.turns.len() as i64 + 1;
+            session.turns.push(ConversationTurnData {
+                turn_id: tid,
+                user_message: user_message.to_string(),
+                assistant_message: assistant_message.to_string(),
+                timestamp: now.clone(),
+                source_message_id: message_id.unwrap_or("").to_string(),
+                source_group_id: group_id.unwrap_or("").to_string(),
+                source_platform: source_platform.to_string(),
+                owner_user_id: user_id.to_string(),
+                source_message_type: message_type.to_string(),
+                dialogue_key: resolved_dk.clone(),
+                image_description: image_description.to_string(),
+            });
+            session.updated_at = now;
+            session.message_type = message_type.to_string();
+            session.group_id = group_id.unwrap_or("").to_string();
+            session
+                .metadata
+                .insert("latest_message_id".to_string(), message_id.unwrap_or("").to_string());
+            session.dirty_turns += 1;
+
+            (tid, session.turn_count(), session.session_id.clone(), session.dialogue_key.clone())
+        };
+
+        let closed_user_id = if !closed_session_id.is_empty() {
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            sessions
+                .get(&closed_session_id)
+                .map(|s| s.user_id.clone())
+                .unwrap_or_else(|| user_id.to_string())
+        } else {
+            String::new()
+        };
+
+        ConversationTurnRegistration {
+            session_id: sid,
+            turn_id,
+            turn_count,
+            user_id: user_id.to_string(),
+            dialogue_key: dk,
+            closed_session_id,
+            closed_session_user_id: closed_user_id,
+        }
+    }
+
+    /// 持久化内存中指定 session 的所有 turns 到 SQLite
+    pub async fn persist_session(&self, session_id: &str) -> XueliResult<bool> {
+        let session_data = {
+            let sessions = self.sessions.lock().map_err(|e| format!("锁错误: {e}"))?;
+            sessions.get(session_id).cloned()
+        };
+
+        let session = match session_data {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+
+        if session.turns.is_empty() {
+            return Ok(false);
+        }
+
+        let db_path = self.db_path.clone();
+        let sid = session_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+            let now = chrono::Utc::now().to_rfc3339();
+            let closed_at = if session.closed_at.is_empty() {
+                now.clone()
+            } else {
+                session.closed_at.clone()
+            };
+
+            // 合并已有 metadata
+            let existing_meta: String = conn
+                .query_row(
+                    "SELECT metadata FROM conversation_sessions WHERE session_id = ?1",
+                    params![sid],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|_| "{}".to_string());
+
+            let mut merged_meta: serde_json::Value =
+                serde_json::from_str(&existing_meta).unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+            if let serde_json::Value::Object(ref mut map) = merged_meta {
+                for (k, v) in &session.metadata {
+                    map.insert(k.clone(), serde_json::Value::String(v.clone()));
+                }
+            }
+            let merged_json = serde_json::to_string(&merged_meta).unwrap_or_else(|_| "{}".to_string());
+
+            conn.execute(
+                "INSERT OR REPLACE INTO conversation_sessions
+                 (session_id, user_id, scope_key, message_type, group_id, platform, created_at, closed_at, turn_count, metadata, dialogue_key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    sid,
+                    session.user_id,
+                    session.dialogue_key,
+                    session.message_type,
+                    session.group_id,
+                    session.started_at,
+                    closed_at,
+                    session.turn_count(),
+                    merged_json,
+                    session.dialogue_key,
+                ],
+            )
+            .map_err(|e| format!("写入会话失败: {e}"))?;
+
+            for turn in &session.turns {
+                let user_msg = MessageRecord::user(
+                    &turn.owner_user_id,
+                    &turn.owner_user_id,
+                    &turn.user_message,
+                    0,
+                    &turn.source_message_id,
+                );
+                let assistant_msg = MessageRecord::assistant(&turn.assistant_message, 0);
+                let user_json = serde_json::to_string(&user_msg).unwrap_or_default();
+                let assistant_json = serde_json::to_string(&assistant_msg).unwrap_or_default();
+
+                conn.execute(
+                    "INSERT OR REPLACE INTO conversation_turns
+                     (turn_id, session_id, user_msg_json, assistant_msg_json, timestamp, source_message_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![turn.turn_id, sid, user_json, assistant_json, turn.timestamp, turn.source_message_id],
+                )
+                .map_err(|e| format!("写入 turn 失败: {e}"))?;
+            }
+
+            Ok(true)
         })
         .await
         .map_err(|e| format!("spawn_blocking 失败: {e}"))?
@@ -519,6 +819,15 @@ impl SqliteConversationStore {
         user_id: &str,
         scope_key: &str,
     ) -> XueliResult<Option<String>> {
+        // 清除内存缓存
+        {
+            let mut by_dialogue = self
+                .active_session_by_dialogue
+                .lock()
+                .map_err(|e| format!("锁错误: {e}"))?;
+            by_dialogue.remove(scope_key);
+        }
+
         let user_id = user_id.to_string();
         let scope_key = scope_key.to_string();
         let db_path = self.db_path.clone();
@@ -555,6 +864,15 @@ impl SqliteConversationStore {
     }
 
     pub async fn close_all_sessions(&self) -> XueliResult<Vec<String>> {
+        // 清除内存缓存
+        {
+            let mut by_dialogue = self
+                .active_session_by_dialogue
+                .lock()
+                .map_err(|e| format!("锁错误: {e}"))?;
+            by_dialogue.clear();
+        }
+
         let db_path = self.db_path.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -895,6 +1213,426 @@ impl SqliteConversationStore {
                 suffix.to_string(),
             )
         })
+    }
+
+    // ── 会话生命周期方法 ──────────────────────────────────────
+
+    /// 构造 dialogue_key — 对应 Python 版 _dialogue_key / build_dialogue_key
+    pub fn build_dialogue_key(
+        &self,
+        user_id: &str,
+        dialogue_key: Option<&str>,
+        message_type: &str,
+        group_id: Option<&str>,
+        platform: &str,
+    ) -> String {
+        let resolved_platform = if platform.trim().is_empty() {
+            "qq"
+        } else {
+            platform.trim()
+        };
+
+        if let Some(dk) = dialogue_key {
+            if !dk.trim().is_empty() {
+                return dk.trim().to_string();
+            }
+        }
+
+        if message_type == "group" {
+            if let Some(gid) = group_id {
+                if !gid.trim().is_empty() {
+                    return format!("{}:group:{}", resolved_platform, gid);
+                }
+            }
+        }
+
+        format!("{}:private:{}", resolved_platform, user_id)
+    }
+
+    /// 检查会话是否已过期
+    fn session_expired(&self, session: &SessionRecord) -> bool {
+        if session.updated_at.is_empty() {
+            return false;
+        }
+        let updated = match chrono::DateTime::parse_from_rfc3339(&session.updated_at) {
+            Ok(dt) => dt.with_timezone(&chrono::Utc),
+            Err(_) => return false,
+        };
+        let elapsed = (chrono::Utc::now() - updated).num_seconds();
+        elapsed > self.session_timeout_seconds as i64
+    }
+
+    /// 确保活跃会话存在 — 对应 Python 版 _ensure_session
+    /// 返回 (session_id, closed_session_id)
+    fn ensure_session(
+        &self,
+        user_id: &str,
+        dialogue_key: &str,
+        message_type: &str,
+        group_id: &str,
+    ) -> (String, String) {
+        let mut closed_session_id = String::new();
+
+        // 检查是否已有活跃会话
+        {
+            let by_dialogue = self
+                .active_session_by_dialogue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(active_sid) = by_dialogue.get(dialogue_key) {
+                let sessions = self
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(session) = sessions.get(active_sid) {
+                    if !self.session_expired(session) {
+                        return (active_sid.clone(), closed_session_id);
+                    }
+                }
+            }
+        }
+
+        // 活跃会话不存在或已过期
+        {
+            let mut by_dialogue = self
+                .active_session_by_dialogue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+
+            // 如果有过期会话，关闭它
+            if let Some(old_sid) = by_dialogue.remove(dialogue_key) {
+                if let Some(old_session) = sessions.get_mut(&old_sid) {
+                    old_session.closed_at = chrono::Utc::now().to_rfc3339();
+                    closed_session_id = old_sid;
+                }
+            }
+
+            // 创建新会话
+            let now = chrono::Utc::now().to_rfc3339();
+            let new_sid = self.generate_session_id(user_id, dialogue_key);
+            let new_session = SessionRecord {
+                session_id: new_sid.clone(),
+                dialogue_key: dialogue_key.to_string(),
+                user_id: user_id.to_string(),
+                message_type: message_type.to_string(),
+                group_id: group_id.to_string(),
+                started_at: now.clone(),
+                updated_at: now,
+                closed_at: String::new(),
+                turns: Vec::new(),
+                metadata: HashMap::new(),
+                dirty_turns: 0,
+            };
+
+            by_dialogue.insert(dialogue_key.to_string(), new_sid.clone());
+            sessions.insert(new_sid.clone(), new_session);
+
+            (new_sid, closed_session_id)
+        }
+    }
+
+    /// 获取指定会话的拥有者 user_id
+    pub fn get_session_owner(&self, session_id: &str) -> String {
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        sessions
+            .get(session_id)
+            .map(|s| s.user_id.clone())
+            .unwrap_or_default()
+    }
+
+    /// 获取指定会话的快照（深拷贝）
+    pub fn get_session_snapshot(&self, session_id: &str) -> Option<SessionRecord> {
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        sessions.get(session_id).cloned()
+    }
+
+    /// 获取指定 dialogue_key 的活跃 session_id
+    pub fn get_active_session_id(
+        &self,
+        user_id: &str,
+        dialogue_key: Option<&str>,
+        message_type: &str,
+        group_id: Option<&str>,
+        platform: &str,
+    ) -> String {
+        let resolved_dk = self.build_dialogue_key(user_id, dialogue_key, message_type, group_id, platform);
+
+        let by_dialogue = self
+            .active_session_by_dialogue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let sid = match by_dialogue.get(&resolved_dk) {
+            Some(s) => s.clone(),
+            None => return String::new(),
+        };
+
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        match sessions.get(&sid) {
+            Some(session) => {
+                if self.session_expired(session) {
+                    String::new()
+                } else {
+                    sid
+                }
+            }
+            None => String::new(),
+        }
+    }
+
+    /// 获取用户的会话列表（从 SQLite 加载）
+    pub async fn get_conversations(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> XueliResult<Vec<SessionRecord>> {
+        let user_id = user_id.to_string();
+        let db_path = self.db_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT session_id, dialogue_key, user_id, message_type, group_id,
+                            created_at, closed_at, turn_count, metadata
+                     FROM conversation_sessions
+                     WHERE user_id = ?1
+                     ORDER BY closed_at DESC, created_at DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| format!("查询失败: {e}"))?;
+
+            let rows: Vec<SessionRecord> = stmt
+                .query_map(params![user_id, limit as i64], |row| {
+                    let metadata_str: String = row.get(8).unwrap_or_else(|_| "{}".to_string());
+                    let metadata_map: HashMap<String, String> =
+                        serde_json::from_str(&metadata_str).unwrap_or_default();
+                    Ok(SessionRecord {
+                        session_id: row.get(0)?,
+                        dialogue_key: row.get(1)?,
+                        user_id: row.get(2)?,
+                        message_type: row.get(3)?,
+                        group_id: row.get(4)?,
+                        started_at: row.get(5)?,
+                        updated_at: String::new(),
+                        closed_at: row.get(6)?,
+                        turns: Vec::new(),
+                        metadata: metadata_map,
+                        dirty_turns: 0,
+                    })
+                })
+                .map_err(|e| format!("查询失败: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
+    }
+
+    /// 获取群组的会话列表（从 SQLite 加载）
+    pub async fn get_conversations_by_group_id(
+        &self,
+        group_id: &str,
+        limit: usize,
+    ) -> XueliResult<Vec<SessionRecord>> {
+        let group_id = group_id.to_string();
+        let db_path = self.db_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT session_id, dialogue_key, user_id, message_type, group_id,
+                            created_at, closed_at, turn_count, metadata
+                     FROM conversation_sessions
+                     WHERE group_id = ?1 AND message_type = 'group'
+                     ORDER BY closed_at DESC, created_at DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| format!("查询失败: {e}"))?;
+
+            let rows: Vec<SessionRecord> = stmt
+                .query_map(params![group_id, limit as i64], |row| {
+                    let metadata_str: String = row.get(8).unwrap_or_else(|_| "{}".to_string());
+                    let metadata_map: HashMap<String, String> =
+                        serde_json::from_str(&metadata_str).unwrap_or_default();
+                    Ok(SessionRecord {
+                        session_id: row.get(0)?,
+                        dialogue_key: row.get(1)?,
+                        user_id: row.get(2)?,
+                        message_type: row.get(3)?,
+                        group_id: row.get(4)?,
+                        started_at: row.get(5)?,
+                        updated_at: String::new(),
+                        closed_at: row.get(6)?,
+                        turns: Vec::new(),
+                        metadata: metadata_map,
+                        dirty_turns: 0,
+                    })
+                })
+                .map_err(|e| format!("查询失败: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
+    }
+
+    /// 获取群聊最近消息 — 对应 Python 版 get_recent_group_messages
+    pub async fn get_recent_group_messages(
+        &self,
+        group_id: &str,
+        limit: usize,
+    ) -> XueliResult<Vec<MessageRecord>> {
+        let group_id = group_id.to_string();
+        let db_path = self.db_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT user_id, display_name, message_text, raw_text, image_descriptions,
+                            message_kind, segments, timestamp, message_id, speaker_role
+                     FROM group_messages
+                     WHERE group_id = ?1
+                     ORDER BY timestamp DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| format!("查询失败: {e}"))?;
+
+            let mut records: Vec<MessageRecord> = stmt
+                .query_map(params![group_id, limit as i64], |row| {
+                    let img_str: String = row.get(4)?;
+                    let seg_str: String = row.get(6)?;
+                    Ok(MessageRecord {
+                        user_id: row.get(0)?,
+                        display_name: row.get(1)?,
+                        message_text: row.get(2)?,
+                        raw_text: row.get(3)?,
+                        image_descriptions: serde_json::from_str(&img_str).unwrap_or_default(),
+                        message_kind: row.get(5)?,
+                        segments: serde_json::from_str(&seg_str).unwrap_or_default(),
+                        timestamp: row.get(7)?,
+                        message_id: row.get(8)?,
+                        speaker_role: row.get(9)?,
+                    })
+                })
+                .map_err(|e| format!("查询失败: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            records.reverse();
+            Ok(records)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
+    }
+
+    /// 获取私聊最近消息 — 对应 Python 版 get_recent_private_messages
+    pub async fn get_recent_private_messages(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> XueliResult<Vec<MessageRecord>> {
+        let user_id = user_id.to_string();
+        let db_path = self.db_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT user_id, display_name, message_text, raw_text, image_descriptions,
+                            message_kind, segments, timestamp, message_id, speaker_role
+                     FROM private_messages
+                     WHERE user_id = ?1
+                     ORDER BY timestamp DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| format!("查询失败: {e}"))?;
+
+            let mut records: Vec<MessageRecord> = stmt
+                .query_map(params![user_id, limit as i64], |row| {
+                    let img_str: String = row.get(4)?;
+                    let seg_str: String = row.get(6)?;
+                    Ok(MessageRecord {
+                        user_id: row.get(0)?,
+                        display_name: row.get(1)?,
+                        message_text: row.get(2)?,
+                        raw_text: row.get(3)?,
+                        image_descriptions: serde_json::from_str(&img_str).unwrap_or_default(),
+                        message_kind: row.get(5)?,
+                        segments: serde_json::from_str(&seg_str).unwrap_or_default(),
+                        timestamp: row.get(7)?,
+                        message_id: row.get(8)?,
+                        speaker_role: row.get(9)?,
+                    })
+                })
+                .map_err(|e| format!("查询失败: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            records.reverse();
+            Ok(records)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
+    }
+
+    /// 清除指定群的所有消息 — 对应 Python 版 clear_group_messages
+    pub async fn clear_group_messages(&self, group_id: &str) -> XueliResult<()> {
+        let group_id = group_id.to_string();
+        let db_path = self.db_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+            conn.execute("DELETE FROM group_messages WHERE group_id = ?1", params![group_id])
+                .map_err(|e| format!("删除群聊消息失败: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
+    }
+
+    /// 清除指定用户的所有私聊消息 — 对应 Python 版 clear_private_messages
+    pub async fn clear_private_messages(&self, user_id: &str) -> XueliResult<()> {
+        let user_id = user_id.to_string();
+        let db_path = self.db_path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+            conn.execute("DELETE FROM private_messages WHERE user_id = ?1", params![user_id])
+                .map_err(|e| format!("删除私聊消息失败: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
+    }
+
+    /// 获取内存中所有活跃会话 ID
+    pub fn active_session_ids_from_cache(&self) -> Vec<String> {
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        sessions.keys().cloned().collect()
     }
 }
 

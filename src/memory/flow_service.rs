@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -9,16 +10,21 @@ use crate::memory::manager::MemoryManager;
 use crate::memory::memory_dispute_resolver::MemoryDisputeResolver;
 use crate::memory::stores::fact_evidence::{FactEvidence, SqliteFactEvidenceStore};
 use crate::prelude::XueliResult;
+use crate::traits::prompt_template::PromptTemplateLoader;
+
+const MAX_QUEUE_SIZE: usize = 256;
 
 /// 记忆流服务 — 异步队列处理记忆提取与持久化
 ///
 /// 对应 Python 版 `src.memory.memory_flow_service.MemoryFlowService`
-pub struct MemoryFlowService {
-    tx: mpsc::UnboundedSender<MemoryJob>,
-    pub memory_manager: Arc<MemoryManager>,
+pub struct MemoryFlowService<L: PromptTemplateLoader + 'static> {
+    tx: mpsc::Sender<MemoryJob>,
+    pub memory_manager: Arc<MemoryManager<L>>,
     dispute_resolver: MemoryDisputeResolver,
     evidence_store: Option<Arc<SqliteFactEvidenceStore>>,
     recent_reply_keys: std::sync::Mutex<HashMap<String, u64>>,
+    running: Arc<AtomicBool>,
+    handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// 记忆作业
@@ -53,13 +59,13 @@ pub enum MemoryJob {
     },
 }
 
-impl MemoryFlowService {
+impl<L: PromptTemplateLoader + 'static> MemoryFlowService<L> {
     pub fn new(
-        memory_manager: Arc<MemoryManager>,
+        memory_manager: Arc<MemoryManager<L>>,
         dispute_config: Option<MemoryDisputeConfig>,
         evidence_store: Option<Arc<SqliteFactEvidenceStore>>,
-    ) -> (Self, mpsc::UnboundedReceiver<MemoryJob>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    ) -> (Self, mpsc::Receiver<MemoryJob>) {
+        let (tx, rx) = mpsc::channel(MAX_QUEUE_SIZE);
         let config = dispute_config.unwrap_or_default();
         (
             Self {
@@ -68,16 +74,50 @@ impl MemoryFlowService {
                 dispute_resolver: MemoryDisputeResolver::new(config),
                 evidence_store,
                 recent_reply_keys: std::sync::Mutex::new(HashMap::new()),
+                running: Arc::new(AtomicBool::new(false)),
+                handle: tokio::sync::Mutex::new(None),
             },
             rx,
         )
     }
 
-    /// 提交记忆作业
+    /// 启动后台处理循环
+    pub async fn start(&self) {
+        if self.running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // start() 使用外部 run() 模式：调用者自行管理 rx 循环
+        // 此处仅标记 running 状态
+        info!("[MemoryFlow] 已标记为运行状态");
+    }
+
+    /// 关闭记忆流服务
+    pub async fn close(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        let mut guard = self.handle.lock().await;
+        if let Some(handle) = guard.take() {
+            handle.abort();
+        }
+        info!("[MemoryFlow] 已关闭");
+    }
+
+    /// 是否正在运行
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    /// 提交记忆作业（有界队列，满时丢弃并记录警告）
     pub fn submit(&self, job: MemoryJob) -> XueliResult<()> {
-        self.tx
-            .send(job)
-            .map_err(|e| format!("记忆作业提交失败: {}", e).into())
+        match self.tx.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("[MemoryFlow] 记忆队列满，丢弃任务");
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(format!("记忆作业提交失败: channel 已关闭").into())
+            }
+        }
     }
 
     /// 回复生成后的副作用入口
@@ -123,7 +163,7 @@ impl MemoryFlowService {
             user_emotion_label: user_emotion_label.to_string(),
             intimacy_delta,
         };
-        let _ = self.tx.send(job);
+        let _ = self.tx.try_send(job);
     }
 
     fn check_dedupe_timestamp(&self, dedupe_key: &str) -> bool {
@@ -181,7 +221,7 @@ impl MemoryFlowService {
 
     /// 启动后台处理循环
     pub async fn run(
-        memory_manager: Arc<MemoryManager>,
+        memory_manager: Arc<MemoryManager<L>>,
         _dispute_resolver: MemoryDisputeResolver,
         _evidence_store: Option<Arc<SqliteFactEvidenceStore>>,
         rx: &mut mpsc::UnboundedReceiver<MemoryJob>,
@@ -320,27 +360,21 @@ impl MemoryFlowService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::config::MemoryConfig;
     use crate::core::types::{MemoryItem, MemoryType};
     use crate::memory::stores::memory_item::SqliteMemoryItemStore;
     use chrono::Utc;
 
-    fn test_config() -> MemoryConfig {
-        MemoryConfig {
-            enabled: true,
-            db_path: ":memory:".to_string(),
-            storage_backend: "sqlite".to_string(),
-            extraction_min_messages: 5,
-            bm25_top_k: 10,
-            vector_top_k: 5,
-            rerank_top_k: 20,
-            dynamic_memory_limit: 8,
-            dispute: Default::default(),
-            auto_extract: true,
-            extract_every_n_turns: 3,
-            decay: Default::default(),
-            retrieval_weights: Default::default(),
-        }
+    /// 将有界 Receiver 转换为 UnboundedReceiver（测试辅助）
+    fn convert_to_unbounded(mut rx: mpsc::Receiver<MemoryJob>) -> mpsc::UnboundedReceiver<MemoryJob> {
+        let (tx, unbounded_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(job) = rx.recv().await {
+                if tx.send(job).is_err() {
+                    break;
+                }
+            }
+        });
+        unbounded_rx
     }
 
     fn make_item(id: &str, content: &str) -> MemoryItem {
@@ -360,8 +394,9 @@ mod tests {
     async fn test_flow_apply_patch() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteMemoryItemStore::new(dir.path()).unwrap());
-        let mgr = Arc::new(MemoryManager::new(Arc::new(test_config()), store).unwrap());
-        let (service, mut rx) = MemoryFlowService::new(mgr.clone(), None, None);
+        let config = crate::core::config::MemoryConfig::default();
+        let mgr = Arc::new(MemoryManager::new(Arc::new(config), store, Arc::new(crate::services::prompt_loader::NoopPromptTemplateLoader)).unwrap());
+        let (service, rx) = MemoryFlowService::new(mgr.clone(), None, None);
 
         let patch = MemoryPatch {
             add: vec![make_item("f1", "内容1"), make_item("f2", "内容2")],
@@ -371,8 +406,9 @@ mod tests {
         service.submit(MemoryJob::ApplyPatch(patch)).unwrap();
 
         // 运行一轮处理
+        let mut unbounded_rx = convert_to_unbounded(rx);
         tokio::select! {
-            _ = MemoryFlowService::run(mgr.clone(), MemoryDisputeResolver::new(Default::default()), None, &mut rx) => {},
+            _ = MemoryFlowService::run(mgr.clone(), MemoryDisputeResolver::new(Default::default()), None, &mut unbounded_rx) => {},
             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
         }
 
@@ -384,8 +420,9 @@ mod tests {
     fn test_dedupe() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteMemoryItemStore::new(dir.path()).unwrap());
-        let mgr = Arc::new(MemoryManager::new(Arc::new(test_config()), store).unwrap());
-        let (service, _rx) = MemoryFlowService::new(mgr, None, None);
+        let config = crate::core::config::MemoryConfig::default();
+        let mgr = Arc::new(MemoryManager::new(Arc::new(config), store, Arc::new(crate::services::prompt_loader::NoopPromptTemplateLoader)).unwrap());
+        let (service, _rx): (MemoryFlowService<crate::services::prompt_loader::NoopPromptTemplateLoader>, _) = MemoryFlowService::new(mgr, None, None);
 
         let key = "test_key";
         assert!(!service.should_dedupe(key));
@@ -394,9 +431,9 @@ mod tests {
 
     #[test]
     fn test_build_dedupe_key() {
-        let key1 = MemoryFlowService::build_dedupe_key("s1", "m1", "hello", "hi");
-        let key2 = MemoryFlowService::build_dedupe_key("s1", "m1", "hello", "hi");
-        let key3 = MemoryFlowService::build_dedupe_key("s1", "m1", "hello", "hey");
+        let key1 = MemoryFlowService::<crate::services::prompt_loader::NoopPromptTemplateLoader>::build_dedupe_key("s1", "m1", "hello", "hi");
+        let key2 = MemoryFlowService::<crate::services::prompt_loader::NoopPromptTemplateLoader>::build_dedupe_key("s1", "m1", "hello", "hi");
+        let key3 = MemoryFlowService::<crate::services::prompt_loader::NoopPromptTemplateLoader>::build_dedupe_key("s1", "m1", "hello", "hey");
         assert_eq!(key1, key2);
         assert_ne!(key1, key3);
         assert!(!key1.is_empty());

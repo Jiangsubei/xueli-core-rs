@@ -61,6 +61,24 @@ impl Default for MemoryAccessContext {
     }
 }
 
+impl MemoryAccessContext {
+    /// 从用户 ID 和 ChatScope 创建 MemoryAccessContext
+    pub fn new(user_id: &str, scope: &crate::core::scope::ChatScope) -> Self {
+        let (message_type, group_id) = match scope {
+            crate::core::scope::ChatScope::Private => ("private".to_string(), String::new()),
+            crate::core::scope::ChatScope::Group(id) => ("group".to_string(), id.clone()),
+        };
+        Self {
+            requester_user_id: user_id.to_string(),
+            message_type,
+            group_id,
+            read_scope: "user".to_string(),
+            platform: String::new(),
+            hour_of_day: -1,
+        }
+    }
+}
+
 /// 记忆访问策略 — 决定哪些记忆对当前上下文可见。
 ///
 /// 包含三层过滤：类型过滤、隐私可见性、适用范围。

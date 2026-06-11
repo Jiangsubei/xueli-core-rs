@@ -207,6 +207,8 @@ mod tests {
             model: "".to_string(),
             tool_calls: None,
             segments: None,
+            raw_content: String::new(),
+            raw_response: None,
         };
         let facts = service.parse_response(&response, "u1").unwrap();
         assert_eq!(facts.len(), 2);
@@ -225,6 +227,8 @@ mod tests {
             model: "".to_string(),
             tool_calls: None,
             segments: None,
+            raw_content: String::new(),
+            raw_response: None,
         };
         let facts = service.parse_response(&response, "u1").unwrap();
         assert!(facts.is_empty());
@@ -247,6 +251,8 @@ mod tests {
             model: "".to_string(),
             tool_calls: None,
             segments: None,
+            raw_content: String::new(),
+            raw_response: None,
         };
         let facts = service.parse_response(&response, "u1").unwrap();
         assert_eq!(facts.len(), 1);

@@ -473,6 +473,8 @@ mod tests {
             model: "".to_string(),
             tool_calls: None,
             segments: None,
+            raw_content: String::new(),
+            raw_response: None,
         };
         let result = reflection.parse_response(&response).unwrap();
         assert_eq!(result.conflicts.len(), 1);
@@ -491,6 +493,8 @@ mod tests {
             model: "".to_string(),
             tool_calls: None,
             segments: None,
+            raw_content: String::new(),
+            raw_response: None,
         };
         let result = reflection.parse_response(&response).unwrap();
         assert!(result.conflicts.is_empty());

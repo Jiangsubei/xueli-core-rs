@@ -35,31 +35,8 @@ impl Default for PromptBudgets {
     }
 }
 
-/// 记忆访问上下文 — 携带当前会话的作用域信息
-#[derive(Debug, Clone)]
-pub struct MemoryAccessContext {
-    pub requester_user_id: String,
-    pub message_type: String,
-    pub group_id: String,
-    pub read_scope: String,
-    pub hour_of_day: i32,
-}
-
-impl MemoryAccessContext {
-    pub fn new(user_id: &str, scope: &ChatScope) -> Self {
-        let (message_type, group_id) = match scope {
-            ChatScope::Private => ("private".to_string(), String::new()),
-            ChatScope::Group(id) => ("group".to_string(), id.clone()),
-        };
-        Self {
-            requester_user_id: user_id.to_string(),
-            message_type,
-            group_id,
-            read_scope: "user".to_string(),
-            hour_of_day: -1,
-        }
-    }
-}
+// 重导出 access_policy 中的 MemoryAccessContext，统一类型
+pub use crate::memory::internal::access_policy::MemoryAccessContext;
 
 /// 构建提示词的记忆上下文结果
 #[derive(Debug, Clone)]
@@ -216,6 +193,65 @@ impl RetrievalCoordinator {
 
         let mut map = self.doc_to_memory.write().await;
         map.clear();
+    }
+
+    /// 搜索记忆：跨作用域检索，过滤不可访问结果，按分数排序返回
+    pub async fn search_memories(
+        &self,
+        user_id: &str,
+        query: &str,
+        top_k: usize,
+        scope: &ChatScope,
+    ) -> XueliResult<Vec<MemoryItem>> {
+        let _context = MemoryAccessContext::new(user_id, scope);
+
+        let retrieval_result = self
+            .retrieve(query, user_id, top_k * 2, top_k * 2)
+            .await?;
+
+        let mut filtered: Vec<MemoryItem> = Vec::new();
+        for item in retrieval_result.items {
+            if self.access_policy.is_accessible(&item, scope) {
+                filtered.push(item);
+            }
+            if filtered.len() >= top_k {
+                break;
+            }
+        }
+
+        Ok(filtered)
+    }
+
+    /// 快速检查特定查询是否与某条记忆显著相关，返回首个匹配的记忆
+    pub async fn quick_check_relevance(
+        &self,
+        user_id: &str,
+        query: &str,
+        threshold: f64,
+    ) -> XueliResult<Option<MemoryItem>> {
+        let result = self.retrieve(query, user_id, 5, 5).await?;
+
+        for (i, item) in result.items.iter().enumerate() {
+            let score = result.scores.get(i).copied().unwrap_or(0.0);
+            if score >= threshold {
+                return Ok(Some(item.clone()));
+            }
+        }
+
+        // 回退：对普通记忆做文本相关性评分
+        let all_memories = self.store.get_by_user(user_id).await?;
+        let mut best: Option<(f64, MemoryItem)> = None;
+        for mem in all_memories {
+            let score = self.score_text(query, &mem.content);
+            if score >= threshold {
+                match &best {
+                    Some((best_score, _)) if score <= *best_score => {}
+                    _ => best = Some((score, mem)),
+                }
+            }
+        }
+
+        Ok(best.map(|(_, item)| item))
     }
 
     // ── 提示词上下文组装 ──────────

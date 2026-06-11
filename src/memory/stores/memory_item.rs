@@ -142,33 +142,169 @@ fn parse_ts_opt(s: &Option<String>) -> Option<DateTime<Utc>> {
     s.as_ref().and_then(|v| v.parse().ok())
 }
 
+/// 类别半衰期修饰符（对应 Python 版 category_half_life_modifiers）
+const CATEGORY_HALF_LIFE_MODIFIERS: &[(&str, f64)] = &[
+    ("core_fact", 3.0),
+    ("important", 1.5),
+    ("casual", 0.7),
+];
+
+/// 类别遗忘阈值（对应 Python 版 _get_forget_threshold）
+const CATEGORY_FORGET_THRESHOLDS: &[(&str, f64)] = &[
+    ("core_fact", 0.05),
+    ("casual", 0.8),
+];
+
+/// 抑制因子（对应 Python 版 suppression_factor）
+const SUPPRESSION_FACTOR: f64 = 0.05;
+
+fn category_half_life_modifier(category: &str) -> f64 {
+    CATEGORY_HALF_LIFE_MODIFIERS
+        .iter()
+        .find(|(k, _)| *k == category)
+        .map(|(_, v)| *v)
+        .unwrap_or(1.0)
+}
+
+fn category_forget_threshold(category: &str, default: f64) -> f64 {
+    CATEGORY_FORGET_THRESHOLDS
+        .iter()
+        .find(|(k, _)| *k == category)
+        .map(|(_, v)| *v)
+        .unwrap_or(default)
+}
+
+/// 从 metadata_json 中提取字段值
+fn meta_get_f64(meta: &serde_json::Value, key: &str) -> Option<f64> {
+    meta.get(key).and_then(|v| v.as_f64())
+}
+
+fn meta_get_i64(meta: &serde_json::Value, key: &str) -> Option<i64> {
+    meta.get(key).and_then(|v| v.as_i64())
+}
+
+fn meta_get_str<'a>(meta: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    meta.get(key).and_then(|v| v.as_str())
+}
+
+fn meta_get_bool(meta: &serde_json::Value, key: &str) -> bool {
+    meta.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// 解析 metadata_json
+fn parse_metadata(json_str: &str) -> serde_json::Value {
+    serde_json::from_str(json_str).unwrap_or(JsonValue::Object(Default::default()))
+}
+
+/// 计算保留奖励（对应 Python 版 _get_retention_bonus）
+fn calc_retention_bonus(meta: &serde_json::Value, age_days: f64) -> f64 {
+    let mention_count = meta_get_i64(meta, "mention_count").unwrap_or(1).max(1) as f64;
+    let mention_bonus = ((mention_count - 1.0).max(0.0) * 0.35).min(1.2);
+
+    let observation_count = meta
+        .get("source_observations")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter(|item| item.is_object()).count() as f64)
+        .unwrap_or(0.0);
+    let observation_bonus = ((observation_count - 1.0).max(0.0) * 0.2).min(0.8);
+
+    let recency_bonus = if age_days <= 7.0 {
+        0.6
+    } else if age_days <= 21.0 {
+        0.35
+    } else if age_days <= 45.0 {
+        0.15
+    } else {
+        0.0
+    };
+
+    let emotional_bonus = if meta_get_str(meta, "emotional_tone")
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+    {
+        0.2
+    } else {
+        0.0
+    };
+
+    mention_bonus + observation_bonus + recency_bonus + emotional_bonus
+}
+
 fn calc_effective_importance(rec: &MemoryItemRecord, now: DateTime<Utc>) -> f64 {
+    let meta = parse_metadata(&rec.metadata_json);
+
+    // 衰减未启用或非 ordinary 类型时返回基础重要度
+    let memory_kind = meta_get_str(&meta, "memory_type").unwrap_or("legacy").to_lowercase();
+    if memory_kind != "ordinary" && memory_kind != "legacy" {
+        // 对于 Rust 版本，所有记忆都走衰减逻辑（因为 Rust 版不区分 memory_type 列）
+    }
+
+    // decay_exempt 检查
+    if meta_get_bool(&meta, "decay_exempt") {
+        return rec.importance.max(0.0);
+    }
+
     let base_half_life = rec.half_life_hours;
-    let modifier = rec.half_life_modifier.unwrap_or(1.0);
-    let effective_half_life = (base_half_life * modifier).max(0.1);
+    let consolidation_modifier = meta_get_f64(&meta, "consolidated_half_life_modifier").unwrap_or(1.0);
+
+    // 类别修饰符
+    let category = meta_get_str(&meta, "memory_category")
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    let category_mod = category_half_life_modifier(&category);
+
+    let effective_half_life = (base_half_life * category_mod * consolidation_modifier).max(0.1);
 
     let ref_dt = rec
         .last_accessed_at_str
         .parse::<DateTime<Utc>>()
         .ok()
+        .or_else(|| {
+            meta_get_str(&meta, "last_reinforced_at")
+                .and_then(|s| s.parse().ok())
+                .or_else(|| {
+                    meta_get_str(&meta, "last_recalled_at").and_then(|s| s.parse().ok())
+                })
+        })
         .or_else(|| rec.created_at_str.parse::<DateTime<Utc>>().ok())
         .unwrap_or(now);
-    let elapsed_hours = (now - ref_dt).num_hours().max(0) as f64;
 
-    let decay_factor = 0.5_f64.powf(elapsed_hours / effective_half_life);
+    let age_days = (now - ref_dt).num_seconds() as f64 / 86400.0;
+    let age_days = age_days.max(0.0);
 
-    let effective = (rec.importance * decay_factor).max(0.0);
+    let base = rec.importance.max(0.0);
 
-    if rec.is_archived {
-        if let Some(archived_at) = parse_ts_opt(&rec.archived_at) {
-            let archived_hours = (now - archived_at).num_hours().max(0) as f64;
-            if archived_hours > 2160.0 {
-                return effective * 0.5_f64.powf(archived_hours / (effective_half_life * 1.5));
-            }
+    // 巩固期内未巩固的记忆保持高重要度
+    let consolidation_hours = rec.half_life_hours; // 使用 half_life_hours 作为近似
+    if consolidation_hours > 0.0 && age_days <= consolidation_hours / 24.0 {
+        if meta_get_i64(&meta, "consolidation_version").unwrap_or(0) < 1 {
+            return base.min(5.0);
         }
     }
 
-    effective
+    let decay_factor = 0.5_f64.powf(age_days / effective_half_life);
+
+    // 冷记忆额外衰减
+    let cold_threshold_days = 90.0;
+    let cold_multiplier = 1.5;
+    let decay_factor = if age_days > cold_threshold_days {
+        let cold_age = age_days - cold_threshold_days;
+        decay_factor * 0.5_f64.powf(cold_age / (effective_half_life / cold_multiplier))
+    } else {
+        decay_factor
+    };
+
+    let retention_bonus = calc_retention_bonus(&meta, age_days);
+    let mut effective = (base * decay_factor + retention_bonus).min(5.0);
+
+    // 抑制计数衰减
+    let suppression_count = meta_get_i64(&meta, "suppression_count").unwrap_or(0);
+    if suppression_count > 0 {
+        effective *= 1.0 - suppression_count as f64 * SUPPRESSION_FACTOR;
+    }
+
+    effective.max(0.0)
 }
 
 impl SqliteMemoryItemStore {
@@ -485,15 +621,16 @@ impl SqliteMemoryItemStore {
                 .lock()
                 .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
             let mut stmt = conn
-                .prepare("SELECT id, importance, is_archived FROM memory_items WHERE user_id = ?1")
+                .prepare("SELECT id, importance, is_archived, metadata_json FROM memory_items WHERE user_id = ?1")
                 .map_err(|e| XueliError::Database(format!("准备查询失败: {e}")))?;
 
-            let items: Vec<(String, f64, bool)> = stmt
+            let items: Vec<(String, f64, bool, String)> = stmt
                 .query_map(params![user_id], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, f64>(1)?,
                         row.get::<_, i32>(2)? != 0,
+                        row.get::<_, String>(3)?,
                     ))
                 })
                 .map_err(|e| XueliError::Database(format!("查询失败: {e}")))?
@@ -502,15 +639,27 @@ impl SqliteMemoryItemStore {
 
             let mut suppressed = 0usize;
             let penalty_clamped = penalty.clamp(0.0, 1.0);
+            let now = Utc::now().to_rfc3339();
 
-            for (mem_id, importance, is_archived) in &items {
+            for (mem_id, importance, is_archived, meta_json) in &items {
                 if selected_set.contains(mem_id) || *is_archived {
                     continue;
                 }
                 let new_importance = (importance * (1.0 - penalty_clamped)).max(0.0);
+
+                // 更新 suppression_count in metadata
+                let mut meta = parse_metadata(meta_json);
+                let current_count = meta_get_i64(&meta, "suppression_count").unwrap_or(0);
+                meta["suppression_count"] = JsonValue::Number(
+                    serde_json::Number::from((current_count + 1).min(5)),
+                );
+                meta["last_suppressed_at"] = JsonValue::String(now.clone());
+                let new_meta_str = serde_json::to_string(&meta)
+                    .map_err(|e| XueliError::Serialization(format!("JSON 序列化失败: {e}")))?;
+
                 conn.execute(
-                    "UPDATE memory_items SET importance=?1, suppressed_at=?2 WHERE id=?3",
-                    params![new_importance, Utc::now().to_rfc3339(), mem_id],
+                    "UPDATE memory_items SET importance=?1, suppressed_at=?2, metadata_json=?3 WHERE id=?4",
+                    params![new_importance, now, new_meta_str, mem_id],
                 )
                 .map_err(|e| XueliError::Database(format!("抑制更新失败: {e}")))?;
                 suppressed += 1;
@@ -520,6 +669,352 @@ impl SqliteMemoryItemStore {
         })
         .await
         .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
+    }
+
+    /// 标记记忆被召回（对应 Python 版 mark_recalled）
+    pub async fn mark_recalled(&self, user_id: &str, memory_ids: &[String]) -> XueliResult<usize> {
+        let user_id = user_id.to_string();
+        let ids: Vec<String> = memory_ids.iter().filter(|s| !s.trim().is_empty()).cloned().collect();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<usize> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            let mut stmt = conn
+                .prepare("SELECT id, metadata_json, is_archived FROM memory_items WHERE user_id = ?1")
+                .map_err(|e| XueliError::Database(format!("准备查询失败: {e}")))?;
+
+            let rows: Vec<(String, String, bool)> = stmt
+                .query_map(params![user_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i32>(2)? != 0,
+                    ))
+                })
+                .map_err(|e| XueliError::Database(format!("查询失败: {e}")))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            let wanted: std::collections::HashSet<&str> =
+                ids.iter().map(|s| s.as_str()).collect();
+            let now_iso = Utc::now().to_rfc3339();
+            let mut updated = 0usize;
+
+            for (mem_id, meta_json, is_archived) in &rows {
+                if !wanted.contains(mem_id.as_str()) {
+                    continue;
+                }
+                let mut meta = parse_metadata(meta_json);
+                let mention_count = meta_get_i64(&meta, "mention_count").unwrap_or(1).max(1) + 1;
+                meta["mention_count"] = JsonValue::Number(serde_json::Number::from(mention_count));
+                meta["last_recalled_at"] = JsonValue::String(now_iso.clone());
+
+                // 减少抑制计数
+                let suppression_count = meta_get_i64(&meta, "suppression_count").unwrap_or(0);
+                if suppression_count > 0 {
+                    meta["suppression_count"] =
+                        JsonValue::Number(serde_json::Number::from((suppression_count - 1).max(0)));
+                }
+
+                let new_meta_str = serde_json::to_string(&meta)
+                    .map_err(|e| XueliError::Serialization(format!("JSON 序列化失败: {e}")))?;
+
+                if *is_archived {
+                    // 重新激活已归档记忆
+                    meta["archived"] = JsonValue::Bool(false);
+                    let recall_count =
+                        meta_get_i64(&meta, "recall_count_since_archive").unwrap_or(0) + 1;
+                    meta["recall_count_since_archive"] =
+                        JsonValue::Number(serde_json::Number::from(recall_count));
+                    let new_meta_str2 = serde_json::to_string(&meta)
+                        .map_err(|e| XueliError::Serialization(format!("JSON 序列化失败: {e}")))?;
+                    conn.execute(
+                        "UPDATE memory_items SET metadata_json=?1, last_accessed_at=?2, is_archived=0 WHERE id=?3",
+                        params![new_meta_str2, now_iso, mem_id],
+                    )
+                    .map_err(|e| XueliError::Database(format!("召回更新失败: {e}")))?;
+                } else {
+                    conn.execute(
+                        "UPDATE memory_items SET metadata_json=?1, last_accessed_at=?2 WHERE id=?3",
+                        params![new_meta_str, now_iso, mem_id],
+                    )
+                    .map_err(|e| XueliError::Database(format!("召回更新失败: {e}")))?;
+                }
+                updated += 1;
+            }
+
+            Ok(updated)
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
+    }
+
+    /// 替换用户所有记忆（对应 Python 版 replace_user_memories）
+    pub async fn replace_user_memories(&self, user_id: &str, memories: Vec<MemoryItem>) -> XueliResult<bool> {
+        let user_id = user_id.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<bool> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| XueliError::Database(format!("事务失败: {e}")))?;
+
+            tx.execute("DELETE FROM memory_items WHERE user_id = ?1", params![user_id])
+                .map_err(|e| XueliError::Database(format!("清理失败: {e}")))?;
+
+            for item in &memories {
+                tx.execute(
+                    "INSERT INTO memory_items
+                     (id, user_id, content, memory_type, importance, created_at, last_accessed_at, access_count)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        item.id,
+                        item.user_id,
+                        item.content,
+                        memory_type_to_str(&item.memory_type),
+                        item.importance,
+                        item.created_at.to_rfc3339(),
+                        item.last_accessed_at.to_rfc3339(),
+                        item.access_count as i64,
+                    ],
+                )
+                .map_err(|e| XueliError::Database(format!("插入失败: {e}")))?;
+            }
+
+            tx.commit()
+                .map_err(|e| XueliError::Database(format!("提交事务失败: {e}")))?;
+            Ok(true)
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
+    }
+
+    /// 获取已归档的用户记忆（对应 Python 版 get_archived_user_memories）
+    pub async fn get_archived_user_memories(&self, user_id: &str) -> XueliResult<Vec<MemoryItem>> {
+        let user_id = user_id.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<Vec<MemoryItem>> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, user_id, content, memory_type, importance, created_at, last_accessed_at, access_count
+                     FROM memory_items WHERE user_id = ?1 AND is_archived = 1
+                     ORDER BY last_accessed_at DESC, created_at DESC",
+                )
+                .map_err(|e| XueliError::Database(format!("准备查询失败: {e}")))?;
+
+            let rows = stmt
+                .query_map(params![user_id], row_to_memory_item)
+                .map_err(|e| XueliError::Database(format!("查询失败: {e}")))?;
+
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row.map_err(|e| XueliError::Database(format!("读取行失败: {e}")))?);
+            }
+            Ok(items)
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
+    }
+
+    /// 关键词搜索（对应 Python 版 search_memories_by_keyword）
+    pub async fn search_memories_by_keyword(&self, keyword: &str, user_id: &str) -> XueliResult<Vec<MemoryItem>> {
+        let memories = self.get_by_user(user_id).await?;
+        let key = keyword.to_lowercase();
+        Ok(memories
+            .into_iter()
+            .filter(|m| m.content.to_lowercase().contains(&key))
+            .collect())
+    }
+
+    /// 文本规范化（对应 Python 版 _normalize_text）
+    pub fn normalize_text(text: &str) -> String {
+        let normalized = text.to_lowercase();
+        let s: String = normalized
+            .chars()
+            .filter(|c| c.is_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(c))
+            .collect();
+        s.trim().to_string()
+    }
+
+    /// 判断两条记忆是否相同（对应 Python 版 _is_same_memory）
+    pub fn is_same_memory(left: &str, right: &str) -> bool {
+        let nl = Self::normalize_text(left);
+        let nr = Self::normalize_text(right);
+        if nl.is_empty() || nr.is_empty() {
+            return false;
+        }
+        if nl == nr {
+            return true;
+        }
+        let (shorter, longer) = if nl.len() <= nr.len() {
+            (&nl, &nr)
+        } else {
+            (&nr, &nl)
+        };
+        if shorter.len() < 4 {
+            return false;
+        }
+        longer.contains(shorter.as_str()) && (shorter.len() as f64 / longer.len().max(1) as f64) >= 0.75
+    }
+
+    /// 带去重的添加记忆（对应 Python 版 add_memory）
+    pub async fn add_memory_dedup(
+        &self,
+        content: &str,
+        user_id: &str,
+        memory_type: MemoryType,
+        importance: f64,
+    ) -> XueliResult<Option<MemoryItem>> {
+        let normalized_content = content.trim().to_string();
+        if normalized_content.is_empty() {
+            return Ok(None);
+        }
+        let user_id = user_id.to_string();
+
+        // 检查去重
+        let existing = self.get_by_user(&user_id).await?;
+        for item in &existing {
+            if Self::is_same_memory(&item.content, &normalized_content) {
+                // 合并：保留较长的内容
+                let new_content = if normalized_content.len() > item.content.len() {
+                    normalized_content.clone()
+                } else {
+                    item.content.clone()
+                };
+                let mut updated = item.clone();
+                updated.content = new_content;
+                updated.last_accessed_at = Utc::now();
+                self.update(updated).await?;
+                return Ok(Some(item.clone()));
+            }
+        }
+
+        // 新建记忆
+        let now = Utc::now();
+        let mem_id = format!(
+            "mem_{}_{:04x}",
+            now.format("%Y%m%d%H%M%S"),
+            (normalized_content.len() as u16)
+        );
+        let item = MemoryItem {
+            id: mem_id,
+            user_id: user_id.clone(),
+            content: normalized_content,
+            memory_type,
+            importance: importance.clamp(0.0, 1.0),
+            created_at: now,
+            last_accessed_at: now,
+            access_count: 0,
+        };
+        self.store(item.clone()).await?;
+        Ok(Some(item))
+    }
+
+    /// 完整版元数据加载（对应 Python 版 _load_metadata）
+    pub async fn load_metadata(&self, user_id: &str, mem_id: &str) -> XueliResult<Option<serde_json::Value>> {
+        let mem_id = mem_id.trim().to_string();
+        let user_id = user_id.to_string();
+        if user_id.is_empty() || mem_id.is_empty() {
+            return Ok(None);
+        }
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<Option<serde_json::Value>> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            let result = conn
+                .query_row(
+                    "SELECT metadata_json FROM memory_items WHERE id = ?1 AND user_id = ?2",
+                    params![mem_id, user_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| XueliError::Database(format!("查询失败: {e}")))?;
+
+            match result {
+                Some(json_str) => Ok(Some(parse_metadata(&json_str))),
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
+    }
+
+    /// 完整版元数据更新（对应 Python 版 _update_metadata）
+    pub async fn update_metadata_full(
+        &self,
+        user_id: &str,
+        mem_id: &str,
+        metadata: &serde_json::Value,
+    ) -> XueliResult<bool> {
+        let mem_id = mem_id.trim().to_string();
+        let user_id = user_id.to_string();
+        if user_id.is_empty() || mem_id.is_empty() {
+            return Ok(false);
+        }
+        let metadata = metadata.clone();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<bool> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            let now = Utc::now().to_rfc3339();
+            let meta_str = serde_json::to_string(&metadata)
+                .map_err(|e| XueliError::Serialization(format!("JSON 序列化失败: {e}")))?;
+            let affected = conn
+                .execute(
+                    "UPDATE memory_items SET metadata_json=?1, last_accessed_at=?2 WHERE id=?3 AND user_id=?4",
+                    params![meta_str, now, mem_id, user_id],
+                )
+                .map_err(|e| XueliError::Database(format!("元数据更新失败: {e}")))?;
+            Ok(affected > 0)
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
+    }
+
+    /// 获取用户活跃（未归档）记忆
+    pub async fn get_active_user_memories(&self, user_id: &str) -> XueliResult<Vec<MemoryItem>> {
+        let user_id = user_id.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<Vec<MemoryItem>> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, user_id, content, memory_type, importance, created_at, last_accessed_at, access_count
+                     FROM memory_items WHERE user_id = ?1 AND is_archived = 0
+                     ORDER BY last_accessed_at DESC, created_at DESC",
+                )
+                .map_err(|e| XueliError::Database(format!("准备查询失败: {e}")))?;
+
+            let rows = stmt
+                .query_map(params![user_id], row_to_memory_item)
+                .map_err(|e| XueliError::Database(format!("查询失败: {e}")))?;
+
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row.map_err(|e| XueliError::Database(format!("读取行失败: {e}")))?);
+            }
+            Ok(items)
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
+    }
+
+    /// 获取所有用户 ID（对应 Python 版 get_user_ids）
+    pub async fn get_user_ids(&self) -> XueliResult<Vec<String>> {
+        self.get_all_user_ids().await
     }
 }
 
@@ -868,7 +1363,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteMemoryItemStore::new(dir.path()).unwrap();
 
-        let old_time = Utc::now() - chrono::TimeDelta::hours(1000);
+        let old_time = Utc::now() - chrono::TimeDelta::hours(1200);
 
         store
             .store(MemoryItem {
