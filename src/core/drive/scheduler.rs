@@ -236,17 +236,15 @@ impl DriveScheduler {
 
         let mut engines = self.engines.lock().await;
         let engine = engines.entry(scope_key.to_string()).or_insert_with(|| {
-            DriveEngine::new(
-                DriveStore::new(&self.data_dir),
-                scope_key,
-                self.enabled,
-            )
+            DriveEngine::new(DriveStore::new(&self.data_dir), scope_key, self.enabled)
         });
         engine.apply_event_deltas(event_patterns).await;
 
         // 记录事件日志
         let mut event_log = self.event_log.lock().await;
-        let log = event_log.entry(scope_key.to_string()).or_insert_with(Vec::new);
+        let log = event_log
+            .entry(scope_key.to_string())
+            .or_insert_with(Vec::new);
         let now = chrono::Local::now().format("%H:%M:%S").to_string();
         for pattern in event_patterns {
             log.push(EventLogEntry {
@@ -290,11 +288,7 @@ impl DriveScheduler {
         }
         let mut engines = self.engines.lock().await;
         let engine = engines.entry(scope_key.to_string()).or_insert_with(|| {
-            DriveEngine::new(
-                DriveStore::new(&self.data_dir),
-                scope_key,
-                self.enabled,
-            )
+            DriveEngine::new(DriveStore::new(&self.data_dir), scope_key, self.enabled)
         });
         engine.apply_event_deltas(event_patterns).await;
     }
@@ -349,16 +343,8 @@ mod tests {
     #[tokio::test]
     async fn test_on_inbound_event() {
         let dir = tempfile::tempdir().unwrap();
-        let scheduler = DriveScheduler::new(
-            dir.path().to_path_buf(),
-            None,
-            None,
-            5,
-            3600,
-            10,
-            0.3,
-            true,
-        );
+        let scheduler =
+            DriveScheduler::new(dir.path().to_path_buf(), None, None, 5, 3600, 10, 0.3, true);
         let patterns = vec!["negative_feedback".to_string()];
         scheduler.on_inbound_event("test_scope", &patterns).await;
         let log = scheduler.event_log.lock().await;
@@ -370,16 +356,8 @@ mod tests {
     #[tokio::test]
     async fn test_on_reply_completed_count() {
         let dir = tempfile::tempdir().unwrap();
-        let scheduler = DriveScheduler::new(
-            dir.path().to_path_buf(),
-            None,
-            None,
-            5,
-            3600,
-            10,
-            0.3,
-            true,
-        );
+        let scheduler =
+            DriveScheduler::new(dir.path().to_path_buf(), None, None, 5, 3600, 10, 0.3, true);
         scheduler.on_reply_completed("test_scope").await;
         let counts = scheduler.round_counts.lock().await;
         assert_eq!(counts.get("test_scope").copied().unwrap_or(0), 1);

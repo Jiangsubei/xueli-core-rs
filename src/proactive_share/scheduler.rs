@@ -128,7 +128,12 @@ impl ProactiveShareScheduler {
                 }
 
                 // 获取待发送分享
-                if let Ok(pending) = store.pending_shares_with_cooldown(1, cooldown_hours, &time_range_start, &time_range_end) {
+                if let Ok(pending) = store.pending_shares_with_cooldown(
+                    1,
+                    cooldown_hours,
+                    &time_range_start,
+                    &time_range_end,
+                ) {
                     for share in pending {
                         // 标记已发送
                         let _ = store.mark_sent(&share.id);

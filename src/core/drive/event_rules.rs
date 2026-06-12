@@ -303,10 +303,7 @@ pub fn build_default_rule_set() -> EventRuleSet {
         },
     ];
 
-    EventRuleSet {
-        rules,
-        version: 1,
-    }
+    EventRuleSet { rules, version: 1 }
 }
 
 // ─── 权重调整参数 ───────────────────────────────────────
@@ -351,7 +348,12 @@ impl DriveEventRuleEngine {
         max_adjustment: f64,
     ) {
         for adj in adjustments {
-            let rule = match self.rule_set.rules.iter_mut().find(|r| r.rule_id == adj.rule_id) {
+            let rule = match self
+                .rule_set
+                .rules
+                .iter_mut()
+                .find(|r| r.rule_id == adj.rule_id)
+            {
                 Some(r) => r,
                 None => continue,
             };

@@ -182,11 +182,7 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
             });
         }
 
-        let db_path = config.memory.db_path.clone();
-        let db_dir = std::path::Path::new(&db_path)
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(std::path::Path::new("."));
+        let db_dir = std::path::Path::new(&config.memory.data_dir);
         let emoji_db = EmojiDB::new(&db_dir.to_string_lossy());
         let emoji_manager =
             Arc::new(EmojiManager::new(emoji_db).with_vision_client(vision_client.clone()));
@@ -233,7 +229,9 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
                 .with_bot_name(&config.identity.name),
         );
 
-        let context_recorder = Arc::new(ContextRecorder::new(Some(db_path.clone())));
+        let context_recorder = Arc::new(ContextRecorder::new(Some(
+            db_dir.join("xueli_memory.db").to_string_lossy().to_string(),
+        )));
 
         let character_card_service = {
             let storage_dir = db_dir.join("_character_cards");
@@ -695,7 +693,15 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         let reply_ctx = plan.map(|p| &p.reply_context).unwrap_or(&empty_ctx);
 
         self.emoji_reply_service
-            .plan_follow_up(event, &user_message, reply_text, reply_ctx, &trace_id, "", None)
+            .plan_follow_up(
+                event,
+                &user_message,
+                reply_text,
+                reply_ctx,
+                &trace_id,
+                "",
+                None,
+            )
             .await
             .ok()
             .flatten()
@@ -791,7 +797,11 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         if !user_message.is_empty() {
             self.narrative_service.add_event(
                 &user_id,
-                &format!("用户: {} → 助手: {}", truncate_str(&user_message, 40), truncate_str(reply_text, 40)),
+                &format!(
+                    "用户: {} → 助手: {}",
+                    truncate_str(&user_message, 40),
+                    truncate_str(reply_text, 40)
+                ),
                 0.3,
             );
         }
@@ -965,12 +975,19 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
 
     /// 判断事件是否包含图片输入
     pub fn has_image_input(&self, event: &InboundEvent) -> bool {
-        event.attachments.iter().any(|a| a.kind.to_lowercase() == "image")
+        event
+            .attachments
+            .iter()
+            .any(|a| a.kind.to_lowercase() == "image")
     }
 
     /// 获取事件中的图片数量
     pub fn get_image_count(&self, event: &InboundEvent) -> usize {
-        event.attachments.iter().filter(|a| a.kind.to_lowercase() == "image").count()
+        event
+            .attachments
+            .iter()
+            .filter(|a| a.kind.to_lowercase() == "image")
+            .count()
     }
 
     /// 判断视觉分析是否可用
@@ -1099,7 +1116,10 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
             .as_ref()
             .map(|m| m.scope.is_group())
             .unwrap_or(false);
-        self.image_pipeline.analyze(event, user_text, is_group).await.ok()
+        self.image_pipeline
+            .analyze(event, user_text, is_group)
+            .await
+            .ok()
     }
 
     /// 检查并执行速率限制：若未达到发送间隔则等待
@@ -1143,17 +1163,20 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         if let (Some(gid), Some(msg)) = (group_id, &event.message) {
             let _ = self.context_recorder.get_or_create_log(&gid).await;
             let event_time = msg.timestamp.timestamp_millis() as f64 / 1000.0;
-            let _ = self.context_recorder.record(
-                &gid,
-                &msg.id,
-                &msg.sender_id,
-                &msg.text,
-                event_time,
-                None,
-                None,
-                &msg.sender_name,
-                &msg.text,
-            ).await;
+            let _ = self
+                .context_recorder
+                .record(
+                    &gid,
+                    &msg.id,
+                    &msg.sender_id,
+                    &msg.text,
+                    event_time,
+                    None,
+                    None,
+                    &msg.sender_name,
+                    &msg.text,
+                )
+                .await;
         }
     }
 
@@ -1223,7 +1246,10 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         if !score.reply_intent.is_empty() && !score.feedback_label.is_empty() {
             let _ = self.character_card_service.record_interaction_signal(
                 &user_id,
-                &format!("reply_effect:{}:{}", score.reply_intent, score.feedback_label),
+                &format!(
+                    "reply_effect:{}:{}",
+                    score.reply_intent, score.feedback_label
+                ),
             );
         }
     }
@@ -1239,11 +1265,7 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
     where
         F: std::future::Future<Output = T>,
     {
-        match tokio::time::timeout(
-            Duration::from_secs_f64(timeout_seconds.max(0.05)),
-            future,
-        )
-        .await
+        match tokio::time::timeout(Duration::from_secs_f64(timeout_seconds.max(0.05)), future).await
         {
             Ok(result) => result,
             Err(_) => {

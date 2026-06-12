@@ -116,7 +116,10 @@ impl<A: AIClient, L: PromptTemplateLoader> MemoryExtractor<A, L> {
     ) -> XueliResult<Vec<MemoryItem>> {
         let pending_turns: Vec<BufferTurn> = {
             let buf = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
-            buf.get_pending_turns(session_id).into_iter().cloned().collect()
+            buf.get_pending_turns(session_id)
+                .into_iter()
+                .cloned()
+                .collect()
         };
 
         if pending_turns.is_empty() {
@@ -133,11 +136,7 @@ impl<A: AIClient, L: PromptTemplateLoader> MemoryExtractor<A, L> {
             .rev()
             .collect();
 
-        let latest_turn_id = pending_turns
-            .iter()
-            .map(|t| t.turn_id)
-            .max()
-            .unwrap_or(0);
+        let latest_turn_id = pending_turns.iter().map(|t| t.turn_id).max().unwrap_or(0);
 
         let dialogue_text = self.format_dialogue(&visible_turns, user_id);
 
@@ -298,7 +297,11 @@ impl<A: AIClient, L: PromptTemplateLoader> MemoryExtractor<A, L> {
 
     /// 构建系统提示词 — 使用 PromptTemplateLoader 加载模板，失败则兜底
     async fn build_system_prompt(&self) -> String {
-        if let Ok(template) = self.prompt_loader.get_template("zh-CN", "memory_extraction").await {
+        if let Ok(template) = self
+            .prompt_loader
+            .get_template("zh-CN", "memory_extraction")
+            .await
+        {
             return template;
         }
         // 兜底：硬编码提示词
@@ -331,7 +334,11 @@ impl<A: AIClient, L: PromptTemplateLoader> MemoryExtractor<A, L> {
 
     /// 构建用户提示词 — 使用 PromptTemplateLoader，失败则兜底
     async fn build_user_prompt(&self, conversation: &str) -> String {
-        if let Ok(template) = self.prompt_loader.get_template("zh-CN", "memory_extraction_user").await {
+        if let Ok(template) = self
+            .prompt_loader
+            .get_template("zh-CN", "memory_extraction_user")
+            .await
+        {
             let vars = HashMap::from([("conversation", conversation)]);
             return self.prompt_loader.render(&template, &vars);
         }
@@ -361,7 +368,8 @@ impl<A: AIClient, L: PromptTemplateLoader> MemoryExtractor<A, L> {
         let mut lines = vec![
             format!("=== 用户 {} 的{}对话记录 ===", user_id, session_label),
             "下面这些内容同时包含用户发言和助手发言。".to_string(),
-            "用户发言是判断记忆的主要来源，助手发言只用于帮助理解上下文，不能直接当成记忆来源。".to_string(),
+            "用户发言是判断记忆的主要来源，助手发言只用于帮助理解上下文，不能直接当成记忆来源。"
+                .to_string(),
             "每条前缀里的 Tn 是稳定 turn 标签，输出时必须引用它。".to_string(),
             String::new(),
         ];
@@ -697,13 +705,8 @@ mod tests {
             narrative_summary: String::new(),
         }];
 
-        let metadata = extractor.build_memory_metadata(
-            "u1",
-            "session_1",
-            "qq:private:u1",
-            &turns,
-            &[],
-        );
+        let metadata =
+            extractor.build_memory_metadata("u1", "session_1", "qq:private:u1", &turns, &[]);
 
         assert_eq!(metadata["owner_user_id"], "u1");
         assert_eq!(metadata["source_turn_start"], 1);

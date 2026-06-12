@@ -46,7 +46,12 @@ impl EmojiTaskManager {
     }
 
     pub async fn count(&self) -> usize {
-        self.tasks.lock().await.iter().filter(|h| !h.is_finished()).count()
+        self.tasks
+            .lock()
+            .await
+            .iter()
+            .filter(|h| !h.is_finished())
+            .count()
     }
 }
 

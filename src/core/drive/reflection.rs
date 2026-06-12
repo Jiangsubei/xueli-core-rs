@@ -30,7 +30,12 @@ pub trait DynTemplateLoader: Send + Sync {
         &self,
         locale: String,
         name: String,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, crate::core::errors::XueliError>> + Send>>;
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<String, crate::core::errors::XueliError>>
+                + Send,
+        >,
+    >;
 }
 
 /// 为 FilePromptTemplateLoader 实现 DynTemplateLoader。
@@ -40,7 +45,12 @@ impl DynTemplateLoader for FilePromptTemplateLoader {
         &self,
         locale: String,
         name: String,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, crate::core::errors::XueliError>> + Send>> {
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<String, crate::core::errors::XueliError>>
+                + Send,
+        >,
+    > {
         let cache = self.cache_arc();
         Box::pin(async move {
             // 先检查缓存
@@ -105,7 +115,10 @@ impl DriveReflection {
 
         // 加载模板
         let system_prompt: String = match &self.template_loader {
-            Some(loader) => match loader.get_template_boxed("zh-CN".to_string(), REFLECTION_PROMPT_TEMPLATE.to_string()).await {
+            Some(loader) => match loader
+                .get_template_boxed("zh-CN".to_string(), REFLECTION_PROMPT_TEMPLATE.to_string())
+                .await
+            {
                 Ok(t) => t,
                 Err(_) => {
                     warn!(
@@ -123,7 +136,10 @@ impl DriveReflection {
 
         let user_content = self.build_user_prompt(snapshot, event_log, round_count);
 
-        let data = match self.invoke_llm(ai_client.as_ref(), &system_prompt, &user_content).await {
+        let data = match self
+            .invoke_llm(ai_client.as_ref(), &system_prompt, &user_content)
+            .await
+        {
             Ok(d) => d,
             Err(e) => {
                 debug!("[DriveReflection] LLM 调用失败: {}", e);
@@ -178,10 +194,7 @@ impl DriveReflection {
         }
 
         // 规则版本
-        parts.push(format!(
-            "\n【规则集版本】v{}",
-            snapshot.event_rules.version
-        ));
+        parts.push(format!("\n【规则集版本】v{}", snapshot.event_rules.version));
         for rule in &snapshot.event_rules.rules {
             parts.push(format!(
                 "  {}: weight={:.2} pattern={}",
@@ -290,18 +303,9 @@ impl DriveReflection {
             .and_then(|v| v.as_object());
         let affective_shift = if let Some(obj) = raw_aff {
             PADVector {
-                valence: obj
-                    .get("valence")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0),
-                arousal: obj
-                    .get("arousal")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0),
-                dominance: obj
-                    .get("dominance")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0),
+                valence: obj.get("valence").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                arousal: obj.get("arousal").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                dominance: obj.get("dominance").and_then(|v| v.as_f64()).unwrap_or(0.0),
             }
         } else {
             PADVector::default()
@@ -403,7 +407,11 @@ mod tests {
         });
         let output = reflection.parse_reflection_output(&data);
         assert_eq!(
-            output.baseline_updates.get("social_drive").copied().unwrap(),
+            output
+                .baseline_updates
+                .get("social_drive")
+                .copied()
+                .unwrap(),
             0.6
         );
         assert!((output.confidence - 0.7).abs() < 0.001);

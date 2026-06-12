@@ -191,13 +191,7 @@ impl ProactiveShareStore {
             .items
             .iter()
             .rev()
-            .filter(|r| {
-                !r.sent
-                    && r.expires_at
-                        .as_ref()
-                        .map(|exp| *exp > now)
-                        .unwrap_or(true)
-            })
+            .filter(|r| !r.sent && r.expires_at.as_ref().map(|exp| *exp > now).unwrap_or(true))
             .take(limit)
             .cloned()
             .collect())
@@ -279,12 +273,9 @@ impl ProactiveShareStore {
         let now = Utc::now();
         {
             let mut inner = self.payload.lock().unwrap();
-            inner.items.retain(|r| {
-                r.expires_at
-                    .as_ref()
-                    .map(|exp| *exp > now)
-                    .unwrap_or(true)
-            });
+            inner
+                .items
+                .retain(|r| r.expires_at.as_ref().map(|exp| *exp > now).unwrap_or(true));
         }
         self.save_to_disk();
     }
@@ -366,7 +357,9 @@ mod tests {
         let path = dir.path().join("shares.json");
         let store = ProactiveShareStore::new(path.to_str().unwrap());
 
-        let record = store.add_share("测试内容", "insight", 168.0, "user1", "group1").unwrap();
+        let record = store
+            .add_share("测试内容", "insight", 168.0, "user1", "group1")
+            .unwrap();
         assert!(!record.id.is_empty());
         assert_eq!(record.content, "测试内容");
         assert_eq!(record.target_user_id, "user1");

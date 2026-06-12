@@ -547,7 +547,11 @@ impl ImportantMemoryStore {
     }
 
     /// 按内容子串删除记忆（对应 Python 版 delete_memory by content_substring）
-    pub async fn delete_memory_by_content(&self, user_id: &str, content_substring: &str) -> XueliResult<bool> {
+    pub async fn delete_memory_by_content(
+        &self,
+        user_id: &str,
+        content_substring: &str,
+    ) -> XueliResult<bool> {
         let user_id = user_id.to_string();
         let pattern = format!("%{}%", content_substring);
         let conn = Arc::clone(&self.conn);
@@ -626,10 +630,7 @@ impl ImportantMemoryStore {
             if score < min_score {
                 continue;
             }
-            matched.push(ImportantMemory {
-                score,
-                ..memory
-            });
+            matched.push(ImportantMemory { score, ..memory });
         }
         matched.sort_by(|a, b| {
             b.score
@@ -643,9 +644,17 @@ impl ImportantMemoryStore {
     }
 
     /// 批量标记重要记忆被召回（对应 Python 版 mark_recalled with user_id）
-    pub async fn mark_recalled_batch(&self, user_id: &str, memory_ids: &[String]) -> XueliResult<usize> {
+    pub async fn mark_recalled_batch(
+        &self,
+        user_id: &str,
+        memory_ids: &[String],
+    ) -> XueliResult<usize> {
         let user_id = user_id.to_string();
-        let ids: Vec<String> = memory_ids.iter().filter(|s| !s.trim().is_empty()).cloned().collect();
+        let ids: Vec<String> = memory_ids
+            .iter()
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .collect();
         if ids.is_empty() {
             return Ok(0);
         }

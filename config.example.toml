@@ -48,7 +48,7 @@ followup_delay_max_seconds = 5.0
 
 [memory]
 enabled = false
-db_path = "data/xueli_memory.db"
+data_dir = "data"
 storage_backend = "sqlite"
 extraction_min_messages = 5
 bm25_top_k = 10

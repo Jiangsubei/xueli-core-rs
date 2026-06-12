@@ -156,23 +156,14 @@ fn parse_ts_opt(s: &Option<String>) -> Option<DateTime<Utc>> {
 }
 
 /// 类别半衰期修饰符（对应 Python 版 category_half_life_modifiers）
-const CATEGORY_HALF_LIFE_MODIFIERS: &[(&str, f64)] = &[
-    ("core_fact", 3.0),
-    ("important", 1.5),
-    ("casual", 0.7),
-];
+const CATEGORY_HALF_LIFE_MODIFIERS: &[(&str, f64)] =
+    &[("core_fact", 3.0), ("important", 1.5), ("casual", 0.7)];
 
 /// 类别遗忘阈值（对应 Python 版 _get_forget_threshold）
-const CATEGORY_FORGET_THRESHOLDS: &[(&str, f64)] = &[
-    ("core_fact", 0.05),
-    ("casual", 0.8),
-];
+const CATEGORY_FORGET_THRESHOLDS: &[(&str, f64)] = &[("core_fact", 0.05), ("casual", 0.8)];
 
 /// 类别归档阈值（归档阈值应高于遗忘阈值，先归档再遗忘）
-const CATEGORY_ARCHIVE_THRESHOLDS: &[(&str, f64)] = &[
-    ("core_fact", 0.2),
-    ("casual", 0.9),
-];
+const CATEGORY_ARCHIVE_THRESHOLDS: &[(&str, f64)] = &[("core_fact", 0.2), ("casual", 0.9)];
 
 /// 抑制因子（对应 Python 版 suppression_factor）
 const SUPPRESSION_FACTOR: f64 = 0.05;
@@ -261,7 +252,9 @@ fn calc_effective_importance(rec: &MemoryItemRecord, now: DateTime<Utc>) -> f64 
     let meta = parse_metadata(&rec.metadata_json);
 
     // 衰减未启用或非 ordinary 类型时返回基础重要度
-    let memory_kind = meta_get_str(&meta, "memory_type").unwrap_or("legacy").to_lowercase();
+    let memory_kind = meta_get_str(&meta, "memory_type")
+        .unwrap_or("legacy")
+        .to_lowercase();
     if memory_kind != "ordinary" && memory_kind != "legacy" {
         // 对于 Rust 版本，所有记忆都走衰减逻辑（因为 Rust 版不区分 memory_type 列）
     }
@@ -272,7 +265,8 @@ fn calc_effective_importance(rec: &MemoryItemRecord, now: DateTime<Utc>) -> f64 
     }
 
     let base_half_life = rec.half_life_hours;
-    let consolidation_modifier = meta_get_f64(&meta, "consolidated_half_life_modifier").unwrap_or(1.0);
+    let consolidation_modifier =
+        meta_get_f64(&meta, "consolidated_half_life_modifier").unwrap_or(1.0);
 
     // 类别修饰符
     let category = meta_get_str(&meta, "memory_category")
@@ -290,9 +284,7 @@ fn calc_effective_importance(rec: &MemoryItemRecord, now: DateTime<Utc>) -> f64 
         .or_else(|| {
             meta_get_str(&meta, "last_reinforced_at")
                 .and_then(|s| s.parse().ok())
-                .or_else(|| {
-                    meta_get_str(&meta, "last_recalled_at").and_then(|s| s.parse().ok())
-                })
+                .or_else(|| meta_get_str(&meta, "last_recalled_at").and_then(|s| s.parse().ok()))
         })
         .or_else(|| rec.created_at_str.parse::<DateTime<Utc>>().ok())
         .unwrap_or(now);
@@ -791,7 +783,11 @@ impl SqliteMemoryItemStore {
     /// 标记记忆被召回（对应 Python 版 mark_recalled）
     pub async fn mark_recalled(&self, user_id: &str, memory_ids: &[String]) -> XueliResult<usize> {
         let user_id = user_id.to_string();
-        let ids: Vec<String> = memory_ids.iter().filter(|s| !s.trim().is_empty()).cloned().collect();
+        let ids: Vec<String> = memory_ids
+            .iter()
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .collect();
         if ids.is_empty() {
             return Ok(0);
         }
@@ -871,7 +867,11 @@ impl SqliteMemoryItemStore {
     }
 
     /// 替换用户所有记忆（对应 Python 版 replace_user_memories）
-    pub async fn replace_user_memories(&self, user_id: &str, memories: Vec<MemoryItem>) -> XueliResult<bool> {
+    pub async fn replace_user_memories(
+        &self,
+        user_id: &str,
+        memories: Vec<MemoryItem>,
+    ) -> XueliResult<bool> {
         let user_id = user_id.to_string();
         let conn = Arc::clone(&self.conn);
         tokio::task::spawn_blocking(move || -> XueliResult<bool> {
@@ -943,7 +943,11 @@ impl SqliteMemoryItemStore {
     }
 
     /// 关键词搜索（对应 Python 版 search_memories_by_keyword）
-    pub async fn search_memories_by_keyword(&self, keyword: &str, user_id: &str) -> XueliResult<Vec<MemoryItem>> {
+    pub async fn search_memories_by_keyword(
+        &self,
+        keyword: &str,
+        user_id: &str,
+    ) -> XueliResult<Vec<MemoryItem>> {
         let memories = self.get_by_user(user_id).await?;
         let key = keyword.to_lowercase();
         Ok(memories
@@ -980,7 +984,8 @@ impl SqliteMemoryItemStore {
         if shorter.len() < 4 {
             return false;
         }
-        longer.contains(shorter.as_str()) && (shorter.len() as f64 / longer.len().max(1) as f64) >= 0.75
+        longer.contains(shorter.as_str())
+            && (shorter.len() as f64 / longer.len().max(1) as f64) >= 0.75
     }
 
     /// 带去重的添加记忆（对应 Python 版 add_memory）
@@ -1037,7 +1042,11 @@ impl SqliteMemoryItemStore {
     }
 
     /// 完整版元数据加载（对应 Python 版 _load_metadata）
-    pub async fn load_metadata(&self, user_id: &str, mem_id: &str) -> XueliResult<Option<serde_json::Value>> {
+    pub async fn load_metadata(
+        &self,
+        user_id: &str,
+        mem_id: &str,
+    ) -> XueliResult<Option<serde_json::Value>> {
         let mem_id = mem_id.trim().to_string();
         let user_id = user_id.to_string();
         if user_id.is_empty() || mem_id.is_empty() {

@@ -192,9 +192,7 @@ impl GroupMessageCollector {
             Some(store) => {
                 let group_id = group_key.strip_prefix("group:").unwrap_or(group_key);
                 match store.get_recent_group_messages(group_id, 1).await {
-                    Ok(messages) => messages
-                        .last()
-                        .and_then(|m| Some(m.message_id.clone())),
+                    Ok(messages) => messages.last().and_then(|m| Some(m.message_id.clone())),
                     Err(_) => None,
                 }
             }
@@ -221,9 +219,7 @@ impl GroupMessageCollector {
                         .get_messages_after_id(&group_id, &msg.id)
                         .await
                         .unwrap_or_default();
-                    let already_exists = existing
-                        .iter()
-                        .any(|m| m.message_id == msg.id);
+                    let already_exists = existing.iter().any(|m| m.message_id == msg.id);
 
                     if !already_exists {
                         let record = MessageRecord::user(

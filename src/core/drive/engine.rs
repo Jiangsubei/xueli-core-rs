@@ -87,7 +87,9 @@ impl DriveEngine {
         self.snapshot.as_mut().unwrap()
     }
 
-    fn ensure_motivational(snap: &mut DriveSnapshot) -> &mut HashMap<String, MotivationalDimension> {
+    fn ensure_motivational(
+        snap: &mut DriveSnapshot,
+    ) -> &mut HashMap<String, MotivationalDimension> {
         for key in MotivationalKey::all() {
             if !snap.motivational.contains_key(key.as_str()) {
                 snap.motivational
@@ -172,7 +174,8 @@ impl DriveEngine {
         if !self.enabled {
             return;
         }
-        let (aff_delta, mot_deltas, guidance_list) = self.rule_engine.compute_deltas(event_patterns);
+        let (aff_delta, mot_deltas, guidance_list) =
+            self.rule_engine.compute_deltas(event_patterns);
         if aff_delta.is_zero() && mot_deltas.is_empty() {
             return;
         }
@@ -317,8 +320,7 @@ impl DriveEngine {
         for key in [MotivationalKey::SocialDrive, MotivationalKey::Proactivity] {
             if let Some(dim) = snap.motivational.get_mut(key.as_str()) {
                 // Logistic 增长恢复
-                dim.baseline =
-                    (dim.baseline + 0.1 * dim.baseline * (1.0 - dim.baseline)).min(1.0);
+                dim.baseline = (dim.baseline + 0.1 * dim.baseline * (1.0 - dim.baseline)).min(1.0);
                 dim.transient_offset = 0.0;
             }
         }

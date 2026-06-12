@@ -8,7 +8,9 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use xueli_core::core::platform_types::{EventType, GroupState, InboundEvent, ReplyAction, SessionRef};
+use xueli_core::core::platform_types::{
+    EventType, GroupState, InboundEvent, ReplyAction, SessionRef,
+};
 use xueli_core::core::scope::ChatScope;
 use xueli_core::core::types::UserMessage;
 use xueli_core::prelude::{XueliError, XueliResult};

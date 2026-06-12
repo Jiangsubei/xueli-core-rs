@@ -155,7 +155,10 @@ pub struct RelationshipProfileInternal {
 }
 
 impl RelationshipProfileInternal {
-    fn resolve_stage_with_thresholds(intimacy: f64, thresholds: &IntimacyThresholdConfig) -> String {
+    fn resolve_stage_with_thresholds(
+        intimacy: f64,
+        thresholds: &IntimacyThresholdConfig,
+    ) -> String {
         if intimacy >= thresholds.trusted {
             "intimate"
         } else if intimacy >= thresholds.close_friend {
@@ -181,7 +184,8 @@ impl RelationshipProfileInternal {
     }
 
     fn update_stage_with_thresholds(&mut self, thresholds: &IntimacyThresholdConfig) {
-        self.relationship_stage = Self::resolve_stage_with_thresholds(self.intimacy_level, thresholds);
+        self.relationship_stage =
+            Self::resolve_stage_with_thresholds(self.intimacy_level, thresholds);
     }
 }
 
@@ -486,11 +490,7 @@ impl CharacterCardService {
     }
 
     /// 保存关系画像
-    pub fn save_relationship_profile(
-        &self,
-        user_id: &str,
-        profile: &RelationshipProfileInternal,
-    ) {
+    pub fn save_relationship_profile(&self, user_id: &str, profile: &RelationshipProfileInternal) {
         if !self.config.relationship_tracking_enabled {
             return;
         }

@@ -336,16 +336,18 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
     ) -> Self {
         let mut end_tool_names = HashSet::new();
         end_tool_names.insert("reply".to_string());
-        let token_counter = TokenCounter::new_cl100k().unwrap_or_else(|_| TokenCounter::new_o200k().unwrap_or_else(|_| {
-            tracing::warn!("[ReplyAgent] TokenCounter 初始化失败，使用零计数回退");
-            TokenCounter::new_cl100k().unwrap_or_else(|_| {
-                // 双重失败时创建 bpe=None 的实例
+        let token_counter = TokenCounter::new_cl100k().unwrap_or_else(|_| {
+            TokenCounter::new_o200k().unwrap_or_else(|_| {
+                tracing::warn!("[ReplyAgent] TokenCounter 初始化失败，使用零计数回退");
                 TokenCounter::new_cl100k().unwrap_or_else(|_| {
-                    // 最终回退：这不应该发生，但保证编译通过
-                    panic!("TokenCounter 初始化失败")
+                    // 双重失败时创建 bpe=None 的实例
+                    TokenCounter::new_cl100k().unwrap_or_else(|_| {
+                        // 最终回退：这不应该发生，但保证编译通过
+                        panic!("TokenCounter 初始化失败")
+                    })
                 })
             })
-        }));
+        });
         Self {
             config,
             ai_client,
@@ -364,11 +366,7 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
 
     /// 注册插件工具
     pub fn load_plugin_tools(&mut self, tools: Vec<(String, Arc<dyn Tool>, serde_json::Value)>) {
-        let existing_names: HashSet<String> = self
-            .plugin_handlers
-            .keys()
-            .cloned()
-            .collect();
+        let existing_names: HashSet<String> = self.plugin_handlers.keys().cloned().collect();
         for (name, handler, _schema) in tools {
             if self.plugin_handlers.contains_key(&name) {
                 tracing::warn!("[ReplyAgent] 插件工具 {} 重复注册，跳过", name);
@@ -737,8 +735,10 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
                             }
                         }
                         // 提取 expected_effect
-                        end_tool_expected_effect =
-                            Self::normalize_expected_effect(args.get("expected_effect").unwrap_or(&serde_json::Value::Null));
+                        end_tool_expected_effect = Self::normalize_expected_effect(
+                            args.get("expected_effect")
+                                .unwrap_or(&serde_json::Value::Null),
+                        );
                     }
                 }
 
@@ -814,7 +814,12 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
             if recent_messages.is_empty() {
                 "（无近期对话记录）".to_string()
             } else {
-                recent_messages.iter().take(10).cloned().collect::<Vec<_>>().join("\n")
+                recent_messages
+                    .iter()
+                    .take(10)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n")
             },
             current_text,
             reference_hint
@@ -873,7 +878,10 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
                     t.get("function")
                         .and_then(|f| f.get("name"))
                         .and_then(|n| n.as_str())
-                        == tool_def.get("function").and_then(|f2| f2.get("name")).and_then(|n2| n2.as_str())
+                        == tool_def
+                            .get("function")
+                            .and_then(|f2| f2.get("name"))
+                            .and_then(|n2| n2.as_str())
                 });
                 if !already_exists {
                     active_tool_defs.push(tool_def);
@@ -926,7 +934,10 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
             matched_tools.push(tool.clone());
         }
 
-        let msg = format!("发现新工具: {}。后续对话中可以使用这些工具。", names.join(", "));
+        let msg = format!(
+            "发现新工具: {}。后续对话中可以使用这些工具。",
+            names.join(", ")
+        );
         (msg, matched_tools)
     }
 
@@ -986,7 +997,7 @@ mod tests {
                 MemoryManager::new(
                     Arc::new(crate::core::config::MemoryConfig {
                         enabled: true,
-                        db_path: ":memory:".to_string(),
+                        data_dir: "/tmp/xueli_test".to_string(),
                         storage_backend: "sqlite".to_string(),
                         extraction_min_messages: 5,
                         bm25_top_k: 10,

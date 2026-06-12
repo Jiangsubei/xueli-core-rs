@@ -227,7 +227,11 @@ impl NarrativeService {
                 arr.iter()
                     .filter_map(|v| {
                         let s = v.as_str().unwrap_or("").trim().to_string();
-                        if s.is_empty() { None } else { Some(s) }
+                        if s.is_empty() {
+                            None
+                        } else {
+                            Some(s)
+                        }
                     })
                     .take(8)
                     .collect()
@@ -240,7 +244,11 @@ impl NarrativeService {
                 arr.iter()
                     .filter_map(|v| {
                         let s = v.as_str().unwrap_or("").trim().to_string();
-                        if s.is_empty() { None } else { Some(s) }
+                        if s.is_empty() {
+                            None
+                        } else {
+                            Some(s)
+                        }
                     })
                     .take(8)
                     .collect()

@@ -41,7 +41,13 @@ pub struct EventDispatcherStats {
 type PreprocessorFn = Box<dyn Fn(&mut EventContext) + Send + Sync>;
 type PostprocessorFn = Box<dyn Fn(&EventContext) + Send + Sync>;
 type MessageHandlerFn = Box<dyn Fn(&InboundEvent) -> XueliResult<()> + Send + Sync>;
-type AsyncMessageHandlerFn = Box<dyn Fn(InboundEvent) -> std::pin::Pin<Box<dyn std::future::Future<Output = XueliResult<()>> + Send>> + Send + Sync>;
+type AsyncMessageHandlerFn = Box<
+    dyn Fn(
+            InboundEvent,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = XueliResult<()>> + Send>>
+        + Send
+        + Sync,
+>;
 
 // ── EventDispatcher ────────────────────────────────────────────────
 

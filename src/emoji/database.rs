@@ -381,7 +381,10 @@ impl EmojiDatabase {
     }
 
     /// 列出待分类的贴纸（自定义数量限制）
-    pub async fn list_pending_async_with_limit(&self, limit: usize) -> XueliResult<Vec<StickerRecord>> {
+    pub async fn list_pending_async_with_limit(
+        &self,
+        limit: usize,
+    ) -> XueliResult<Vec<StickerRecord>> {
         let db_path = self.db_path.clone();
         let effective_limit = limit.max(1);
         let _guard = self.lock.lock().await;
@@ -461,8 +464,7 @@ impl EmojiDatabase {
         let intent = intent.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let conn =
-                Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {}", e))?;
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {}", e))?;
             let mut stmt = conn
                 .prepare(
                     "SELECT file_hash, file_path, file_format, description, emotion_status,
@@ -487,7 +489,8 @@ impl EmojiDatabase {
 
     /// 根据文件路径查询贴纸记录
     pub fn get_record_by_path(&self, file_path: &str) -> XueliResult<Option<StickerRecord>> {
-        let conn = Connection::open(&self.db_path).map_err(|e| XueliError::Internal(format!("打开 DB 失败: {}", e)))?;
+        let conn = Connection::open(&self.db_path)
+            .map_err(|e| XueliError::Internal(format!("打开 DB 失败: {}", e)))?;
         conn.query_row(
             "SELECT file_hash, file_path, file_format, description, emotion_status,
                     is_registered, is_banned, query_count, auto_reply_count,
@@ -552,8 +555,7 @@ impl EmojiDatabase {
     pub async fn get_registered_count_async(&self) -> XueliResult<i64> {
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
-            let conn =
-                Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {}", e))?;
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {}", e))?;
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM stickers WHERE is_registered=1 AND is_banned=0",

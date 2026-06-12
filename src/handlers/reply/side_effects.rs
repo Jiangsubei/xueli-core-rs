@@ -144,7 +144,12 @@ impl ReplySideEffects {
 
         // 从缓存的 feedback_triage 信号中提取 style_label 和 emotion_label
         let triage_key = format!("{}:{}", group_id, user_id);
-        let signal = self.last_feedback_triage.lock().unwrap_or_else(|e| e.into_inner()).remove(&triage_key).unwrap_or_default();
+        let signal = self
+            .last_feedback_triage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&triage_key)
+            .unwrap_or_default();
         let style_label = signal
             .get("style_feedback_label")
             .and_then(|v| v.as_str())
@@ -157,9 +162,7 @@ impl ReplySideEffects {
             .unwrap_or("")
             .trim()
             .to_string();
-        let prediction_met = signal
-            .get("prediction_met")
-            .and_then(|v| v.as_bool());
+        let prediction_met = signal.get("prediction_met").and_then(|v| v.as_bool());
 
         // 尝试调用 apply_reply_effect_bundle
         let applied = ccs.apply_reply_effect_bundle(

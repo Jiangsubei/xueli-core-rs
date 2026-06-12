@@ -50,7 +50,11 @@ pub struct MemoryBackgroundCoordinator<L: PromptTemplateLoader + 'static> {
 }
 
 impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
-    pub fn new(config: Arc<MemoryConfig>, task_manager: Arc<MemoryTaskManager>, prompt_loader: Arc<L>) -> Self {
+    pub fn new(
+        config: Arc<MemoryConfig>,
+        task_manager: Arc<MemoryTaskManager>,
+        prompt_loader: Arc<L>,
+    ) -> Self {
         Self {
             auto_extract_memory: config.auto_extract,
             config,
@@ -338,18 +342,21 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
                 } else {
                     reg.closed_session_user_id.clone()
                 };
-                self.schedule_conversation_save(
-                    closed_user_id,
-                    reg.closed_session_id.clone(),
-                );
+                self.schedule_conversation_save(closed_user_id, reg.closed_session_id.clone());
             }
         }
 
         tracing::info!(
             "[后台协调] 已登记对话轮次：用户={}，会话={}，轮次={}",
             user_id,
-            registration.as_ref().map(|r| r.session_id.as_str()).unwrap_or(session_id),
-            registration.as_ref().map(|r| r.turn_id).unwrap_or(turn_id as i64),
+            registration
+                .as_ref()
+                .map(|r| r.session_id.as_str())
+                .unwrap_or(session_id),
+            registration
+                .as_ref()
+                .map(|r| r.turn_id)
+                .unwrap_or(turn_id as i64),
         );
     }
 
@@ -1073,7 +1080,11 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
 
     /// 构建记忆提取系统提示词 — 优先从模板加载，失败则兜底
     async fn build_extraction_system_prompt(&self) -> String {
-        if let Ok(template) = self.prompt_loader.get_template("zh-CN", "memory_extraction").await {
+        if let Ok(template) = self
+            .prompt_loader
+            .get_template("zh-CN", "memory_extraction")
+            .await
+        {
             return template;
         }
         // 兜底
@@ -1106,7 +1117,11 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
 
     /// 构建记忆提取用户提示词 — 优先从模板加载，失败则兜底
     async fn build_extraction_user_prompt(&self, conversation: &str) -> String {
-        if let Ok(template) = self.prompt_loader.get_template("zh-CN", "memory_extraction_user").await {
+        if let Ok(template) = self
+            .prompt_loader
+            .get_template("zh-CN", "memory_extraction_user")
+            .await
+        {
             let vars = std::collections::HashMap::from([("conversation", conversation)]);
             return self.prompt_loader.render(&template, &vars);
         }
@@ -1119,7 +1134,11 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
 
     /// 构建 insight 消化系统提示词 — 优先从模板加载，失败则兜底
     async fn build_insight_system_prompt(&self) -> String {
-        if let Ok(template) = self.prompt_loader.get_template("zh-CN", "insight_digestion").await {
+        if let Ok(template) = self
+            .prompt_loader
+            .get_template("zh-CN", "insight_digestion")
+            .await
+        {
             return template;
         }
         // 兜底
@@ -1136,7 +1155,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
 
 如果近期记忆中没有值得提炼的洞察，has_insight 设为 false。
 只输出 JSON，不要额外说明。"#
-        .to_string()
+            .to_string()
     }
 }
 

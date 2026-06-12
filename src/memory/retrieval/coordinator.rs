@@ -205,9 +205,7 @@ impl RetrievalCoordinator {
     ) -> XueliResult<Vec<MemoryItem>> {
         let _context = MemoryAccessContext::new(user_id, scope);
 
-        let retrieval_result = self
-            .retrieve(query, user_id, top_k * 2, top_k * 2)
-            .await?;
+        let retrieval_result = self.retrieve(query, user_id, top_k * 2, top_k * 2).await?;
 
         let mut filtered: Vec<MemoryItem> = Vec::new();
         for item in retrieval_result.items {

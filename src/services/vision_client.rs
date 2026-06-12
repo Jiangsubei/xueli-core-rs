@@ -87,26 +87,17 @@ impl ImageAnalysisResult {
 
     /// 判断指定索引的图片是否为表情贴纸
     pub fn is_sticker(&self, index: usize) -> bool {
-        self.sticker_flags
-            .get(index)
-            .copied()
-            .unwrap_or(false)
+        self.sticker_flags.get(index).copied().unwrap_or(false)
     }
 
     /// 获取指定索引图片的贴纸识别置信度
     pub fn get_sticker_confidence(&self, index: usize) -> f64 {
-        self.sticker_confidences
-            .get(index)
-            .copied()
-            .unwrap_or(0.0)
+        self.sticker_confidences.get(index).copied().unwrap_or(0.0)
     }
 
     /// 获取指定索引图片被识别为贴纸的原因
     pub fn get_sticker_reason(&self, index: usize) -> String {
-        self.sticker_reasons
-            .get(index)
-            .cloned()
-            .unwrap_or_default()
+        self.sticker_reasons.get(index).cloned().unwrap_or_default()
     }
 
     /// 获取指定索引图片的描述文本
@@ -139,8 +130,14 @@ impl ImageAnalysisResult {
                 );
             }
         }
-        fields.insert("vision_success_count".to_string(), self.success_count.to_string());
-        fields.insert("vision_failure_count".to_string(), self.failure_count.to_string());
+        fields.insert(
+            "vision_success_count".to_string(),
+            self.success_count.to_string(),
+        );
+        fields.insert(
+            "vision_failure_count".to_string(),
+            self.failure_count.to_string(),
+        );
         fields.insert("vision_source".to_string(), self.source.clone());
         fields.insert(
             "vision_error".to_string(),
@@ -150,7 +147,10 @@ impl ImageAnalysisResult {
             "vision_available".to_string(),
             self.has_usable_description().to_string(),
         );
-        fields.insert("sticker_count".to_string(), self.sticker_count().to_string());
+        fields.insert(
+            "sticker_count".to_string(),
+            self.sticker_count().to_string(),
+        );
         fields
     }
 

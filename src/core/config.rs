@@ -379,8 +379,9 @@ pub struct MemoryConfig {
     /// 是否启用
     #[serde(default)]
     pub enabled: bool,
-    /// SQLite 数据库路径
-    pub db_path: String,
+    /// 数据存储目录（各数据库文件如 conversations.db、important.db、xueli_memory.db 等存放于此）
+    #[serde(default = "default_memory_data_dir")]
+    pub data_dir: String,
     /// 存储后端
     #[serde(default = "default_storage_backend")]
     pub storage_backend: String,
@@ -461,6 +462,10 @@ pub struct MemoryConfig {
     pub dispute: MemoryDisputeConfig,
 }
 
+fn default_memory_data_dir() -> String {
+    "data".to_string()
+}
+
 fn default_pre_rerank_top_k() -> usize {
     12
 }
@@ -500,7 +505,7 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            db_path: "data/xueli_memory.db".to_string(),
+            data_dir: default_memory_data_dir(),
             storage_backend: default_storage_backend(),
             extraction_min_messages: 5,
             bm25_top_k: 10,
@@ -1792,13 +1797,17 @@ impl XueliConfig {
         }
 
         // 延迟参数一致性
-        if self.bot_behavior.first_segment_delay_min_ms > self.bot_behavior.first_segment_delay_max_ms {
+        if self.bot_behavior.first_segment_delay_min_ms
+            > self.bot_behavior.first_segment_delay_max_ms
+        {
             errors.push(
                 "bot_behavior.first_segment_delay_min_ms 不能大于 first_segment_delay_max_ms"
                     .to_string(),
             );
         }
-        if self.bot_behavior.followup_delay_min_seconds > self.bot_behavior.followup_delay_max_seconds {
+        if self.bot_behavior.followup_delay_min_seconds
+            > self.bot_behavior.followup_delay_max_seconds
+        {
             errors.push(
                 "bot_behavior.followup_delay_min_seconds 不能大于 followup_delay_max_seconds"
                     .to_string(),
@@ -1806,7 +1815,9 @@ impl XueliConfig {
         }
 
         // 记忆冲突阈值一致性
-        if self.memory_dispute.normal_confidence_threshold > self.memory_dispute.high_confidence_threshold {
+        if self.memory_dispute.normal_confidence_threshold
+            > self.memory_dispute.high_confidence_threshold
+        {
             errors.push(
                 "memory_dispute.normal_confidence_threshold 不能大于 high_confidence_threshold"
                     .to_string(),
@@ -1849,7 +1860,11 @@ impl XueliConfig {
     /// 获取助手名称
     pub fn get_assistant_name(&self) -> &str {
         let name = self.identity.name.trim();
-        if name.is_empty() { "AI助手" } else { name }
+        if name.is_empty() {
+            "AI助手"
+        } else {
+            name
+        }
     }
 
     /// 获取助手别名
@@ -1860,99 +1875,161 @@ impl XueliConfig {
     /// 获取 AI 主服务的客户端配置
     pub fn get_ai_service_client_config(&self) -> HashMap<String, serde_json::Value> {
         let mut map = HashMap::new();
-        map.insert("api_base".to_string(), serde_json::Value::String(self.model.api_base.clone()));
-        map.insert("api_key".to_string(), serde_json::Value::String(self.model.api_key.clone()));
-        map.insert("model".to_string(), serde_json::Value::String(self.model.primary_model.clone()));
-        map.insert("context_window".to_string(), serde_json::Value::Number(self.model.context_window.into()));
-        map.insert("response_path".to_string(), serde_json::Value::String(self.model.response_path.clone()));
+        map.insert(
+            "api_base".to_string(),
+            serde_json::Value::String(self.model.api_base.clone()),
+        );
+        map.insert(
+            "api_key".to_string(),
+            serde_json::Value::String(self.model.api_key.clone()),
+        );
+        map.insert(
+            "model".to_string(),
+            serde_json::Value::String(self.model.primary_model.clone()),
+        );
+        map.insert(
+            "context_window".to_string(),
+            serde_json::Value::Number(self.model.context_window.into()),
+        );
+        map.insert(
+            "response_path".to_string(),
+            serde_json::Value::String(self.model.response_path.clone()),
+        );
         map
     }
 
     /// 获取记忆提取模型的客户端配置
     pub fn get_memory_extraction_client_config(&self) -> HashMap<String, serde_json::Value> {
         let mut map = HashMap::new();
-        map.insert("api_base".to_string(), serde_json::Value::String(
-            self.memory.extraction_api_base.clone().unwrap_or_default(),
-        ));
-        map.insert("api_key".to_string(), serde_json::Value::String(
-            self.memory.extraction_api_key.clone().unwrap_or_default(),
-        ));
-        map.insert("model".to_string(), serde_json::Value::String(
-            self.memory.extraction_model.clone().unwrap_or_default(),
-        ));
-        map.insert("context_window".to_string(), serde_json::Value::Number(
-            self.memory.extraction_context_window.into(),
-        ));
-        map.insert("response_path".to_string(), serde_json::Value::String(
-            self.memory.extraction_response_path.clone().unwrap_or_else(|| self.model.response_path.clone()),
-        ));
+        map.insert(
+            "api_base".to_string(),
+            serde_json::Value::String(self.memory.extraction_api_base.clone().unwrap_or_default()),
+        );
+        map.insert(
+            "api_key".to_string(),
+            serde_json::Value::String(self.memory.extraction_api_key.clone().unwrap_or_default()),
+        );
+        map.insert(
+            "model".to_string(),
+            serde_json::Value::String(self.memory.extraction_model.clone().unwrap_or_default()),
+        );
+        map.insert(
+            "context_window".to_string(),
+            serde_json::Value::Number(self.memory.extraction_context_window.into()),
+        );
+        map.insert(
+            "response_path".to_string(),
+            serde_json::Value::String(
+                self.memory
+                    .extraction_response_path
+                    .clone()
+                    .unwrap_or_else(|| self.model.response_path.clone()),
+            ),
+        );
         map
     }
 
     /// 获取记忆重排序模型的客户端配置
     pub fn get_memory_rerank_client_config(&self) -> HashMap<String, serde_json::Value> {
         let mut map = HashMap::new();
-        map.insert("api_base".to_string(), serde_json::Value::String(
-            self.memory_rerank.api_base.clone().unwrap_or_default(),
-        ));
-        map.insert("api_key".to_string(), serde_json::Value::String(
-            self.memory_rerank.api_key.clone().unwrap_or_default(),
-        ));
-        map.insert("model".to_string(), serde_json::Value::String(
-            self.memory_rerank.model.clone(),
-        ));
-        map.insert("context_window".to_string(), serde_json::Value::Number(
-            self.memory_rerank.context_window.into(),
-        ));
-        map.insert("response_path".to_string(), serde_json::Value::String(
-            self.memory_rerank.extra_params.get("response_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(&self.model.response_path)
-                .to_string(),
-        ));
+        map.insert(
+            "api_base".to_string(),
+            serde_json::Value::String(self.memory_rerank.api_base.clone().unwrap_or_default()),
+        );
+        map.insert(
+            "api_key".to_string(),
+            serde_json::Value::String(self.memory_rerank.api_key.clone().unwrap_or_default()),
+        );
+        map.insert(
+            "model".to_string(),
+            serde_json::Value::String(self.memory_rerank.model.clone()),
+        );
+        map.insert(
+            "context_window".to_string(),
+            serde_json::Value::Number(self.memory_rerank.context_window.into()),
+        );
+        map.insert(
+            "response_path".to_string(),
+            serde_json::Value::String(
+                self.memory_rerank
+                    .extra_params
+                    .get("response_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&self.model.response_path)
+                    .to_string(),
+            ),
+        );
         map
     }
 
     /// 获取群聊回复决策模型的客户端配置
     pub fn get_group_reply_decision_client_config(&self) -> HashMap<String, serde_json::Value> {
         let mut map = HashMap::new();
-        map.insert("api_base".to_string(), serde_json::Value::String(
-            self.group_reply_decision.api_base.clone().unwrap_or_default(),
-        ));
-        map.insert("api_key".to_string(), serde_json::Value::String(
-            self.group_reply_decision.api_key.clone().unwrap_or_default(),
-        ));
-        map.insert("model".to_string(), serde_json::Value::String(
-            self.group_reply_decision.model.clone(),
-        ));
-        map.insert("context_window".to_string(), serde_json::Value::Number(
-            self.group_reply_decision.context_window.into(),
-        ));
-        map.insert("response_path".to_string(), serde_json::Value::String(
-            self.model.response_path.clone(),
-        ));
+        map.insert(
+            "api_base".to_string(),
+            serde_json::Value::String(
+                self.group_reply_decision
+                    .api_base
+                    .clone()
+                    .unwrap_or_default(),
+            ),
+        );
+        map.insert(
+            "api_key".to_string(),
+            serde_json::Value::String(
+                self.group_reply_decision
+                    .api_key
+                    .clone()
+                    .unwrap_or_default(),
+            ),
+        );
+        map.insert(
+            "model".to_string(),
+            serde_json::Value::String(self.group_reply_decision.model.clone()),
+        );
+        map.insert(
+            "context_window".to_string(),
+            serde_json::Value::Number(self.group_reply_decision.context_window.into()),
+        );
+        map.insert(
+            "response_path".to_string(),
+            serde_json::Value::String(self.model.response_path.clone()),
+        );
         map
     }
 
     /// 获取视觉服务的客户端配置
     pub fn get_vision_client_config(&self) -> HashMap<String, serde_json::Value> {
         let mut map = HashMap::new();
-        map.insert("enabled".to_string(), serde_json::Value::Bool(self.vision.enabled));
-        map.insert("api_base".to_string(), serde_json::Value::String(
-            self.vision.api_base.clone().unwrap_or_default(),
-        ));
-        map.insert("api_key".to_string(), serde_json::Value::String(
-            self.vision.api_key.clone().unwrap_or_default(),
-        ));
-        map.insert("model".to_string(), serde_json::Value::String(
-            self.vision.model.clone().unwrap_or_default(),
-        ));
-        map.insert("context_window".to_string(), serde_json::Value::Number(
-            self.vision.context_window.into(),
-        ));
-        map.insert("response_path".to_string(), serde_json::Value::String(
-            self.vision.response_path.clone().unwrap_or_else(|| self.model.response_path.clone()),
-        ));
+        map.insert(
+            "enabled".to_string(),
+            serde_json::Value::Bool(self.vision.enabled),
+        );
+        map.insert(
+            "api_base".to_string(),
+            serde_json::Value::String(self.vision.api_base.clone().unwrap_or_default()),
+        );
+        map.insert(
+            "api_key".to_string(),
+            serde_json::Value::String(self.vision.api_key.clone().unwrap_or_default()),
+        );
+        map.insert(
+            "model".to_string(),
+            serde_json::Value::String(self.vision.model.clone().unwrap_or_default()),
+        );
+        map.insert(
+            "context_window".to_string(),
+            serde_json::Value::Number(self.vision.context_window.into()),
+        );
+        map.insert(
+            "response_path".to_string(),
+            serde_json::Value::String(
+                self.vision
+                    .response_path
+                    .clone()
+                    .unwrap_or_else(|| self.model.response_path.clone()),
+            ),
+        );
         map
     }
 }

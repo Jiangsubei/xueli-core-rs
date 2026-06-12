@@ -396,9 +396,7 @@ impl DriveContext {
         if !self.user_id.is_empty() {
             lines.push(format!(
                 "关系: 亲密度={:.2} 信任度={:.2} 关注={:.2}",
-                self.relational.intimacy,
-                self.relational.trust,
-                self.relational.attention_weight
+                self.relational.intimacy, self.relational.trust, self.relational.attention_weight
             ));
         }
 

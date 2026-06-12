@@ -259,11 +259,25 @@ mod tests {
         async fn send_action(&self, _action: &ReplyAction) -> crate::prelude::XueliResult<()> {
             Ok(())
         }
-        fn strip_mentions(&self, text: &str) -> String { text.to_string() }
-        fn extract_mentions(&self, _event: &crate::core::platform_types::InboundEvent) -> Vec<String> { vec![] }
-        fn resolve_mention_placeholders(&self, text: &str, _mentions: &[String]) -> String { text.to_string() }
-        fn platform_name(&self) -> &str { "test" }
-        fn parse_event(&self, _raw: &str) -> crate::prelude::XueliResult<crate::core::platform_types::InboundEvent> {
+        fn strip_mentions(&self, text: &str) -> String {
+            text.to_string()
+        }
+        fn extract_mentions(
+            &self,
+            _event: &crate::core::platform_types::InboundEvent,
+        ) -> Vec<String> {
+            vec![]
+        }
+        fn resolve_mention_placeholders(&self, text: &str, _mentions: &[String]) -> String {
+            text.to_string()
+        }
+        fn platform_name(&self) -> &str {
+            "test"
+        }
+        fn parse_event(
+            &self,
+            _raw: &str,
+        ) -> crate::prelude::XueliResult<crate::core::platform_types::InboundEvent> {
             unimplemented!()
         }
     }
@@ -362,6 +376,8 @@ mod tests {
             .unwrap()
             .as_secs_f64()
             + 3600.0;
-        assert!(!ReplySender::<NoopPlatformAdapter>::is_window_expired(future));
+        assert!(!ReplySender::<NoopPlatformAdapter>::is_window_expired(
+            future
+        ));
     }
 }

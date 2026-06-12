@@ -72,7 +72,9 @@ pub struct ConversationContext {
 ///
 /// 集成 MemoryManager、CharacterCardService、NarrativeService、
 /// ReplyStylePolicy 等组件，对应 Python 版 `ConversationContextBuilder`。
-pub struct ConversationContextBuilder<L: PromptTemplateLoader + 'static = crate::services::prompt_loader::NoopPromptTemplateLoader> {
+pub struct ConversationContextBuilder<
+    L: PromptTemplateLoader + 'static = crate::services::prompt_loader::NoopPromptTemplateLoader,
+> {
     store: Arc<SqliteConversationStore>,
     session_manager: Option<Arc<ConversationSessionManager>>,
     memory_manager: Option<Arc<MemoryManager<L>>>,
@@ -298,11 +300,9 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
                 if lines.is_empty() {
                     None
                 } else {
-                    Some(
-                        crate::handlers::reply::pipeline::format_memory_context(
-                            &lines,
-                        ),
-                    )
+                    Some(crate::handlers::reply::pipeline::format_memory_context(
+                        &lines,
+                    ))
                 }
             }
             Err(_) => None,
@@ -506,7 +506,9 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
     }
 }
 
-impl Default for ConversationContextBuilder<crate::services::prompt_loader::FilePromptTemplateLoader> {
+impl Default
+    for ConversationContextBuilder<crate::services::prompt_loader::FilePromptTemplateLoader>
+{
     fn default() -> Self {
         let dir = std::path::PathBuf::from("data/conversations");
         let store =

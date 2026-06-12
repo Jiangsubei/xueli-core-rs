@@ -55,10 +55,7 @@ pub fn format_memory_context(memory_lines: &[String]) -> String {
 }
 
 /// 格式化并去重记忆行
-pub fn format_memory_context_and_dedupe(
-    memory_lines: &[String],
-    existing_context: &str,
-) -> String {
+pub fn format_memory_context_and_dedupe(memory_lines: &[String], existing_context: &str) -> String {
     let existing = collect_memory_lines_from_text(existing_context);
     let deduped = dedupe_memory_lines(memory_lines, &existing);
     format_memory_context(&deduped)
@@ -241,8 +238,7 @@ impl<L: PromptTemplateLoader + 'static> ReplyPipeline<L> {
                                 .and_then(|v| v.as_str().map(|s| s.to_string()))
                         })
                         .collect();
-                    result.session_restore_context =
-                        format_memory_context_and_dedupe(&entries, "");
+                    result.session_restore_context = format_memory_context_and_dedupe(&entries, "");
                 }
                 if !ctx_result.dynamic_memories.is_empty() {
                     let entries: Vec<String> = ctx_result
@@ -446,7 +442,10 @@ mod tests {
     #[tokio::test]
     async fn test_load_memory_context_empty() {
         let config = Arc::new(XueliConfig::default());
-        let pipeline = ReplyPipeline::<crate::services::prompt_loader::NoopPromptTemplateLoader>::new(config, None, None);
+        let pipeline =
+            ReplyPipeline::<crate::services::prompt_loader::NoopPromptTemplateLoader>::new(
+                config, None, None,
+            );
         let result = pipeline
             .load_memory_context("user1", "scope1", false, 0)
             .await;

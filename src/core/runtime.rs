@@ -6,12 +6,12 @@ use chrono::{Local, Timelike};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::core::config::{ProactiveShareConfig, XueliConfig};
+use crate::core::errors::XueliError;
 use crate::core::log_labels::{LOG_RETRY, LOG_STARTUP_INFO};
 use crate::core::log_text::preview_text_for_log;
 use crate::core::metrics::RuntimeMetrics;
 use crate::core::platform_types::{GroupState, InboundEvent, ReplyAction};
 use crate::core::scope::ChatScope;
-use crate::core::errors::XueliError;
 use crate::handlers::message_handler::MessageHandler;
 use crate::prelude::XueliResult;
 use crate::proactive_share::scheduler::ProactiveShareScheduler;
@@ -987,7 +987,9 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
 
         // P0：非@群聊消息 → 缓冲并检查阈值
         if !is_private && !is_mention && !deferred_trigger {
-            let should_process = self.register_pending_message(&group_key, Some(event.clone())).await;
+            let should_process = self
+                .register_pending_message(&group_key, Some(event.clone()))
+                .await;
             if !should_process {
                 // P3 中断：若 Agent 正在运行，发送中断信号
                 let flags = self.group_interrupt_flags.lock().await;
@@ -1005,7 +1007,18 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
         }
 
         // 执行处理（含回复锁）
-        match self.handle_message_inner(event, &group_key, &session_key, trace_id, is_private, is_mention, from_wait).await {
+        match self
+            .handle_message_inner(
+                event,
+                &group_key,
+                &session_key,
+                trace_id,
+                is_private,
+                is_mention,
+                from_wait,
+            )
+            .await
+        {
             Ok(()) => Ok(()),
             Err(XueliError::ReqAbort) => {
                 tracing::info!("[中断] key={} 推理被中断, 重新收集消息", group_key);
@@ -1081,7 +1094,9 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
                     metrics.record_error();
                 }
                 self.cleanup_after_processing(group_key).await;
-                return Err(XueliError::AIService(crate::core::errors::AIServiceError::Timeout));
+                return Err(XueliError::AIService(
+                    crate::core::errors::AIServiceError::Timeout,
+                ));
             }
         };
 
@@ -1115,7 +1130,8 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
                 // WAIT 处理
                 if !is_private {
                     self.set_group_waiting(group_key).await;
-                    self.handle_agent_wait(event, group_key, trace_id, from_wait).await;
+                    self.handle_agent_wait(event, group_key, trace_id, from_wait)
+                        .await;
                 } else {
                     self.set_group_stopped(group_key).await;
                 }
@@ -1270,10 +1286,12 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
                 ChatScope::Group(gid) => Some(gid.clone()),
                 _ => None,
             })
-            .or_else(|| event.session.as_ref().and_then(|s| match &s.scope {
-                ChatScope::Group(gid) => Some(gid.clone()),
-                _ => None,
-            }))
+            .or_else(|| {
+                event.session.as_ref().and_then(|s| match &s.scope {
+                    ChatScope::Group(gid) => Some(gid.clone()),
+                    _ => None,
+                })
+            })
             .unwrap_or_else(|| self.get_session_key(event))
     }
 
@@ -1362,13 +1380,16 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
             metrics.snapshot()
         };
         let mut cache = self.status_cache.write().await;
-        cache.messages_received = snapshot.get("total_messages_received")
+        cache.messages_received = snapshot
+            .get("total_messages_received")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        cache.messages_sent = snapshot.get("reply_parts_sent")
+        cache.messages_sent = snapshot
+            .get("reply_parts_sent")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        cache.errors = snapshot.get("message_errors")
+        cache.errors = snapshot
+            .get("message_errors")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
     }
@@ -1382,7 +1403,10 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
     pub async fn get_status(&self) -> HashMap<String, serde_json::Value> {
         let mut status = HashMap::new();
         let cache = self.status_cache.read().await;
-        status.insert("connected".to_string(), serde_json::Value::Bool(cache.connected));
+        status.insert(
+            "connected".to_string(),
+            serde_json::Value::Bool(cache.connected),
+        );
         status.insert("ready".to_string(), serde_json::Value::Bool(cache.ready));
         status.insert(
             "messages_received".to_string(),
@@ -1489,14 +1513,13 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
             }
             None => {
                 // 无中断标记 → 直接调用
-                match tokio::time::timeout(
-                    Duration::from_secs(response_timeout.max(1)),
-                    ai_call,
-                )
-                .await
+                match tokio::time::timeout(Duration::from_secs(response_timeout.max(1)), ai_call)
+                    .await
                 {
                     Ok(result) => result,
-                    Err(_) => Err(XueliError::AIService(crate::core::errors::AIServiceError::Timeout)),
+                    Err(_) => Err(XueliError::AIService(
+                        crate::core::errors::AIServiceError::Timeout,
+                    )),
                 }
             }
         }

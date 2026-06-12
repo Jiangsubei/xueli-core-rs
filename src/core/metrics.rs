@@ -161,7 +161,8 @@ impl RuntimeMetrics {
     }
 
     pub fn record_message_received_count(&self, count: u64) {
-        self.total_messages_received.fetch_add(count, Ordering::Relaxed);
+        self.total_messages_received
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn record_reply_sent(&self, latency_ms: f64) {
@@ -219,9 +220,15 @@ impl RuntimeMetrics {
 
     pub fn record_planner_action(&self, action: &str) {
         match action.trim().to_lowercase().as_str() {
-            "reply" => { self.planner_reply.fetch_add(1, Ordering::Relaxed); }
-            "wait" => { self.planner_wait.fetch_add(1, Ordering::Relaxed); }
-            "ignore" => { self.planner_ignore.fetch_add(1, Ordering::Relaxed); }
+            "reply" => {
+                self.planner_reply.fetch_add(1, Ordering::Relaxed);
+            }
+            "wait" => {
+                self.planner_wait.fetch_add(1, Ordering::Relaxed);
+            }
+            "ignore" => {
+                self.planner_ignore.fetch_add(1, Ordering::Relaxed);
+            }
             _ => {}
         }
     }
@@ -239,8 +246,10 @@ impl RuntimeMetrics {
             return;
         }
         self.vision_requests.fetch_add(1, Ordering::Relaxed);
-        self.vision_images_processed.fetch_add(image_count, Ordering::Relaxed);
-        self.vision_failures.fetch_add(failure_count, Ordering::Relaxed);
+        self.vision_images_processed
+            .fetch_add(image_count, Ordering::Relaxed);
+        self.vision_failures
+            .fetch_add(failure_count, Ordering::Relaxed);
     }
 
     // ── 表情统计 ──────────────────────────────────────────────
@@ -254,11 +263,13 @@ impl RuntimeMetrics {
     }
 
     pub fn record_emoji_classification_failure(&self, count: u64) {
-        self.emoji_classification_failures.fetch_add(count, Ordering::Relaxed);
+        self.emoji_classification_failures
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn record_emoji_reply_decision(&self, count: u64) {
-        self.emoji_reply_decisions.fetch_add(count, Ordering::Relaxed);
+        self.emoji_reply_decisions
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn record_emoji_reply_sent(&self, count: u64) {
@@ -270,7 +281,8 @@ impl RuntimeMetrics {
     }
 
     pub fn record_emoji_reply_no_candidate(&self, count: u64) {
-        self.emoji_reply_no_candidate.fetch_add(count, Ordering::Relaxed);
+        self.emoji_reply_no_candidate
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn record_emoji_total(&self, count: u64) {
@@ -278,7 +290,8 @@ impl RuntimeMetrics {
     }
 
     pub fn set_emoji_pending_classification(&self, count: u64) {
-        self.emoji_pending_classification.store(count, Ordering::Relaxed);
+        self.emoji_pending_classification
+            .store(count, Ordering::Relaxed);
     }
 
     pub fn set_emoji_disabled(&self, count: u64) {
@@ -286,7 +299,8 @@ impl RuntimeMetrics {
     }
 
     pub fn set_emoji_active_classifiers(&self, count: u64) {
-        self.emoji_active_classifiers.store(count, Ordering::Relaxed);
+        self.emoji_active_classifiers
+            .store(count, Ordering::Relaxed);
     }
 
     // ── 记忆统计 ──────────────────────────────────────────────
@@ -303,7 +317,8 @@ impl RuntimeMetrics {
     }
 
     pub fn inc_memory_scene_rule_hits(&self, count: u64) {
-        self.memory_scene_rule_hits.fetch_add(count, Ordering::Relaxed);
+        self.memory_scene_rule_hits
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn record_memory_write(&self, count: u64) {
@@ -311,7 +326,8 @@ impl RuntimeMetrics {
     }
 
     pub fn record_memory_access_denied(&self, count: u64) {
-        self.memory_access_denied.fetch_add(count, Ordering::Relaxed);
+        self.memory_access_denied
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn inc_memory_migration(&self, count: u64) {
@@ -355,7 +371,8 @@ impl RuntimeMetrics {
     // ── 信号统计 ──────────────────────────────────────────────
 
     pub fn record_signal_l1_stale_invalidation(&self, count: u64) {
-        self.signal_l1_stale_invalidation.fetch_add(count, Ordering::Relaxed);
+        self.signal_l1_stale_invalidation
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     // ── 快照 ──────────────────────────────────────────────────
@@ -363,58 +380,177 @@ impl RuntimeMetrics {
     /// 返回所有指标的快照（含 uptime_seconds 和 last_error_at）
     pub fn snapshot(&self) -> HashMap<String, serde_json::Value> {
         let mut map = HashMap::new();
-        map.insert("ready".to_string(), serde_json::Value::Bool(self.is_ready()));
-        map.insert("connected".to_string(), serde_json::Value::Bool(self.is_connected()));
-        map.insert("uptime_seconds".to_string(), serde_json::Value::Number(
-            serde_json::Number::from_f64(self.started_at.elapsed().as_secs_f64().round()).unwrap_or(serde_json::Number::from(0)),
-        ));
-        map.insert("last_error_at".to_string(), serde_json::Value::String(
-            self.last_error_at.lock().ok().and_then(|v| v.clone()).unwrap_or_default(),
-        ));
+        map.insert(
+            "ready".to_string(),
+            serde_json::Value::Bool(self.is_ready()),
+        );
+        map.insert(
+            "connected".to_string(),
+            serde_json::Value::Bool(self.is_connected()),
+        );
+        map.insert(
+            "uptime_seconds".to_string(),
+            serde_json::Value::Number(
+                serde_json::Number::from_f64(self.started_at.elapsed().as_secs_f64().round())
+                    .unwrap_or(serde_json::Number::from(0)),
+            ),
+        );
+        map.insert(
+            "last_error_at".to_string(),
+            serde_json::Value::String(
+                self.last_error_at
+                    .lock()
+                    .ok()
+                    .and_then(|v| v.clone())
+                    .unwrap_or_default(),
+            ),
+        );
 
         let u64_fields = [
-            ("total_messages_received", self.total_messages_received.load(Ordering::Relaxed)),
-            ("total_replies_sent", self.total_replies_sent.load(Ordering::Relaxed)),
-            ("reply_parts_sent", self.reply_parts_sent.load(Ordering::Relaxed)),
-            ("message_errors", self.message_errors.load(Ordering::Relaxed)),
+            (
+                "total_messages_received",
+                self.total_messages_received.load(Ordering::Relaxed),
+            ),
+            (
+                "total_replies_sent",
+                self.total_replies_sent.load(Ordering::Relaxed),
+            ),
+            (
+                "reply_parts_sent",
+                self.reply_parts_sent.load(Ordering::Relaxed),
+            ),
+            (
+                "message_errors",
+                self.message_errors.load(Ordering::Relaxed),
+            ),
             ("total_ignored", self.total_ignored.load(Ordering::Relaxed)),
-            ("total_ai_calls", self.total_ai_calls.load(Ordering::Relaxed)),
-            ("total_tokens_used", self.total_tokens_used.load(Ordering::Relaxed)),
+            (
+                "total_ai_calls",
+                self.total_ai_calls.load(Ordering::Relaxed),
+            ),
+            (
+                "total_tokens_used",
+                self.total_tokens_used.load(Ordering::Relaxed),
+            ),
             ("command_hits", self.command_hits.load(Ordering::Relaxed)),
             ("planner_reply", self.planner_reply.load(Ordering::Relaxed)),
             ("planner_wait", self.planner_wait.load(Ordering::Relaxed)),
-            ("planner_ignore", self.planner_ignore.load(Ordering::Relaxed)),
-            ("vision_requests", self.vision_requests.load(Ordering::Relaxed)),
-            ("vision_images_processed", self.vision_images_processed.load(Ordering::Relaxed)),
-            ("vision_failures", self.vision_failures.load(Ordering::Relaxed)),
-            ("vision_reused_from_plan", self.vision_reused_from_plan.load(Ordering::Relaxed)),
-            ("emoji_detected", self.emoji_detected.load(Ordering::Relaxed)),
-            ("emoji_classified", self.emoji_classified.load(Ordering::Relaxed)),
-            ("emoji_classification_failures", self.emoji_classification_failures.load(Ordering::Relaxed)),
-            ("emoji_reply_decisions", self.emoji_reply_decisions.load(Ordering::Relaxed)),
-            ("emoji_reply_sent", self.emoji_reply_sent.load(Ordering::Relaxed)),
-            ("emoji_reply_skipped", self.emoji_reply_skipped.load(Ordering::Relaxed)),
-            ("emoji_reply_no_candidate", self.emoji_reply_no_candidate.load(Ordering::Relaxed)),
+            (
+                "planner_ignore",
+                self.planner_ignore.load(Ordering::Relaxed),
+            ),
+            (
+                "vision_requests",
+                self.vision_requests.load(Ordering::Relaxed),
+            ),
+            (
+                "vision_images_processed",
+                self.vision_images_processed.load(Ordering::Relaxed),
+            ),
+            (
+                "vision_failures",
+                self.vision_failures.load(Ordering::Relaxed),
+            ),
+            (
+                "vision_reused_from_plan",
+                self.vision_reused_from_plan.load(Ordering::Relaxed),
+            ),
+            (
+                "emoji_detected",
+                self.emoji_detected.load(Ordering::Relaxed),
+            ),
+            (
+                "emoji_classified",
+                self.emoji_classified.load(Ordering::Relaxed),
+            ),
+            (
+                "emoji_classification_failures",
+                self.emoji_classification_failures.load(Ordering::Relaxed),
+            ),
+            (
+                "emoji_reply_decisions",
+                self.emoji_reply_decisions.load(Ordering::Relaxed),
+            ),
+            (
+                "emoji_reply_sent",
+                self.emoji_reply_sent.load(Ordering::Relaxed),
+            ),
+            (
+                "emoji_reply_skipped",
+                self.emoji_reply_skipped.load(Ordering::Relaxed),
+            ),
+            (
+                "emoji_reply_no_candidate",
+                self.emoji_reply_no_candidate.load(Ordering::Relaxed),
+            ),
             ("emoji_total", self.emoji_total.load(Ordering::Relaxed)),
-            ("emoji_pending_classification", self.emoji_pending_classification.load(Ordering::Relaxed)),
-            ("emoji_disabled", self.emoji_disabled.load(Ordering::Relaxed)),
-            ("emoji_active_classifiers", self.emoji_active_classifiers.load(Ordering::Relaxed)),
+            (
+                "emoji_pending_classification",
+                self.emoji_pending_classification.load(Ordering::Relaxed),
+            ),
+            (
+                "emoji_disabled",
+                self.emoji_disabled.load(Ordering::Relaxed),
+            ),
+            (
+                "emoji_active_classifiers",
+                self.emoji_active_classifiers.load(Ordering::Relaxed),
+            ),
             ("memory_reads", self.memory_reads.load(Ordering::Relaxed)),
             ("memory_writes", self.memory_writes.load(Ordering::Relaxed)),
-            ("memory_shared_reads", self.memory_shared_reads.load(Ordering::Relaxed)),
-            ("memory_scene_rule_hits", self.memory_scene_rule_hits.load(Ordering::Relaxed)),
-            ("memory_access_denied", self.memory_access_denied.load(Ordering::Relaxed)),
-            ("memory_migrations", self.memory_migrations.load(Ordering::Relaxed)),
-            ("memory_compactions", self.memory_compactions.load(Ordering::Relaxed)),
-            ("active_message_tasks", self.active_message_tasks.load(Ordering::Relaxed)),
-            ("active_session_workers", self.active_session_workers.load(Ordering::Relaxed)),
-            ("active_model_workers", self.active_model_workers.load(Ordering::Relaxed)),
-            ("pending_model_jobs", self.pending_model_jobs.load(Ordering::Relaxed)),
-            ("active_conversations", self.active_conversations.load(Ordering::Relaxed)),
-            ("background_tasks", self.background_tasks.load(Ordering::Relaxed)),
+            (
+                "memory_shared_reads",
+                self.memory_shared_reads.load(Ordering::Relaxed),
+            ),
+            (
+                "memory_scene_rule_hits",
+                self.memory_scene_rule_hits.load(Ordering::Relaxed),
+            ),
+            (
+                "memory_access_denied",
+                self.memory_access_denied.load(Ordering::Relaxed),
+            ),
+            (
+                "memory_migrations",
+                self.memory_migrations.load(Ordering::Relaxed),
+            ),
+            (
+                "memory_compactions",
+                self.memory_compactions.load(Ordering::Relaxed),
+            ),
+            (
+                "active_message_tasks",
+                self.active_message_tasks.load(Ordering::Relaxed),
+            ),
+            (
+                "active_session_workers",
+                self.active_session_workers.load(Ordering::Relaxed),
+            ),
+            (
+                "active_model_workers",
+                self.active_model_workers.load(Ordering::Relaxed),
+            ),
+            (
+                "pending_model_jobs",
+                self.pending_model_jobs.load(Ordering::Relaxed),
+            ),
+            (
+                "active_conversations",
+                self.active_conversations.load(Ordering::Relaxed),
+            ),
+            (
+                "background_tasks",
+                self.background_tasks.load(Ordering::Relaxed),
+            ),
             ("wait_inflight", self.wait_inflight.load(Ordering::Relaxed)),
-            ("wait_queue_drop", self.wait_queue_drop.load(Ordering::Relaxed)),
-            ("signal_l1_stale_invalidation", self.signal_l1_stale_invalidation.load(Ordering::Relaxed)),
+            (
+                "wait_queue_drop",
+                self.wait_queue_drop.load(Ordering::Relaxed),
+            ),
+            (
+                "signal_l1_stale_invalidation",
+                self.signal_l1_stale_invalidation.load(Ordering::Relaxed),
+            ),
             ("error_count", self.error_count.load(Ordering::Relaxed)),
         ];
         for (key, value) in u64_fields {
@@ -422,9 +558,12 @@ impl RuntimeMetrics {
         }
 
         if let Ok(avg) = self.avg_response_latency_ms.lock() {
-            map.insert("avg_response_latency_ms".to_string(), serde_json::Value::Number(
-                serde_json::Number::from_f64(*avg).unwrap_or(serde_json::Number::from(0)),
-            ));
+            map.insert(
+                "avg_response_latency_ms".to_string(),
+                serde_json::Value::Number(
+                    serde_json::Number::from_f64(*avg).unwrap_or(serde_json::Number::from(0)),
+                ),
+            );
         }
 
         if let Ok(cmd_map) = self.command_hits_by_name.lock() {
@@ -432,7 +571,10 @@ impl RuntimeMetrics {
             for (name, count) in cmd_map.iter() {
                 cmd_obj.insert(name.clone(), serde_json::Value::Number((*count).into()));
             }
-            map.insert("command_hits_by_name".to_string(), serde_json::Value::Object(cmd_obj));
+            map.insert(
+                "command_hits_by_name".to_string(),
+                serde_json::Value::Object(cmd_obj),
+            );
         }
 
         map

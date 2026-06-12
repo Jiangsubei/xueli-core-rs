@@ -582,10 +582,9 @@ impl SqliteConversationStore {
                 image_description: String::new(),
             });
             session.updated_at = now;
-            session.metadata.insert(
-                "latest_message_id".to_string(),
-                source_msg_id.clone(),
-            );
+            session
+                .metadata
+                .insert("latest_message_id".to_string(), source_msg_id.clone());
             session.dirty_turns += 1;
 
             (tid, session.turn_count(), dk)
@@ -661,20 +660,15 @@ impl SqliteConversationStore {
             source_platform,
         );
 
-        let (session_id, closed_session_id) = self.ensure_session(
-            user_id,
-            &resolved_dk,
-            message_type,
-            group_id.unwrap_or(""),
-        );
+        let (session_id, closed_session_id) =
+            self.ensure_session(user_id, &resolved_dk, message_type, group_id.unwrap_or(""));
 
         let now = chrono::Utc::now().to_rfc3339();
         let (turn_id, turn_count, sid, dk) = {
-            let mut sessions = self
-                .sessions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let session = sessions.get_mut(&session_id).expect("session must exist after ensure");
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let session = sessions
+                .get_mut(&session_id)
+                .expect("session must exist after ensure");
 
             let tid = session.turns.len() as i64 + 1;
             session.turns.push(ConversationTurnData {
@@ -693,12 +687,18 @@ impl SqliteConversationStore {
             session.updated_at = now;
             session.message_type = message_type.to_string();
             session.group_id = group_id.unwrap_or("").to_string();
-            session
-                .metadata
-                .insert("latest_message_id".to_string(), message_id.unwrap_or("").to_string());
+            session.metadata.insert(
+                "latest_message_id".to_string(),
+                message_id.unwrap_or("").to_string(),
+            );
             session.dirty_turns += 1;
 
-            (tid, session.turn_count(), session.session_id.clone(), session.dialogue_key.clone())
+            (
+                tid,
+                session.turn_count(),
+                session.session_id.clone(),
+                session.dialogue_key.clone(),
+            )
         };
 
         let closed_user_id = if !closed_session_id.is_empty() {
@@ -1280,10 +1280,7 @@ impl SqliteConversationStore {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(active_sid) = by_dialogue.get(dialogue_key) {
-                let sessions = self
-                    .sessions
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(session) = sessions.get(active_sid) {
                     if !self.session_expired(session) {
                         return (active_sid.clone(), closed_session_id);
@@ -1298,10 +1295,7 @@ impl SqliteConversationStore {
                 .active_session_by_dialogue
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let mut sessions = self
-                .sessions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
 
             // 如果有过期会话，关闭它
             if let Some(old_sid) = by_dialogue.remove(dialogue_key) {
@@ -1337,10 +1331,7 @@ impl SqliteConversationStore {
 
     /// 获取指定会话的拥有者 user_id
     pub fn get_session_owner(&self, session_id: &str) -> String {
-        let sessions = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions
             .get(session_id)
             .map(|s| s.user_id.clone())
@@ -1349,10 +1340,7 @@ impl SqliteConversationStore {
 
     /// 获取指定会话的快照（深拷贝）
     pub fn get_session_snapshot(&self, session_id: &str) -> Option<SessionRecord> {
-        let sessions = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions.get(session_id).cloned()
     }
 
@@ -1365,7 +1353,8 @@ impl SqliteConversationStore {
         group_id: Option<&str>,
         platform: &str,
     ) -> String {
-        let resolved_dk = self.build_dialogue_key(user_id, dialogue_key, message_type, group_id, platform);
+        let resolved_dk =
+            self.build_dialogue_key(user_id, dialogue_key, message_type, group_id, platform);
 
         let by_dialogue = self
             .active_session_by_dialogue
@@ -1377,10 +1366,7 @@ impl SqliteConversationStore {
             None => return String::new(),
         };
 
-        let sessions = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
 
         match sessions.get(&sid) {
             Some(session) => {
@@ -1603,8 +1589,11 @@ impl SqliteConversationStore {
 
         tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
-            conn.execute("DELETE FROM group_messages WHERE group_id = ?1", params![group_id])
-                .map_err(|e| format!("删除群聊消息失败: {e}"))?;
+            conn.execute(
+                "DELETE FROM group_messages WHERE group_id = ?1",
+                params![group_id],
+            )
+            .map_err(|e| format!("删除群聊消息失败: {e}"))?;
             Ok(())
         })
         .await
@@ -1618,8 +1607,11 @@ impl SqliteConversationStore {
 
         tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
-            conn.execute("DELETE FROM private_messages WHERE user_id = ?1", params![user_id])
-                .map_err(|e| format!("删除私聊消息失败: {e}"))?;
+            conn.execute(
+                "DELETE FROM private_messages WHERE user_id = ?1",
+                params![user_id],
+            )
+            .map_err(|e| format!("删除私聊消息失败: {e}"))?;
             Ok(())
         })
         .await
@@ -1628,10 +1620,7 @@ impl SqliteConversationStore {
 
     /// 获取内存中所有活跃会话 ID
     pub fn active_session_ids_from_cache(&self) -> Vec<String> {
-        let sessions = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions.keys().cloned().collect()
     }
 }

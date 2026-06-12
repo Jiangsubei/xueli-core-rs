@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -365,7 +365,9 @@ mod tests {
     use chrono::Utc;
 
     /// 将有界 Receiver 转换为 UnboundedReceiver（测试辅助）
-    fn convert_to_unbounded(mut rx: mpsc::Receiver<MemoryJob>) -> mpsc::UnboundedReceiver<MemoryJob> {
+    fn convert_to_unbounded(
+        mut rx: mpsc::Receiver<MemoryJob>,
+    ) -> mpsc::UnboundedReceiver<MemoryJob> {
         let (tx, unbounded_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
@@ -395,7 +397,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteMemoryItemStore::new(dir.path()).unwrap());
         let config = crate::core::config::MemoryConfig::default();
-        let mgr = Arc::new(MemoryManager::new(Arc::new(config), store, Arc::new(crate::services::prompt_loader::NoopPromptTemplateLoader)).unwrap());
+        let mgr = Arc::new(
+            MemoryManager::new(
+                Arc::new(config),
+                store,
+                Arc::new(crate::services::prompt_loader::NoopPromptTemplateLoader),
+            )
+            .unwrap(),
+        );
         let (service, rx) = MemoryFlowService::new(mgr.clone(), None, None);
 
         let patch = MemoryPatch {
@@ -421,8 +430,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteMemoryItemStore::new(dir.path()).unwrap());
         let config = crate::core::config::MemoryConfig::default();
-        let mgr = Arc::new(MemoryManager::new(Arc::new(config), store, Arc::new(crate::services::prompt_loader::NoopPromptTemplateLoader)).unwrap());
-        let (service, _rx): (MemoryFlowService<crate::services::prompt_loader::NoopPromptTemplateLoader>, _) = MemoryFlowService::new(mgr, None, None);
+        let mgr = Arc::new(
+            MemoryManager::new(
+                Arc::new(config),
+                store,
+                Arc::new(crate::services::prompt_loader::NoopPromptTemplateLoader),
+            )
+            .unwrap(),
+        );
+        let (service, _rx): (
+            MemoryFlowService<crate::services::prompt_loader::NoopPromptTemplateLoader>,
+            _,
+        ) = MemoryFlowService::new(mgr, None, None);
 
         let key = "test_key";
         assert!(!service.should_dedupe(key));

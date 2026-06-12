@@ -143,7 +143,14 @@ impl<L: PromptTemplateLoader> EmojiReplyService<L> {
         }
 
         let decision = self
-            .decide_reply_intent(user_message, assistant_reply, reply_context, trace_id, intent_reference, window_messages)
+            .decide_reply_intent(
+                user_message,
+                assistant_reply,
+                reply_context,
+                trace_id,
+                intent_reference,
+                window_messages,
+            )
             .await?;
 
         if !decision.should_send {

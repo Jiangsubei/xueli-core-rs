@@ -26,10 +26,7 @@ impl DriveStore {
     }
 
     fn sanitize_key(key: &str) -> String {
-        let safe: String = key
-            .replace('/', "_")
-            .replace('\\', "_")
-            .replace(':', "_");
+        let safe: String = key.replace('/', "_").replace('\\', "_").replace(':', "_");
         if safe.is_empty() {
             "default".to_string()
         } else {
@@ -38,7 +35,8 @@ impl DriveStore {
     }
 
     fn path_for(&self, key: &str) -> PathBuf {
-        self.base_path.join(format!("{}.json", Self::sanitize_key(key)))
+        self.base_path
+            .join(format!("{}.json", Self::sanitize_key(key)))
     }
 
     async fn ensure_dir(&self) -> std::io::Result<()> {
@@ -104,18 +102,9 @@ impl DriveStore {
         obj: &serde_json::Map<String, serde_json::Value>,
         scope_key: &str,
     ) -> DriveSnapshot {
-        let valence = obj
-            .get("valence")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        let arousal = obj
-            .get("arousal")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.5);
-        let energy = obj
-            .get("energy")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.8);
+        let valence = obj.get("valence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let arousal = obj.get("arousal").and_then(|v| v.as_f64()).unwrap_or(0.5);
+        let energy = obj.get("energy").and_then(|v| v.as_f64()).unwrap_or(0.8);
         let updated_at = obj
             .get("updated_at")
             .and_then(|v| v.as_str())

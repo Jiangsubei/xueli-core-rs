@@ -6,7 +6,9 @@ use crate::core::config::MemoryConfig;
 use crate::core::scope::ChatScope;
 use crate::core::types::{MemoryItem, MemoryPatch, MemoryType};
 use crate::memory::chat_summary_service::ChatSummaryService;
-use crate::memory::internal::access_policy::{MemoryAccessContext, MemoryAccessPolicy, PromptEntry};
+use crate::memory::internal::access_policy::{
+    MemoryAccessContext, MemoryAccessPolicy, PromptEntry,
+};
 use crate::memory::internal::background::MemoryBackgroundCoordinator;
 use crate::memory::internal::index_coordinator::IndexCoordinator;
 use crate::memory::internal::task_manager::MemoryTaskManager;
@@ -53,10 +55,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryManager<L> {
         memory_store: Arc<SqliteMemoryItemStore>,
         prompt_loader: Arc<L>,
     ) -> XueliResult<Self> {
-        let base_dir = Path::new(&config.db_path)
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
+        let base_dir = Path::new(&config.data_dir);
 
         let important_store = Arc::new(ImportantMemoryStore::new(base_dir)?);
         let conversation_store = Arc::new(SqliteConversationStore::open(base_dir)?);
@@ -88,18 +87,15 @@ impl<L: PromptTemplateLoader + 'static> MemoryManager<L> {
         let dispute_resolver = Arc::new(MemoryDisputeResolver::new(config.dispute.clone()));
 
         // 构建后台协调器
-        let background_coordinator = MemoryBackgroundCoordinator::new(
-            config.clone(),
-            task_manager.clone(),
-            prompt_loader,
-        )
-        .with_conversation_store(conversation_store.clone())
-        .with_memory_store(memory_store.clone())
-        .with_important_store(important_store.clone())
-        .with_person_fact_service(person_fact_service.clone())
-        .with_summary_service(chat_summary_service.clone())
-        .with_auto_extract(config.auto_extract)
-        .into_arc();
+        let background_coordinator =
+            MemoryBackgroundCoordinator::new(config.clone(), task_manager.clone(), prompt_loader)
+                .with_conversation_store(conversation_store.clone())
+                .with_memory_store(memory_store.clone())
+                .with_important_store(important_store.clone())
+                .with_person_fact_service(person_fact_service.clone())
+                .with_summary_service(chat_summary_service.clone())
+                .with_auto_extract(config.auto_extract)
+                .into_arc();
 
         Ok(Self {
             config,
@@ -121,7 +117,11 @@ impl<L: PromptTemplateLoader + 'static> MemoryManager<L> {
     }
 
     /// 设置 LLM 客户端（启用记忆提取和消化功能）
-    pub fn with_llm_client(self: Arc<Self>, _client: Arc<dyn crate::traits::ai_client::AIClient>, _model: String) -> Arc<Self> {
+    pub fn with_llm_client(
+        self: Arc<Self>,
+        _client: Arc<dyn crate::traits::ai_client::AIClient>,
+        _model: String,
+    ) -> Arc<Self> {
         // 由于 background_coordinator 已在 new() 中创建，
         // 需要通过 Arc 内部可变性来更新 coordinator 的 LLM 客户端
         // 当前实现中 coordinator 的 llm_client 是 Option，通过 builder 设置
@@ -452,7 +452,11 @@ impl<L: PromptTemplateLoader + 'static> MemoryManager<L> {
         // 重要记忆标记召回
         if !important_ids.is_empty() {
             let ids: Vec<String> = important_ids.into_iter().cloned().collect();
-            match self.important_store.mark_recalled_batch(user_id, &ids).await {
+            match self
+                .important_store
+                .mark_recalled_batch(user_id, &ids)
+                .await
+            {
                 Ok(count) => total += count,
                 Err(e) => {
                     tracing::warn!("[MemoryManager] 重要记忆标记召回失败: {}", e);
@@ -621,11 +625,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryManager<L> {
         Ok(())
     }
 
-    pub async fn maybe_extract_memories(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> Vec<MemoryItem> {
+    pub async fn maybe_extract_memories(&self, user_id: &str, session_id: &str) -> Vec<MemoryItem> {
         if let Some(ref coord) = self.background_coordinator {
             coord.maybe_extract_memories(user_id, session_id).await
         } else {
@@ -819,7 +819,9 @@ impl<L: PromptTemplateLoader + 'static> MemoryManager<L> {
         memory_id: &str,
         memory_metadata: &serde_json::Value,
     ) -> XueliResult<Option<crate::memory::stores::fact_evidence::FactEvidence>> {
-        let decision = self.dispute_resolver.resolve_from_memory_metadata(memory_metadata);
+        let decision = self
+            .dispute_resolver
+            .resolve_from_memory_metadata(memory_metadata);
         if decision.level == "ignore" {
             return Ok(None);
         }
@@ -874,7 +876,14 @@ impl<L: PromptTemplateLoader + 'static> MemoryManager<L> {
         ttl_seconds: f64,
     ) -> XueliResult<()> {
         self.signal_store
-            .set(signal_key, signal_type, prompt_version, payload, confidence, ttl_seconds)
+            .set(
+                signal_key,
+                signal_type,
+                prompt_version,
+                payload,
+                confidence,
+                ttl_seconds,
+            )
             .await
     }
 
@@ -900,7 +909,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryManager<L> {
 
     pub async fn get_stats(&self) -> HashMap<String, String> {
         let mut stats = HashMap::new();
-        stats.insert("db_path".to_string(), self.config.db_path.clone());
+        stats.insert("data_dir".to_string(), self.config.data_dir.clone());
         stats.insert(
             "background_tasks".to_string(),
             self.task_manager.count().await.to_string(),
