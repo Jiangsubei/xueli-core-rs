@@ -4,8 +4,13 @@ use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 
+use crate::character::card_service::CharacterCardService;
+use crate::core::config::GroupReplyDecisionConfig;
 use crate::core::log_labels::{LOG_PROMPT_DIGEST, LOG_RETRY};
+use crate::core::mood_engine::MoodEngine;
 use crate::prelude::XueliResult;
+use crate::services::token_counter::TokenCounter;
+use crate::signals::label_mapper::mood_state_label;
 use crate::traits::ai_client::{AIClient, ChatCompletionRequest, ChatMessage};
 use crate::traits::prompt_template::PromptTemplateLoader;
 use crate::traits::timing_gate::{TimingContext, TimingDecision, TimingGateStrategy};
@@ -89,6 +94,14 @@ pub struct DefaultTimingGate<A: AIClient, L: PromptTemplateLoader> {
     cache_ttl_secs: f64,
     /// 最大重试次数
     max_retries: usize,
+    /// 情绪引擎（可选）
+    mood_engine: Option<Arc<std::sync::Mutex<MoodEngine>>>,
+    /// 角色卡服务（可选）
+    character_card_service: Option<Arc<CharacterCardService>>,
+    /// Token 计数器（可选）
+    token_counter: Option<Arc<TokenCounter>>,
+    /// 群聊回复决策配置（可选）
+    decision_config: Option<GroupReplyDecisionConfig>,
 }
 
 impl<A: AIClient, L: PromptTemplateLoader> DefaultTimingGate<A, L> {
@@ -108,6 +121,10 @@ impl<A: AIClient, L: PromptTemplateLoader> DefaultTimingGate<A, L> {
             cache: RwLock::new(HashMap::new()),
             cache_ttl_secs: 12.0,
             max_retries: 3,
+            mood_engine: None,
+            character_card_service: None,
+            token_counter: None,
+            decision_config: None,
         }
     }
 
@@ -119,8 +136,86 @@ impl<A: AIClient, L: PromptTemplateLoader> DefaultTimingGate<A, L> {
         }
     }
 
-    /// 构建系统提示词
-    async fn build_system_prompt(&self) -> XueliResult<String> {
+    /// 注入情绪引擎
+    pub fn with_mood_engine(mut self, engine: Arc<std::sync::Mutex<MoodEngine>>) -> Self {
+        self.mood_engine = Some(engine);
+        self
+    }
+
+    /// 注入角色卡服务
+    pub fn with_character_card_service(mut self, service: Arc<CharacterCardService>) -> Self {
+        self.character_card_service = Some(service);
+        self
+    }
+
+    /// 注入 Token 计数器
+    pub fn with_token_counter(mut self, counter: Arc<TokenCounter>) -> Self {
+        self.token_counter = Some(counter);
+        self
+    }
+
+    /// 注入群聊回复决策配置
+    pub fn with_decision_config(mut self, config: GroupReplyDecisionConfig) -> Self {
+        self.decision_config = Some(config);
+        self
+    }
+
+    /// 构建情绪状态行（用于注入 system prompt）
+    fn build_mood_state_line(&self) -> String {
+        let engine = match &self.mood_engine {
+            Some(e) => e,
+            None => return String::new(),
+        };
+        let guard = match engine.lock() {
+            Ok(g) => g,
+            Err(_) => return String::new(),
+        };
+        if let Some(state) = guard.current() {
+            let label = mood_state_label(state.valence, state.arousal, state.energy);
+            format!(
+                "当前心情: {label} (valence={:.2}, energy={:.2}, arousal={:.2})",
+                state.valence, state.energy, state.arousal
+            )
+        } else {
+            String::new()
+        }
+    }
+
+    /// 构建关系摘要（用于注入 system prompt）
+    fn build_relationship_summary(&self, ctx: &TimingContext) -> String {
+        let card_service = match &self.character_card_service {
+            Some(s) => s,
+            None => return String::new(),
+        };
+        let sender_id = ctx
+            .event
+            .message
+            .as_ref()
+            .map(|m| m.sender_id.as_str())
+            .unwrap_or("");
+        if sender_id.is_empty() {
+            return String::new();
+        }
+        let snapshot = card_service.get_snapshot(sender_id);
+        let mut parts: Vec<String> = Vec::new();
+        if !snapshot.relationship_state_summary.is_empty() {
+            parts.push(snapshot.relationship_state_summary);
+        }
+        if !snapshot.relationship_tone_hint.is_empty() {
+            parts.push(format!("语气提示: {}", snapshot.relationship_tone_hint));
+        }
+        if !snapshot.emotional_trend.is_empty() {
+            parts.push(format!("情绪趋势: {}", snapshot.emotional_trend));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("与发送者的关系: {}", parts.join("; "))
+        }
+    }
+
+    /// 构建系统提示词（含情绪/关系注入）
+    async fn build_system_prompt(&self, ctx: &TimingContext) -> XueliResult<String> {
         let aliases_part_str = if self.assistant_alias.is_empty() {
             String::new()
         } else {
@@ -178,12 +273,33 @@ impl<A: AIClient, L: PromptTemplateLoader> DefaultTimingGate<A, L> {
                 )
             });
 
+        let mut system = system;
+
+        // 注入情绪状态
+        let mood_line = self.build_mood_state_line();
+        if !mood_line.is_empty() {
+            system.push('\n');
+            system.push_str(&mood_line);
+        }
+
+        // 注入关系摘要
+        let relationship = self.build_relationship_summary(ctx);
+        if !relationship.is_empty() {
+            system.push('\n');
+            system.push_str(&relationship);
+        }
+
         Ok(system)
     }
 
     /// 构建 user prompt
     fn build_user_prompt(&self, ctx: &TimingContext) -> String {
         let mut parts: Vec<String> = Vec::new();
+
+        // 近期历史（由调用方通过 unified_history_renderer 预渲染）
+        if !ctx.recent_history_text.is_empty() {
+            parts.push(ctx.recent_history_text.clone());
+        }
 
         // 发送者信息
         let sender = ctx
@@ -208,6 +324,14 @@ impl<A: AIClient, L: PromptTemplateLoader> DefaultTimingGate<A, L> {
                 content
             }
         ));
+
+        // wait 后新到达的消息
+        if !ctx.new_messages_since_wait.is_empty() {
+            parts.push("\n自上次 wait 决策后，新到达的消息：".to_string());
+            for (i, msg) in ctx.new_messages_since_wait.iter().enumerate() {
+                parts.push(format!("  [{i}] {msg}"));
+            }
+        }
 
         // 对话活跃度信号
         if ctx.is_mentioned {
@@ -373,9 +497,9 @@ impl<A: AIClient, L: PromptTemplateLoader> DefaultTimingGate<A, L> {
 #[async_trait::async_trait]
 impl<A: AIClient, L: PromptTemplateLoader> TimingGateStrategy for DefaultTimingGate<A, L> {
     async fn should_reply(&self, ctx: &TimingContext) -> XueliResult<TimingDecision> {
-        // 1. 检查缓存
+        // 1. 检查缓存（仅在无 wait 新消息时使用缓存）
         let cache_key = self.build_cache_key(ctx);
-        {
+        if ctx.new_messages_since_wait.is_empty() {
             let cache = self.cache.read();
             if let Some(entry) = cache.get(&cache_key) {
                 if entry.is_valid() {
@@ -395,18 +519,53 @@ impl<A: AIClient, L: PromptTemplateLoader> TimingGateStrategy for DefaultTimingG
         }
 
         // 3. LLM 调用
-        let system_prompt = self.build_system_prompt().await?;
+        let system_prompt = self.build_system_prompt(ctx).await?;
         let user_prompt = self.build_user_prompt(ctx);
 
-        let messages = vec![
+        let mut messages = vec![
             ChatMessage::text("system", &system_prompt),
             ChatMessage::text("user", &user_prompt),
         ];
 
+        // 3a. Token 预算修剪
+        if let Some(ref counter) = self.token_counter {
+            let budget = self
+                .decision_config
+                .as_ref()
+                .map(|c| c.context_window as usize)
+                .unwrap_or(8000);
+            let sys_msg = ChatMessage::text("system", &system_prompt);
+            let cur_msg = ChatMessage::text("user", &user_prompt);
+            let history: Vec<ChatMessage> = Vec::new();
+            let (trimmed, _skipped) = counter.trim_messages_to_budget(
+                &sys_msg,
+                &cur_msg,
+                &history,
+                budget,
+                512, // TimingGate 响应预算
+                None,
+                "timing_gate",
+            );
+            messages = trimmed;
+        }
+
+        // 3b. 模型名配置驱动
+        let model_name = self
+            .decision_config
+            .as_ref()
+            .and_then(|c| {
+                if c.model.is_empty() {
+                    None
+                } else {
+                    Some(c.model.as_str())
+                }
+            })
+            .unwrap_or("gpt-4o-mini");
+
         let mut last_err = String::new();
         for attempt in 0..self.max_retries {
             let request = ChatCompletionRequest {
-                model: "gpt-4o-mini".to_string(),
+                model: model_name.to_string(),
                 messages: messages.clone(),
                 temperature: Some(0.1),
                 max_tokens: Some(512),
@@ -432,19 +591,21 @@ impl<A: AIClient, L: PromptTemplateLoader> TimingGateStrategy for DefaultTimingG
                                 signals.user_emotion_label
                             );
 
-                            // 写入缓存
-                            self.evict_cache();
-                            let mut cache = self.cache.write();
-                            cache.insert(
-                                cache_key,
-                                CachedDecision {
-                                    action: decision.clone(),
-                                    reason,
-                                    planning_signals: signals,
-                                    cached_at: Instant::now(),
-                                    ttl: Duration::from_secs_f64(self.cache_ttl_secs),
-                                },
-                            );
+                            // 写入缓存（仅在无 wait 新消息时缓存）
+                            if ctx.new_messages_since_wait.is_empty() {
+                                self.evict_cache();
+                                let mut cache = self.cache.write();
+                                cache.insert(
+                                    cache_key,
+                                    CachedDecision {
+                                        action: decision.clone(),
+                                        reason,
+                                        planning_signals: signals,
+                                        cached_at: Instant::now(),
+                                        ttl: Duration::from_secs_f64(self.cache_ttl_secs),
+                                    },
+                                );
+                            }
 
                             return Ok(decision);
                         }
@@ -513,6 +674,8 @@ mod tests {
             conversation_active: true,
             time_since_last_reply_secs: 10.0,
             message_count_in_window: 3,
+            recent_history_text: String::new(),
+            new_messages_since_wait: Vec::new(),
         }
     }
 
