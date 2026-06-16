@@ -1,5 +1,8 @@
 use crate::core::types::{MemoryItem, MemoryPatch, MemoryType};
+use crate::memory::memory_dispute_resolver::ReflectionPayload;
+use crate::memory::stores::memory_item::SqliteMemoryItemStore;
 use crate::prelude::XueliResult;
+use serde_json::Value as JsonValue;
 
 /// 记忆 Patch 合并器 — 将新提取的记忆合并到已有记忆
 ///
@@ -7,6 +10,7 @@ use crate::prelude::XueliResult;
 /// 1. 基于内容相似度去重
 /// 2. 同用户同类型记忆：高重要性覆盖低重要性
 /// 3. 冲突标记保留（等待 Reflection 处理）
+/// 4. 基于反射结果更新记忆 patch 元数据
 pub struct PatchMerger;
 
 impl PatchMerger {
@@ -126,6 +130,95 @@ impl PatchMerger {
                 | MemoryType::Relationship
         ) && item.importance >= 5.0
             && item.access_count >= 2
+    }
+
+    /// 基于反射结果更新记忆上的 patch 元数据
+    ///
+    /// 根据 `ReflectionPayload` 中的 action 决定如何处理新旧记忆之间的关系：
+    /// - `prefer_existing` → 新记忆标记为 superseded，旧记忆保持 active
+    /// - `prefer_new` → 新记忆标记为 active_patch，旧记忆标记为 superseded
+    /// - `keep_both_prefer_recent` → 新记忆 active_patch，旧记忆 superseded
+    /// - `merge_context` → 新记忆 active_patch，旧记忆 contextualized
+    pub async fn apply_patch_merge(
+        store: &SqliteMemoryItemStore,
+        new_memory: &MemoryItem,
+        existing_memory: &MemoryItem,
+        reflection: &ReflectionPayload,
+    ) -> XueliResult<()> {
+        let new_patch_status = Self::resolve_new_memory_patch_status(&reflection.action);
+        let existing_patch_status = Self::resolve_existing_memory_patch_status(&reflection.action);
+
+        Self::update_patch_metadata(store, &new_memory.id, "patch_status", &new_patch_status)
+            .await?;
+        Self::update_patch_metadata(
+            store,
+            &new_memory.id,
+            "patch_relation",
+            &format!("reflected_against_{}", existing_memory.id),
+        )
+        .await?;
+
+        Self::update_patch_metadata(
+            store,
+            &existing_memory.id,
+            "patch_status",
+            &existing_patch_status,
+        )
+        .await?;
+        Self::update_patch_metadata(
+            store,
+            &existing_memory.id,
+            "patch_relation",
+            &format!("reflected_against_{}", new_memory.id),
+        )
+        .await?;
+
+        // 如果新记忆被采纳，需要将旧记忆抑制写入普通存储
+        if reflection.action == "prefer_new" || reflection.action == "keep_both_prefer_recent" {
+            Self::apply_to_ordinary(store, existing_memory, &existing_patch_status).await?;
+        }
+        if reflection.action == "prefer_existing" {
+            Self::apply_to_ordinary(store, new_memory, &new_patch_status).await?;
+        }
+
+        Ok(())
+    }
+
+    /// 更新单条记忆的 patch 元数据字段
+    async fn update_patch_metadata(
+        store: &SqliteMemoryItemStore,
+        mem_id: &str,
+        key: &str,
+        value: &str,
+    ) -> XueliResult<()> {
+        store.update_metadata(mem_id, key, value).await
+    }
+
+    /// 将 patch 状态写入普通存储（通过 replace_user_memories 或 update_metadata）
+    async fn apply_to_ordinary(
+        store: &SqliteMemoryItemStore,
+        memory: &MemoryItem,
+        patch_status: &str,
+    ) -> XueliResult<()> {
+        // 更新该记忆的元数据，标记其 patch 状态
+        let mut meta = match store.load_metadata(&memory.user_id, &memory.id).await? {
+            Some(m) => m,
+            None => JsonValue::Object(Default::default()),
+        };
+        if let JsonValue::Object(ref mut map) = meta {
+            map.insert(
+                "patch_status".to_string(),
+                JsonValue::String(patch_status.to_string()),
+            );
+            map.insert(
+                "patch_resolved_at".to_string(),
+                JsonValue::String(chrono::Utc::now().to_rfc3339()),
+            );
+        }
+        store
+            .update_metadata_full(&memory.user_id, &memory.id, &meta)
+            .await?;
+        Ok(())
     }
 }
 

@@ -178,9 +178,12 @@ impl<A: AIClient> PersonFactService<A> {
     }
 }
 
-impl<A: AIClient> Default for PersonFactService<A> {
+impl<A: AIClient + Default> Default for PersonFactService<A> {
     fn default() -> Self {
-        unimplemented!("PersonFactService 需要 AI 客户端，请使用 new() 构造")
+        tracing::warn!(
+            "[PersonFactService] 使用 Default 构造，AI 客户端为默认值，生产环境请使用 new()"
+        );
+        Self::new(Arc::new(A::default()), "gpt-4o-mini")
     }
 }
 

@@ -14,7 +14,7 @@ use super::buffer::{BufferTurn, ExtractionBuffer};
 /// LLM 记忆提取器 — 从对话中提取结构化记忆
 ///
 /// 对应 Python 版 `xueli/src/memory/extraction/extractor.py`
-pub struct MemoryExtractor<A: AIClient, L: PromptTemplateLoader> {
+pub struct MemoryExtractor<A: AIClient + ?Sized, L: PromptTemplateLoader> {
     ai_client: Arc<A>,
     model: String,
     max_retries: usize,
@@ -24,7 +24,7 @@ pub struct MemoryExtractor<A: AIClient, L: PromptTemplateLoader> {
     max_dialogue_length: usize,
 }
 
-impl<A: AIClient, L: PromptTemplateLoader> MemoryExtractor<A, L> {
+impl<A: AIClient + ?Sized, L: PromptTemplateLoader> MemoryExtractor<A, L> {
     pub fn new(ai_client: Arc<A>, model: &str, prompt_loader: Arc<L>) -> Self {
         Self {
             ai_client,
@@ -556,9 +556,14 @@ impl<A: AIClient, L: PromptTemplateLoader> MemoryExtractor<A, L> {
     }
 }
 
-impl<A: AIClient, L: PromptTemplateLoader> Default for MemoryExtractor<A, L> {
+impl<A: AIClient + Default, L: PromptTemplateLoader + Default> Default for MemoryExtractor<A, L> {
     fn default() -> Self {
-        unimplemented!("MemoryExtractor 需要 AI 客户端和模板加载器，请使用 new() 构造")
+        tracing::warn!("[MemoryExtractor] 使用 Default 构造，AI 客户端和模板加载器均为默认值，生产环境请使用 new()");
+        Self::new(
+            Arc::new(A::default()),
+            "gpt-4o-mini",
+            Arc::new(L::default()),
+        )
     }
 }
 

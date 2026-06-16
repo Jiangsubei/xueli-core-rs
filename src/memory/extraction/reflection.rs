@@ -10,13 +10,13 @@ use crate::traits::ai_client::{
 /// 记忆冲突反思 — 检测新旧记忆矛盾并给出解决方案
 ///
 /// 对应 Python 版 `xueli/src/memory/extraction/reflection.py`
-pub struct MemoryReflection<A: AIClient> {
+pub struct MemoryReflection<A: AIClient + ?Sized> {
     ai_client: Arc<A>,
     model: String,
     max_retries: usize,
 }
 
-impl<A: AIClient> MemoryReflection<A> {
+impl<A: AIClient + ?Sized> MemoryReflection<A> {
     pub fn new(ai_client: Arc<A>, model: &str) -> Self {
         Self {
             ai_client,
@@ -439,9 +439,12 @@ pub fn build_reflection_evidence(
     evidence
 }
 
-impl<A: AIClient> Default for MemoryReflection<A> {
+impl<A: AIClient + Default> Default for MemoryReflection<A> {
     fn default() -> Self {
-        unimplemented!("MemoryReflection 需要 AI 客户端，请使用 new() 构造")
+        tracing::warn!(
+            "[MemoryReflection] 使用 Default 构造，AI 客户端为默认值，生产环境请使用 new()"
+        );
+        Self::new(Arc::new(A::default()), "gpt-4o-mini")
     }
 }
 
