@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tracing::debug;
+
 use crate::character::card_service::{CharacterCardService, CharacterCardSnapshot};
 use crate::character::narrative::NarrativeService;
+use crate::core::drive::engine::DriveEngine;
+use crate::core::drive::models::DriveContext;
 use crate::core::platform_types::InboundEvent;
 use crate::core::scope::ChatScope;
 use crate::core::types::ReplyPlan;
@@ -10,6 +14,7 @@ use crate::handlers::reply::style_policy::{FinalStyleGuide, SoftUncertaintySigna
 use crate::handlers::session_manager::ConversationSessionManager;
 use crate::memory::manager::MemoryManager;
 use crate::memory::stores::conversation::{ConversationRecord, SqliteConversationStore};
+use crate::memory::stores::fact_evidence::SqliteFactEvidenceStore;
 use crate::prelude::XueliResult;
 use crate::traits::prompt_template::PromptTemplateLoader;
 
@@ -66,6 +71,10 @@ pub struct ConversationContext {
     pub style_guide: Option<FinalStyleGuide>,
     /// 软不确定性信号
     pub soft_uncertainty_signals: Option<Vec<SoftUncertaintySignal>>,
+    /// 内驱力上下文（情绪/动机/关系状态）
+    pub drive_context: Option<DriveContext>,
+    /// 谨慎事件检测结果（{event_type: description}）
+    pub caution_events: Option<Vec<(String, String)>>,
 }
 
 /// 会话上下文构建器 — 从存储和会话管理器加载历史，构建完整上下文。
@@ -80,6 +89,8 @@ pub struct ConversationContextBuilder<
     memory_manager: Option<Arc<MemoryManager<L>>>,
     character_card_service: Option<Arc<CharacterCardService>>,
     narrative_service: Option<Arc<NarrativeService>>,
+    drive_engine: Option<Arc<DriveEngine>>,
+    fact_evidence_store: Option<Arc<SqliteFactEvidenceStore>>,
 }
 
 impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
@@ -90,6 +101,8 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
             memory_manager: None,
             character_card_service: None,
             narrative_service: None,
+            drive_engine: None,
+            fact_evidence_store: None,
         }
     }
 
@@ -114,6 +127,18 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
     /// 设置叙事服务（用于加载叙事线）
     pub fn with_narrative_service(mut self, svc: Arc<NarrativeService>) -> Self {
         self.narrative_service = Some(svc);
+        self
+    }
+
+    /// 设置内驱力引擎（用于加载驱动力上下文）
+    pub fn with_drive_engine(mut self, engine: Arc<DriveEngine>) -> Self {
+        self.drive_engine = Some(engine);
+        self
+    }
+
+    /// 设置事实证据存储（用于加载软不确定性信号）
+    pub fn with_fact_evidence_store(mut self, store: Arc<SqliteFactEvidenceStore>) -> Self {
+        self.fact_evidence_store = Some(store);
         self
     }
 
@@ -199,12 +224,21 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
         // 加载角色卡快照
         let character_card_snapshot = self.load_character_card_snapshot(&user_id);
 
-        // 加载叙事线
+        // 加载叙事线（使用 get_thread_summary 统一入口）
         let (narrative_thread_summary, narrative_thread_label, narrative_self) =
             self.load_narrative_thread(&user_id);
 
+        // 加载内驱力上下文
+        let drive_context = self.load_drive_context(&user_id);
+
+        // 加载软不确定性信号
+        let soft_uncertainty_signals = self.load_soft_uncertainty_signals(&user_id).await;
+
         // 构建用户画像信号
         let user_emotion_label = self.build_user_emotion_label(&user_id);
+
+        // 检测谨慎事件
+        let caution_events = self.detect_caution_events(&user_message, &recent_messages);
 
         // 构建谨慎度信号
         let caution_signal = self.build_caution_signal(
@@ -212,8 +246,11 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
             &persistent_memory,
             &precise_recall,
             &dynamic_memory,
-            None,
+            soft_uncertainty_signals.as_ref().map(|s| s.as_slice()),
         );
+
+        // 规划信号归一化
+        let planning_signals = self.normalize_planning_signals(_plan);
 
         Ok(ConversationContext {
             user_message,
@@ -237,10 +274,12 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
             narrative_thread_label,
             narrative_self,
             caution_signal,
-            planning_signals: None,
+            planning_signals,
             user_emotion_label,
             style_guide: None,
-            soft_uncertainty_signals: None,
+            soft_uncertainty_signals,
+            drive_context,
+            caution_events,
         })
     }
 
@@ -251,7 +290,10 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
     ) -> (Option<Vec<String>>, Option<String>, Option<String>) {
         let mm = match &self.memory_manager {
             Some(m) => m,
-            None => return (None, None, None),
+            None => {
+                debug!("跳过记忆上下文加载：memory_manager 未注入");
+                return (None, None, None);
+            }
         };
 
         // 人物事实
@@ -341,7 +383,10 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
     ) {
         let svc = match &self.narrative_service {
             Some(s) => s,
-            None => return (None, None, None),
+            None => {
+                debug!("跳过叙事线程加载：narrative_service 未注入");
+                return (None, None, None);
+            }
         };
 
         let thread = svc.get_thread(user_id);
@@ -391,7 +436,7 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
         persistent_memory: &Option<String>,
         precise_recall: &Option<String>,
         dynamic_memory: &Option<String>,
-        _soft_uncertainty_signals: Option<&[SoftUncertaintySignal]>,
+        soft_uncertainty_signals: Option<&[SoftUncertaintySignal]>,
     ) -> Option<HashMap<String, String>> {
         let mut reasons: Vec<String> = Vec::new();
         let mut guidance: Vec<String> = Vec::new();
@@ -419,6 +464,14 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
         if !memory_available {
             reasons.push("memory_context_empty".to_string());
             guidance.push("没有可靠记忆依据时，避免假装记得细节。".to_string());
+        }
+
+        // 软不确定性信号：证据不足的事实
+        if let Some(signals) = soft_uncertainty_signals {
+            if !signals.is_empty() {
+                reasons.push("soft_uncertainty".to_string());
+                guidance.push("部分事实证据不足，回复时避免断言不明确的信息。".to_string());
+            }
         }
 
         // 无原因则返回低谨慎度
@@ -502,6 +555,411 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
             None
         } else {
             Some(snapshot.emotional_trend.clone())
+        }
+    }
+
+    // ─── Phase 2.2 增强 ──────────────────────────────────
+
+    /// 加载内驱力上下文 — 从 DriveEngine 获取情绪/动机/关系状态
+    fn load_drive_context(&self, user_id: &str) -> Option<DriveContext> {
+        let engine = match &self.drive_engine {
+            Some(e) => e,
+            None => {
+                debug!("跳过内驱力上下文加载：drive_engine 未注入");
+                return None;
+            }
+        };
+        if !engine.enabled() {
+            debug!("跳过内驱力上下文加载：DriveEngine 未启用");
+            return None;
+        }
+        Some(engine.get_drive_context(user_id))
+    }
+
+    /// 加载软不确定性信号 — 从 FactEvidenceStore 获取高置信度争议信号
+    async fn load_soft_uncertainty_signals(
+        &self,
+        user_id: &str,
+    ) -> Option<Vec<SoftUncertaintySignal>> {
+        let store = match &self.fact_evidence_store {
+            Some(s) => s,
+            None => {
+                debug!("跳过软不确定性信号加载：fact_evidence_store 未注入");
+                return None;
+            }
+        };
+        let evidences = store.get_by_user(user_id).await.ok()?;
+        if evidences.is_empty() {
+            return None;
+        }
+        let signals: Vec<SoftUncertaintySignal> = evidences
+            .iter()
+            .map(|e| SoftUncertaintySignal {
+                reason: format!(
+                    "事实'{}'的证据来源有限（仅{}条证据）",
+                    e.fact_id,
+                    evidences.len()
+                ),
+            })
+            .collect();
+        if signals.is_empty() {
+            None
+        } else {
+            Some(signals)
+        }
+    }
+
+    /// 检测所有谨慎事件，返回检测到的事件列表
+    fn detect_caution_events(
+        &self,
+        message: &str,
+        recent_messages: &[String],
+    ) -> Option<Vec<(String, String)>> {
+        let text = message.trim();
+        if text.is_empty() {
+            return None;
+        }
+
+        let mut events: Vec<(String, String)> = Vec::new();
+
+        if let Some(desc) = Self::detect_repeated_question(text, recent_messages) {
+            events.push(("repeated_question".to_string(), desc));
+        }
+        if let Some(desc) = Self::detect_sensitive_topic(text) {
+            events.push(("sensitive_topic".to_string(), desc));
+        }
+        if let Some(desc) = Self::detect_new_topic(text, recent_messages) {
+            events.push(("new_topic".to_string(), desc));
+        }
+        if let Some(desc) = Self::detect_user_contradiction(text, recent_messages) {
+            events.push(("user_contradiction".to_string(), desc));
+        }
+        if let Some(desc) = Self::detect_high_emotion(text) {
+            events.push(("high_emotion".to_string(), desc));
+        }
+        if let Some(desc) = Self::detect_cross_questioning(text) {
+            events.push(("cross_questioning".to_string(), desc));
+        }
+        if let Some(desc) = Self::detect_incoherence(text, recent_messages) {
+            events.push(("incoherence".to_string(), desc));
+        }
+        if let Some(desc) = Self::detect_low_credibility(text) {
+            events.push(("low_credibility".to_string(), desc));
+        }
+        if let Some(desc) = Self::detect_stale_topic(text, recent_messages) {
+            events.push(("stale_topic".to_string(), desc));
+        }
+
+        if events.is_empty() {
+            None
+        } else {
+            Some(events)
+        }
+    }
+
+    /// 检测重复提问：用户短时间内重复相同或高度相似的问题
+    fn detect_repeated_question(text: &str, recent_messages: &[String]) -> Option<String> {
+        if recent_messages.is_empty() {
+            return None;
+        }
+        let normalized = text.trim().to_lowercase();
+        // 仅检查长度 >= 4 的文本，避免短回复误判
+        if normalized.chars().count() < 4 {
+            return None;
+        }
+        let mut count = 0usize;
+        for msg in recent_messages {
+            let lower = msg.trim().to_lowercase();
+            // 简单相似度：完全相同或包含关系
+            if lower == normalized || lower.contains(&normalized) || normalized.contains(&lower) {
+                count += 1;
+            }
+        }
+        if count >= 2 {
+            Some(format!(
+                "用户重复提问（近{}条消息中出现{}次相似内容）",
+                recent_messages.len(),
+                count
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// 检测敏感话题：涉及政治、暴力、违法等敏感内容
+    fn detect_sensitive_topic(text: &str) -> Option<String> {
+        let keywords = [
+            "自杀", "自残", "暴力", "违法", "毒品", "赌博", "传销", "诈骗", "色情", "赌博",
+        ];
+        let lower = text.to_lowercase();
+        for kw in &keywords {
+            if lower.contains(kw) {
+                return Some(format!("检测到敏感话题关键词：{}", kw));
+            }
+        }
+        None
+    }
+
+    /// 检测新话题引入：消息与近期对话主题明显不同
+    fn detect_new_topic(text: &str, recent_messages: &[String]) -> Option<String> {
+        if recent_messages.len() < 3 {
+            return None;
+        }
+        let normalized = text.trim().to_lowercase();
+        if normalized.chars().count() < 6 {
+            return None;
+        }
+        // 检查是否与近期消息有重合词汇
+        let recent_text = recent_messages.join(" ").to_lowercase();
+        let words: Vec<&str> = normalized
+            .split(|c: char| !c.is_alphanumeric() && !c.is_whitespace())
+            .filter(|w| w.chars().count() >= 2)
+            .collect();
+        let overlap_count = words.iter().filter(|w| recent_text.contains(**w)).count();
+        let overlap_ratio = if words.is_empty() {
+            1.0
+        } else {
+            overlap_count as f64 / words.len() as f64
+        };
+        if overlap_ratio < 0.2 {
+            Some(format!(
+                "用户引入新话题，与近期对话词汇重合率仅{:.0}%",
+                overlap_ratio * 100.0
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// 检测用户矛盾：用户当前消息与近期之前的表态矛盾
+    fn detect_user_contradiction(text: &str, recent_messages: &[String]) -> Option<String> {
+        if recent_messages.len() < 2 {
+            return None;
+        }
+        let normalized = text.trim().to_lowercase();
+        if normalized.chars().count() < 10 {
+            return None;
+        }
+        let negation_markers = [
+            "不是", "不对", "错了", "不再", "改了", "变了", "之前", "以前", "原来", "其实",
+        ];
+        let has_negation = negation_markers.iter().any(|m| normalized.contains(m));
+        if !has_negation {
+            return None;
+        }
+        // 检查最近的用户消息是否有矛盾信号
+        // 取倒数第2条（最近的是 assistant，倒数第2条是用户上一条）
+        let mut prev_user_msgs: Vec<&str> = recent_messages
+            .iter()
+            .rev()
+            .filter(|m| {
+                // 用户消息通常以 "用户" 或 sender 名开头
+                m.contains("用户") || m.contains("user")
+            })
+            .take(2)
+            .map(|s| s.as_str())
+            .collect();
+        if prev_user_msgs.len() < 2 {
+            return None;
+        }
+        prev_user_msgs.reverse(); // 恢复时间顺序
+                                  // 简单检测：如果前一条用户消息不含否定词，当前含否定词，可能矛盾
+        let prev_has_negation = negation_markers
+            .iter()
+            .any(|m| prev_user_msgs[0].to_lowercase().contains(m));
+        if !prev_has_negation {
+            Some("用户当前消息含否定/修正表述，可能与此前表态矛盾".to_string())
+        } else {
+            None
+        }
+    }
+
+    /// 检测高情绪：用户消息中出现强烈情绪表达
+    fn detect_high_emotion(text: &str) -> Option<String> {
+        let high_emotion_markers = [
+            "!!",
+            "！！！",
+            "？？？",
+            "啊啊啊",
+            "呜呜",
+            "气死",
+            "烦死",
+            "崩溃",
+            "太棒了",
+            "太开心",
+            "好激动",
+            "受不了",
+            "救命",
+            "卧槽",
+            "我靠",
+            "天哪",
+            "我的天",
+        ];
+        let lower = text.to_lowercase();
+        let mut found: Vec<&str> = Vec::new();
+        for marker in &high_emotion_markers {
+            if lower.contains(marker) {
+                found.push(marker);
+            }
+        }
+        // 连续感叹号/问号
+        let exclamation_count = text.chars().filter(|c| *c == '!' || *c == '！').count();
+        let question_count = text.chars().filter(|c| *c == '?' || *c == '？').count();
+        if exclamation_count >= 3 {
+            found.push("连续感叹号");
+        }
+        if question_count >= 3 {
+            found.push("连续问号");
+        }
+
+        if found.is_empty() {
+            None
+        } else {
+            Some(format!("用户消息情绪强烈：{}", found.join("、")))
+        }
+    }
+
+    /// 检测交叉提问：用户在同一消息中提出多个不相关的问题
+    fn detect_cross_questioning(text: &str) -> Option<String> {
+        let question_count = text
+            .chars()
+            .filter(|c| *c == '?' || *c == '？' || *c == '?')
+            .count();
+        // 同时检测多个疑问句标记
+        let question_markers = [
+            "什么",
+            "怎么",
+            "为什么",
+            "如何",
+            "哪里",
+            "谁",
+            "几点",
+            "多少",
+        ];
+        let marker_count = question_markers
+            .iter()
+            .filter(|m| text.contains(**m))
+            .count();
+        // 至少2个问号或2个疑问标记
+        if question_count >= 2 || marker_count >= 2 {
+            Some(format!(
+                "用户交叉提问（{}个问号，{}个疑问标记）",
+                question_count, marker_count
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// 检测不连贯：用户消息与近期对话缺乏逻辑关联
+    fn detect_incoherence(text: &str, recent_messages: &[String]) -> Option<String> {
+        if recent_messages.len() < 2 {
+            return None;
+        }
+        let normalized = text.trim().to_lowercase();
+        if normalized.chars().count() < 6 {
+            return None;
+        }
+        // 取最近1条消息，检查是否有共享词汇
+        let last_msg = recent_messages.last()?.to_lowercase();
+        let words: Vec<&str> = normalized
+            .split(|c: char| !c.is_alphanumeric() && !c.is_whitespace())
+            .filter(|w| w.chars().count() >= 2)
+            .collect();
+        let has_overlap = words.iter().any(|w| last_msg.contains(*w));
+        if !has_overlap && words.len() >= 3 {
+            Some("用户消息与上一条对话无共享词汇，可能不连贯".to_string())
+        } else {
+            None
+        }
+    }
+
+    /// 检测低可信：用户消息包含不确定/猜测性表述
+    fn detect_low_credibility(text: &str) -> Option<String> {
+        let uncertainty_markers = [
+            "可能",
+            "也许",
+            "大概",
+            "好像",
+            "似乎",
+            "听说",
+            "据说",
+            "不确定",
+            "不清楚",
+            "不知道是不是",
+            "感觉",
+            "应该是",
+            "或许是",
+            "或许是",
+            "说不定",
+        ];
+        let lower = text.to_lowercase();
+        let count = uncertainty_markers
+            .iter()
+            .filter(|m| lower.contains(**m))
+            .count();
+        if count >= 2 {
+            Some(format!("用户消息包含{}个不确定表述，可信度较低", count))
+        } else {
+            None
+        }
+    }
+
+    /// 检测陈旧话题：用户重新提及很久以前的话题
+    fn detect_stale_topic(text: &str, recent_messages: &[String]) -> Option<String> {
+        if recent_messages.len() < 5 {
+            return None;
+        }
+        let normalized = text.trim().to_lowercase();
+        if normalized.chars().count() < 6 {
+            return None;
+        }
+        // 检查消息是否与较旧的消息（前一半）有关联，而与最近的消息（后一半）无关联
+        let mid = recent_messages.len() / 2;
+        let old_messages = &recent_messages[..mid];
+        let recent_half = &recent_messages[mid..];
+
+        let old_text = old_messages.join(" ").to_lowercase();
+        let recent_text = recent_half.join(" ").to_lowercase();
+
+        let words: Vec<&str> = normalized
+            .split(|c: char| !c.is_alphanumeric() && !c.is_whitespace())
+            .filter(|w| w.chars().count() >= 2)
+            .collect();
+        let old_overlap = words.iter().filter(|w| old_text.contains(**w)).count();
+        let recent_overlap = words.iter().filter(|w| recent_text.contains(**w)).count();
+
+        if old_overlap >= 2 && recent_overlap == 0 && !words.is_empty() {
+            Some(format!(
+                "用户重新提及较旧话题，与近期{}条消息无关",
+                recent_half.len()
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// 规划信号归一化 — 将 ReplyPlan 标准化为键值对映射
+    fn normalize_planning_signals(&self, plan: &ReplyPlan) -> Option<HashMap<String, String>> {
+        let mut map = HashMap::new();
+
+        if let Some(ref topic) = plan.topic {
+            map.insert("topic".to_string(), topic.clone());
+        }
+        if let Some(ref style) = plan.style {
+            map.insert("style".to_string(), style.clone());
+        }
+        map.insert(
+            "memory_recall_needed".to_string(),
+            plan.memory_recall_needed.to_string(),
+        );
+        map.insert("use_emoji".to_string(), plan.use_emoji.to_string());
+        map.insert("priority".to_string(), plan.priority.to_string());
+
+        if map.is_empty() {
+            None
+        } else {
+            Some(map)
         }
     }
 }
