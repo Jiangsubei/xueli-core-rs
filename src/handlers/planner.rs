@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::core::platform_types::InboundEvent;
@@ -22,6 +23,36 @@ pub struct PlanResult {
     pub reply_reference: String,
     pub should_reply: bool,
     pub confidence: f64,
+}
+
+/// 记忆检索 profile
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryProfile {
+    /// 不加载记忆
+    Off,
+    /// 仅人物事实
+    FactsOnly,
+    /// 仅高度相关
+    Relevant,
+    /// 较多记忆（默认）
+    Rich,
+}
+
+impl Default for MemoryProfile {
+    fn default() -> Self {
+        Self::Relevant
+    }
+}
+
+/// 层级强度
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SectionIntensity {
+    High,
+    Normal,
+    Light,
+    Off,
 }
 
 /// 提示词区段编译开关 — 对应 Python 版 `PromptSectionPolicy`
@@ -59,7 +90,7 @@ pub struct PromptPlan {
     pub continuity_mode: String,
     pub timeline_detail: String,
     pub context_profile: String,
-    pub memory_profile: String,
+    pub memory_profile: MemoryProfile,
     pub tone_profile: String,
     pub initiative: String,
     pub expression_profile: String,
@@ -67,6 +98,9 @@ pub struct PromptPlan {
     pub notes: String,
     pub emoji_should_send: bool,
     pub emoji_intent_reference: String,
+    /// 各提示词区段的强度控制
+    #[serde(default)]
+    pub section_intensity: HashMap<String, SectionIntensity>,
 }
 
 impl Default for PromptPlan {
@@ -76,7 +110,7 @@ impl Default for PromptPlan {
             continuity_mode: "direct_continue".into(),
             timeline_detail: "summary".into(),
             context_profile: "standard".into(),
-            memory_profile: "relevant".into(),
+            memory_profile: MemoryProfile::default(),
             tone_profile: "balanced".into(),
             initiative: "gentle_follow".into(),
             expression_profile: "plain".into(),
@@ -84,6 +118,7 @@ impl Default for PromptPlan {
             notes: String::new(),
             emoji_should_send: false,
             emoji_intent_reference: String::new(),
+            section_intensity: HashMap::new(),
         }
     }
 }

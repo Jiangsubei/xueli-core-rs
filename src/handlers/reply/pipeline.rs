@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::core::config::XueliConfig;
+use crate::handlers::planner::MemoryProfile;
 use crate::memory::manager::MemoryManager;
 use crate::memory::stores::conversation::{ConversationRecord, SqliteConversationStore};
 
@@ -217,6 +218,144 @@ impl<L: PromptTemplateLoader + 'static> ReplyPipeline<L> {
         }
 
         result
+    }
+
+    /// 根据记忆 profile 加载多层级记忆上下文
+    ///
+    /// - `Off`: 跳过所有记忆层，仅加载历史消息
+    /// - `FactsOnly`: 仅加载人物事实
+    /// - `Relevant`: 加载人物事实 + 持久记忆（限制数量）
+    /// - `Rich`: 加载全部记忆层（等同于 `load_memory_context`）
+    pub async fn load_memory_context_with_profile(
+        &self,
+        user_id: &str,
+        scope_id: &str,
+        is_group: bool,
+        existing_message_count: usize,
+        profile: MemoryProfile,
+    ) -> MemoryContextResult {
+        let is_first_turn = existing_message_count == 0;
+        let scope_type = if is_group { "group" } else { "private" };
+
+        let mut result = MemoryContextResult {
+            is_first_turn,
+            ..Default::default()
+        };
+
+        match profile {
+            MemoryProfile::Off => {
+                // 跳过所有记忆层
+            }
+            MemoryProfile::FactsOnly => {
+                // 层级1：人物事实
+                if let Some(ref mm) = self.memory_manager {
+                    if let Err(e) = self.load_person_facts(mm, user_id, &mut result).await {
+                        warn!("[回复管道] 加载人物事实失败: {}", e);
+                    }
+                }
+            }
+            MemoryProfile::Relevant => {
+                // 层级1：人物事实
+                if let Some(ref mm) = self.memory_manager {
+                    if let Err(e) = self.load_person_facts(mm, user_id, &mut result).await {
+                        warn!("[回复管道] 加载人物事实失败: {}", e);
+                    }
+                    // 层级2：持久记忆（限制数量）
+                    if let Err(e) = self
+                        .load_persistent_memory(mm, user_id, &mut result, 3)
+                        .await
+                    {
+                        warn!("[回复管道] 加载持久记忆失败: {}", e);
+                    }
+                }
+            }
+            MemoryProfile::Rich => {
+                // 全量加载，委托给 load_memory_context
+                return self
+                    .load_memory_context(user_id, scope_id, is_group, existing_message_count)
+                    .await;
+            }
+        }
+
+        // 历史消息：从 conversation store 加载
+        if let Some(ref store) = self.conversation_store {
+            match store.get_recent_by_scope(scope_type, scope_id, 30) {
+                Ok(records) => {
+                    result.history_messages = records;
+                    if result.history_messages.is_empty() {
+                        result.is_first_turn = true;
+                    }
+                }
+                Err(e) => {
+                    warn!("[回复管道] 加载对话历史失败: {}", e);
+                }
+            }
+        }
+
+        result
+    }
+
+    /// 加载人物事实
+    async fn load_person_facts(
+        &self,
+        mm: &Arc<MemoryManager<L>>,
+        user_id: &str,
+        result: &mut MemoryContextResult,
+    ) -> Result<(), String> {
+        let items = mm
+            .get_by_user(user_id)
+            .await
+            .map_err(|e| format!("{}", e))?;
+        let facts: Vec<String> = items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.memory_type,
+                    crate::core::types::MemoryType::Fact
+                        | crate::core::types::MemoryType::Preference
+                        | crate::core::types::MemoryType::Relationship
+                )
+            })
+            .take(6)
+            .map(|item| item.content.clone())
+            .collect();
+        if !facts.is_empty() {
+            result.person_fact_context = facts.join("\n");
+        }
+        Ok(())
+    }
+
+    /// 加载持久记忆（可指定最大条目数）
+    async fn load_persistent_memory(
+        &self,
+        mm: &Arc<MemoryManager<L>>,
+        user_id: &str,
+        result: &mut MemoryContextResult,
+        max_items: usize,
+    ) -> Result<(), String> {
+        let items = mm
+            .get_by_user(user_id)
+            .await
+            .map_err(|e| format!("{}", e))?;
+        let mut important: Vec<_> = items
+            .iter()
+            .filter(|item| item.importance > 0.5)
+            .cloned()
+            .collect();
+        important.sort_by(|a, b| {
+            b.importance
+                .partial_cmp(&a.importance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let lines: Vec<String> = important
+            .iter()
+            .take(max_items)
+            .map(|item| item.content.clone())
+            .collect();
+        if !lines.is_empty() {
+            result.persistent_memory_context = format_memory_context(&lines);
+        }
+        Ok(())
     }
 
     async fn load_retrieval_context(

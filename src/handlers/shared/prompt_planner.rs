@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use crate::core::platform_types::InboundEvent;
-use crate::handlers::planner::{PromptPlan, PromptSectionPolicy};
+use crate::handlers::planner::{MemoryProfile, PromptPlan, PromptSectionPolicy, SectionIntensity};
 
 static PROMPT_NOTES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
@@ -176,10 +176,9 @@ impl PromptPlanner {
                 &["compact", "standard", "full"],
                 &default_plan.context_profile,
             ),
-            memory_profile: Self::normalize_choice(
+            memory_profile: Self::parse_memory_profile(
                 raw_plan.get("memory_profile").and_then(|v| v.as_str()),
-                &["off", "facts_only", "relevant", "rich"],
-                &default_plan.memory_profile,
+                default_plan.memory_profile,
             ),
             tone_profile: Self::normalize_choice(
                 raw_plan.get("tone_profile").and_then(|v| v.as_str()),
@@ -202,6 +201,11 @@ impl PromptPlanner {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or(default_plan.notes),
+            section_intensity: Self::parse_section_intensity(
+                raw_plan
+                    .get("section_intensity")
+                    .and_then(|v| v.as_object()),
+            ),
             emoji_should_send: decision
                 .get("emoji_should_send")
                 .and_then(|v| v.as_bool())
@@ -268,19 +272,19 @@ impl PromptPlanner {
         };
 
         let memory_profile = if reply_goal == "clarify" && is_group {
-            "off"
+            MemoryProfile::Off
         } else if reply_goal == "answer" && continuity_hint == "old_topic_resume" {
-            "rich"
+            MemoryProfile::Rich
         } else if reply_goal == "comfort" {
             if is_group {
-                "facts_only"
+                MemoryProfile::FactsOnly
             } else {
-                "relevant"
+                MemoryProfile::Relevant
             }
         } else if continuity_hint == "old_topic_resume" {
-            "rich"
+            MemoryProfile::Rich
         } else {
-            "relevant"
+            MemoryProfile::Relevant
         };
 
         let tone_profile = if reply_goal == "comfort" {
@@ -317,11 +321,18 @@ impl PromptPlanner {
         let should_reply = true;
         let include_person_facts = should_reply
             && !is_group
-            && matches!(memory_profile, "facts_only" | "relevant" | "rich");
+            && matches!(
+                memory_profile,
+                MemoryProfile::FactsOnly | MemoryProfile::Relevant | MemoryProfile::Rich
+            );
         let include_session_restore =
             should_reply && matches!(continuity_hint, "resume_after_break" | "old_topic_resume");
         let include_precise_recall = should_reply && continuity_hint == "old_topic_resume";
-        let include_dynamic_memory = should_reply && matches!(memory_profile, "relevant" | "rich");
+        let include_dynamic_memory = should_reply
+            && matches!(
+                memory_profile,
+                MemoryProfile::Relevant | MemoryProfile::Rich
+            );
 
         let policy = PromptSectionPolicy {
             include_recent_history: should_reply,
@@ -341,7 +352,7 @@ impl PromptPlanner {
             continuity_mode: continuity_mode_final.to_string(),
             timeline_detail: timeline_detail.to_string(),
             context_profile: context_profile.to_string(),
-            memory_profile: memory_profile.to_string(),
+            memory_profile,
             tone_profile: tone_profile.to_string(),
             initiative: initiative.to_string(),
             expression_profile: expression_profile.to_string(),
@@ -349,6 +360,7 @@ impl PromptPlanner {
             notes,
             emoji_should_send: false,
             emoji_intent_reference: String::new(),
+            section_intensity: HashMap::new(),
         }
     }
 
@@ -422,6 +434,37 @@ impl PromptPlanner {
             None => default.to_string(),
         }
     }
+
+    fn parse_memory_profile(value: Option<&str>, default: MemoryProfile) -> MemoryProfile {
+        match value {
+            Some("off") => MemoryProfile::Off,
+            Some("facts_only") => MemoryProfile::FactsOnly,
+            Some("relevant") => MemoryProfile::Relevant,
+            Some("rich") => MemoryProfile::Rich,
+            _ => default,
+        }
+    }
+
+    fn parse_section_intensity(
+        raw: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> HashMap<String, SectionIntensity> {
+        let mut map = HashMap::new();
+        if let Some(obj) = raw {
+            for (key, val) in obj {
+                if let Some(s) = val.as_str() {
+                    let intensity = match s {
+                        "high" => SectionIntensity::High,
+                        "normal" => SectionIntensity::Normal,
+                        "light" => SectionIntensity::Light,
+                        "off" => SectionIntensity::Off,
+                        _ => continue,
+                    };
+                    map.insert(key.clone(), intensity);
+                }
+            }
+        }
+        map
+    }
 }
 
 #[cfg(test)]
@@ -470,7 +513,7 @@ mod tests {
         // "comfort" reply_goal from a specific path - let's test old_topic_resume
         let plan2 = pp.default_prompt_plan(false, "old_topic_resume", false, false);
         assert_eq!(plan2.reply_goal, "recall");
-        assert_eq!(plan2.memory_profile, "rich");
+        assert_eq!(plan2.memory_profile, MemoryProfile::Rich);
         assert!(plan2.policy.include_precise_recall);
     }
 

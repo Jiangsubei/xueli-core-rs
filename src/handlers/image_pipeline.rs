@@ -96,8 +96,19 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> ImagePipeline<A, 
         }
 
         let mut result = if !normal_images.is_empty() {
+            let session = event.get_session();
+            let trace_id = event.id.as_str();
+            let session_key = session.session_id.as_str();
+            let message_id = event.id.as_str();
             self.vision_client
-                .analyze_images(&normal_images, user_text, is_group)
+                .analyze_images(
+                    &normal_images,
+                    user_text,
+                    is_group,
+                    trace_id,
+                    session_key,
+                    message_id,
+                )
                 .await?
         } else {
             ImageAnalysisResult::empty()
@@ -108,9 +119,20 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> ImagePipeline<A, 
                 let b64 = base64::engine::general_purpose::STANDARD.encode(data);
                 let emotion_labels: Vec<String> = Vec::new();
                 let reply_tones: Vec<String> = Vec::new();
+                let session = event.get_session();
+                let trace_id = event.id.as_str();
+                let session_key = session.session_id.as_str();
+                let message_id = event.id.as_str();
                 match self
                     .vision_client
-                    .classify_sticker_emotion(&b64, &emotion_labels, &reply_tones)
+                    .classify_sticker_emotion(
+                        &b64,
+                        &emotion_labels,
+                        &reply_tones,
+                        trace_id,
+                        session_key,
+                        message_id,
+                    )
                     .await
                 {
                     Ok(emotion) => {

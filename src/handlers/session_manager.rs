@@ -220,8 +220,8 @@ impl ConversationSessionManager {
 
     /// 从持久化存储恢复历史会话到内存（用于空会话初始化）。
     ///
-    /// 群聊：按 scope 查询群组内所有历史消息。
-    /// 私聊：按用户 ID 查询该用户的所有历史消息。
+    /// 群聊：按对话键查询群组内所有已关闭会话，合并各会话的 turns。
+    /// 私聊：按用户 ID 查询该用户的所有已关闭会话，合并各会话的 turns。
     ///
     /// 恢复后设置 restored_session_pending 标识，供 downstream 判断是否为恢复上下文。
     pub async fn restore(&self, key: &str) {
@@ -230,83 +230,115 @@ impl ConversationSessionManager {
             None => return,
         };
 
-        let parts: Vec<String> = key.split(':').map(|s| s.to_string()).collect();
-        let is_group = parts.len() >= 3 && parts.get(1).map_or(false, |s| s == "group");
+        let parts: Vec<&str> = key.split(':').collect();
+        let is_group = parts.len() >= 3 && parts.get(1).map_or(false, |s| *s == "group");
+        let dialogue_key = key.to_string();
 
-        let fetch_key = key.to_string();
-        let records_result = if is_group {
-            let group_id = parts.get(2).cloned().unwrap_or_default();
+        let sessions_result = if is_group {
+            let group_id = parts.get(2).map(|s| s.to_string()).unwrap_or_default();
             if group_id.is_empty() {
                 return;
             }
-            let store_arc = store.clone();
-            tokio::task::spawn_blocking(move || {
-                store_arc.get_recent_by_scope("group", &group_id, 600)
-            })
-            .await
+            store.get_conversations_by_group_id(&group_id, 6).await
         } else {
             let user_id = self._resolve_owner_user_id(key);
             if user_id.is_empty() {
                 return;
             }
-            let store_arc = store.clone();
-            tokio::task::spawn_blocking(move || store_arc.get_recent_by_user(&user_id, 600)).await
+            store.get_conversations(&user_id, 6).await
         };
 
-        let records = match records_result {
-            Ok(Ok(recs)) => recs,
+        let sessions = match sessions_result {
+            Ok(s) => s,
             _ => {
-                tracing::warn!("[会话管理器] 加载历史会话失败, key={}", fetch_key);
+                tracing::warn!("[会话管理器] 加载历史会话失败, key={}", dialogue_key);
                 return;
             }
         };
 
-        if records.is_empty() {
+        if sessions.is_empty() {
             return;
         }
 
-        let mut latest_time = 0.0f64;
+        let mut all_messages: Vec<MessageEntry> = Vec::new();
+        let mut latest_session_time = 0.0f64;
         let mut latest_session_id = String::new();
-        let mut messages: Vec<MessageEntry> = Vec::new();
 
-        for record in &records {
-            let text = record.text.trim();
-            if text.is_empty() {
+        for record in &sessions {
+            if record.dialogue_key != dialogue_key || record.turn_count() == 0 {
                 continue;
             }
-            let event_time = record.event_time;
-            if event_time > 0.0 && event_time > latest_time {
-                latest_time = event_time;
+
+            let restored_session_time = {
+                let ts = if !record.closed_at.is_empty() {
+                    self._parse_timestamp(&record.closed_at)
+                } else {
+                    self._parse_timestamp(&record.updated_at)
+                };
+                ts
+            };
+
+            let turns = match store.load_session(&record.session_id).await {
+                Ok(t) => t,
+                _ => continue,
+            };
+
+            if turns.is_empty() {
+                continue;
+            }
+
+            let effective_session_time = if restored_session_time <= 0.0 {
+                turns
+                    .iter()
+                    .map(|t| t.timestamp as f64)
+                    .fold(0.0f64, f64::max)
+            } else {
+                restored_session_time
+            };
+
+            if effective_session_time > latest_session_time {
+                latest_session_time = effective_session_time;
                 latest_session_id = record.session_id.clone();
             }
-            let role = if record.is_bot { "assistant" } else { "user" };
-            messages.push(MessageEntry {
-                role: role.to_string(),
-                content: text.to_string(),
-                timestamp: event_time,
-                image_description: String::new(),
-                message_id: record.message_id.clone(),
-                restored: true,
-            });
+
+            for turn_msg in &turns {
+                let text = turn_msg.message_text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                let role = if turn_msg.speaker_role == "assistant" {
+                    "assistant"
+                } else {
+                    "user"
+                };
+                all_messages.push(MessageEntry {
+                    role: role.to_string(),
+                    content: text.to_string(),
+                    timestamp: turn_msg.timestamp as f64,
+                    image_description: turn_msg.image_descriptions.join("\n"),
+                    message_id: turn_msg.message_id.clone(),
+                    restored: true,
+                });
+            }
         }
 
-        messages.sort_by(|a, b| {
+        if all_messages.is_empty() {
+            return;
+        }
+
+        all_messages.sort_by(|a, b| {
             a.timestamp
                 .partial_cmp(&b.timestamp)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        if messages.is_empty() {
-            return;
-        }
-
-        let message_count = messages.len();
+        let message_count = all_messages.len();
         let mut conversations = self.conversations.lock().await;
-        let conv = conversations.entry(fetch_key).or_default();
-        for msg in &messages {
+        let conv = conversations.entry(dialogue_key).or_default();
+        for msg in &all_messages {
             conv.messages.push(msg.clone());
         }
-        conv.restored_previous_session_time = latest_time;
+        conv.restored_previous_session_time = latest_session_time;
         conv.restored_session_id = latest_session_id;
         conv.restored_session_pending = true;
         conv.last_update = current_timestamp();
@@ -374,6 +406,28 @@ impl ConversationSessionManager {
             return parts.last().unwrap_or(&"").to_string();
         }
         parts.last().unwrap_or(&"").to_string()
+    }
+
+    /// 解析 ISO 8601 / RFC 3339 时间字符串为 Unix 时间戳（秒）。
+    ///
+    /// 支持带时区偏移或不带时区的格式，解析失败返回 0.0。
+    fn _parse_timestamp(&self, value: &str) -> f64 {
+        let text = value.trim();
+        if text.is_empty() {
+            return 0.0;
+        }
+        // 尝试 RFC 3339（含时区偏移，如 "2024-01-01T12:00:00+08:00"）
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(text) {
+            return dt.timestamp() as f64;
+        }
+        // 尝试 naive datetime 常见格式（无时区，按 UTC 处理）
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S") {
+            return dt.and_utc().timestamp() as f64;
+        }
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f") {
+            return dt.and_utc().timestamp() as f64;
+        }
+        0.0
     }
 }
 

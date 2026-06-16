@@ -72,7 +72,7 @@ pub struct MessageHandler<
     reply_pipeline: Arc<ReplyPipeline<L>>,
 
     memory_manager: Arc<MemoryManager<L>>,
-    memory_flow_tx: tokio::sync::mpsc::UnboundedSender<MemoryJob>,
+    memory_flow_tx: tokio::sync::mpsc::Sender<MemoryJob>,
 
     character_card_service: Arc<CharacterCardService>,
     narrative_service: Arc<NarrativeService>,
@@ -171,14 +171,12 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
             Some(memory_manager.conversation_store()),
         ));
 
-        let (memory_flow_tx, mut memory_flow_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (flow_service, mut memory_flow_rx) =
+            MemoryFlowService::new(memory_manager.clone(), None, None);
+        let memory_flow_tx = flow_service.tx.clone();
         {
-            let mgr = memory_manager.clone();
             tokio::spawn(async move {
-                use crate::memory::memory_dispute_resolver::MemoryDisputeResolver;
-                let resolver =
-                    MemoryDisputeResolver::new(crate::core::config::MemoryDisputeConfig::default());
-                MemoryFlowService::run(mgr, resolver, None, &mut memory_flow_rx).await;
+                flow_service.run(&mut memory_flow_rx).await;
             });
         }
 
@@ -436,6 +434,8 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
             conversation_active: true,
             time_since_last_reply_secs: 10.0,
             message_count_in_window: 3,
+            recent_history_text: String::new(),
+            new_messages_since_wait: Vec::new(),
         };
 
         let decision = self.timing_gate.should_reply(&ctx).await;
@@ -569,33 +569,36 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
             )
             .await;
 
-        let _ = self.memory_flow_tx.send(MemoryJob::RegisterDialogue {
-            user_id: event
-                .message
-                .as_ref()
-                .map(|m| m.sender_id.clone())
-                .unwrap_or_default(),
-            user_message: context.user_message.clone(),
-            assistant_message: result.reply_text.clone(),
-            dialogue_key: conversation_key.clone(),
-            scope_type: if scope.is_group() {
-                "group".to_string()
-            } else {
-                "private".to_string()
-            },
-            group_id: scope.group_id().unwrap_or("").to_string(),
-            message_id: event
-                .message
-                .as_ref()
-                .map(|m| m.id.clone())
-                .unwrap_or_default(),
-            image_description: context.vision_description.unwrap_or_default(),
-            narrative_summary: context.narrative_thread_summary.clone().unwrap_or_default(),
-            platform: event.platform.clone(),
-            warmth_guidance: String::new(),
-            user_emotion_label: String::new(),
-            intimacy_delta: 0.0,
-        });
+        let _ = self
+            .memory_flow_tx
+            .send(MemoryJob::RegisterDialogue {
+                user_id: event
+                    .message
+                    .as_ref()
+                    .map(|m| m.sender_id.clone())
+                    .unwrap_or_default(),
+                user_message: context.user_message.clone(),
+                assistant_message: result.reply_text.clone(),
+                dialogue_key: conversation_key.clone(),
+                scope_type: if scope.is_group() {
+                    "group".to_string()
+                } else {
+                    "private".to_string()
+                },
+                group_id: scope.group_id().unwrap_or("").to_string(),
+                message_id: event
+                    .message
+                    .as_ref()
+                    .map(|m| m.id.clone())
+                    .unwrap_or_default(),
+                image_description: context.vision_description.unwrap_or_default(),
+                narrative_summary: context.narrative_thread_summary.clone().unwrap_or_default(),
+                platform: event.platform.clone(),
+                warmth_guidance: String::new(),
+                user_emotion_label: String::new(),
+                intimacy_delta: 0.0,
+            })
+            .await;
         self._apply_mood_adjustments(event, &result.reply_text)
             .await;
 

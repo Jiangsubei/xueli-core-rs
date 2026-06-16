@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::character::card_service::{CharacterCardService, CharacterCardSnapshot};
 use crate::core::platform_types::InboundEvent;
 use crate::core::scope::ChatScope;
-use crate::core::types::ReplyPlan;
+use crate::core::types::{PromptPlan, ReplyPlan};
 use crate::handlers::context_builder::ConversationContextBuilder;
 use crate::handlers::planner::{ConversationPlanner, PlanResult};
 use crate::handlers::session_manager::ConversationSessionManager;
@@ -54,7 +54,16 @@ pub struct MessageContext {
     pub unified_history: Vec<HashMap<String, serde_json::Value>>,
     pub vision_analysis: HashMap<String, serde_json::Value>,
     pub planning_signals: HashMap<String, serde_json::Value>,
-    pub relationship_summary: String,
+    pub relationship_summary: Option<String>,
+    pub narrative_thread_summary: Option<String>,
+    pub drive_context: Option<String>,
+    pub soft_uncertainty_signals: Vec<String>,
+    pub final_style_guide: Option<String>,
+    pub session_restore_context: Option<String>,
+    pub precise_recall_context: Option<String>,
+    pub rendered_memory_sections: HashMap<String, String>,
+    pub user_emotion_label: Option<String>,
+    pub prompt_plan: Option<PromptPlan>,
 }
 
 impl Default for MessageContext {
@@ -73,7 +82,16 @@ impl Default for MessageContext {
             unified_history: Vec::new(),
             vision_analysis: HashMap::new(),
             planning_signals: HashMap::new(),
-            relationship_summary: String::new(),
+            relationship_summary: None,
+            narrative_thread_summary: None,
+            drive_context: None,
+            soft_uncertainty_signals: Vec::new(),
+            final_style_guide: None,
+            session_restore_context: None,
+            precise_recall_context: None,
+            rendered_memory_sections: HashMap::new(),
+            user_emotion_label: None,
+            prompt_plan: None,
         }
     }
 }
@@ -393,9 +411,14 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ConversationPlanCoordinator
 
         // 关系摘要
         let relationship_summary = self
-            .build_relationship_summary(event)
+            .build_relationship_summary_from_event(event)
             .await
             .unwrap_or_default();
+        let relationship_summary = if relationship_summary.is_empty() {
+            None
+        } else {
+            Some(relationship_summary)
+        };
 
         // 视觉分析
         let vision_analysis = Self::extract_vision_analysis(&current_message);
@@ -436,6 +459,15 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ConversationPlanCoordinator
             vision_analysis,
             planning_signals,
             relationship_summary,
+            narrative_thread_summary: None,
+            drive_context: None,
+            soft_uncertainty_signals: Vec::new(),
+            final_style_guide: None,
+            session_restore_context: None,
+            precise_recall_context: None,
+            rendered_memory_sections: HashMap::new(),
+            user_emotion_label: None,
+            prompt_plan: None,
         })
     }
 
@@ -739,7 +771,10 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ConversationPlanCoordinator
     /// 构建关系摘要 — 从角色卡快照中提取关系信息
     ///
     /// 对应 Python 版 `_build_relationship_summary()`
-    async fn build_relationship_summary(&self, event: &InboundEvent) -> XueliResult<String> {
+    async fn build_relationship_summary_from_event(
+        &self,
+        event: &InboundEvent,
+    ) -> XueliResult<String> {
         let user_id = event
             .message
             .as_ref()
@@ -762,6 +797,34 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ConversationPlanCoordinator
             String::new()
         } else {
             parts.join("\n")
+        })
+    }
+
+    /// 公开的关系摘要构建方法 — 根据 user_id 和 scope 生成关系摘要
+    ///
+    /// 新公开接口，便于下游模块直接调用获取关系摘要。
+    pub async fn build_relationship_summary(
+        &self,
+        user_id: &str,
+        _scope: &ChatScope,
+    ) -> XueliResult<Option<String>> {
+        if user_id.is_empty() {
+            return Ok(None);
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+
+        if let Some(ref ccs) = self.character_card_service {
+            let snapshot = ccs.get_snapshot(user_id);
+            if snapshot.intimacy_level > 0.0 || !snapshot.relationship_stage.is_empty() {
+                parts.extend(Self::format_snapshot_relationship(&snapshot));
+            }
+        }
+
+        Ok(if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n"))
         })
     }
 
