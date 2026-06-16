@@ -17,10 +17,14 @@ max_retries = 3
 
 [vision]
 enabled = false
+provider = "openai"
 # api_base = "https://api.openai.com/v1"  # 默认使用 model.api_base
 # api_key = "YOUR_API_KEY"                # 默认使用 model.api_key
 # model = "gpt-4o"                        # 默认使用 model.primary_model
+temperature = 0.7
+max_tokens = 4096
 context_window = 32000
+concurrent_limit = 3
 # response_path = "choices.0.message.content"
 
 [reply]
@@ -54,9 +58,19 @@ extraction_min_messages = 5
 bm25_top_k = 10
 vector_top_k = 5
 rerank_top_k = 20
+pre_rerank_top_k = 12
 dynamic_memory_limit = 8
+dynamic_dedup_enabled = true
+dynamic_dedup_similarity_threshold = 0.72
+rerank_candidate_max_chars = 160
+rerank_total_prompt_budget = 2400
 auto_extract = true
 extract_every_n_turns = 3
+# extraction_api_base = ""          # 记忆提取模型 API 地址
+# extraction_api_key = ""           # 记忆提取模型 API 密钥
+# extraction_model = ""             # 记忆提取模型名称
+extraction_context_window = 128000
+# extraction_response_path = ""     # 记忆提取响应路径
 
 [memory.decay]
 ordinary_decay_enabled = true
@@ -65,6 +79,22 @@ ordinary_forget_threshold = 0.5
 cold_memory_threshold_days = 90.0
 cold_decay_multiplier = 1.5
 
+[memory.merge]
+enabled = false
+min_cluster_size = 2
+max_batch = 5
+llm_enabled = true
+consolidation_hours = 48.0
+consolidation_llm_enabled = false
+consolidation_batch_size = 20
+archive_penalty_base = 0.5
+
+[memory.suppression]
+enabled = false
+factor = 0.05
+max_per_query = 3
+cooldown_retrievals = 5
+
 [memory.retrieval_weights]
 local_bm25_weight = 1.0
 local_importance_weight = 0.35
@@ -72,6 +102,18 @@ local_mention_weight = 0.2
 local_recency_weight = 0.15
 local_scene_weight = 0.3
 vector_weight = 0.4
+
+[memory.scene_weights]
+same_group_weight = 1.5
+same_type_weight = 1.0
+same_user_weight = 0.8
+
+[memory.fuzzy_recall]
+enabled = false
+probability = 0.3
+confidence_threshold = 0.7
+confidence_decay_per_day = 0.01
+confidence_minimum = 0.3
 
 [memory.dispute]
 enabled = true
@@ -96,13 +138,18 @@ max_concurrent_messages = 10
 [emoji]
 enabled = true
 db_path = "data/emoji.db"
+data_dir = "data/emoji"
+max_stored_emojis = 100
+max_stickers = 200
+max_per_user = 50
 capture_enabled = true
 classification_enabled = true
+# classification_windows = ["08:00-12:00", "18:00-22:00"]
+# emotion_labels = ["开心", "喜欢", "惊讶", "无语", "委屈", "生气", "伤心", "嘲讽", "害怕", "困惑", "焦虑", "疲惫", "温暖", "内疚", "感动"]
 idle_seconds_before_classify = 45.0
 classification_interval_seconds = 30.0
 reply_enabled = false
 reply_cooldown_seconds = 180.0
-max_stored_emojis = 100
 overflow_policy = "replace_oldest"
 
 [proactive_share]
@@ -132,6 +179,15 @@ mood_recovery_rate = 0.4
 mood_cycle_length_days = 7
 mood_show_in_reply = true
 relationship_tracking_enabled = true
+gain_per_positive = 0.02
+loss_per_negative = 0.03
+emotional_history_size = 50
+
+[character_growth.intimacy_thresholds]
+acquaintance = 0.2
+friend = 0.5
+close_friend = 0.7
+trusted = 0.9
 
 [group_reply]
 only_reply_when_at = true
@@ -155,3 +211,88 @@ adapter = "napcat"
 platform = "qq"
 ws_url = "ws://0.0.0.0:8095"
 http_url = "http://127.0.0.1:6700"
+
+# =============================================================================
+# 记忆冲突裁决（顶层配置，独立于 memory.dispute）
+# 当新记忆与旧记忆矛盾时如何裁决
+# =============================================================================
+
+[memory_dispute]
+enabled = true
+high_confidence_threshold = 0.75
+normal_confidence_threshold = 0.45
+signal_ttl_hours = 168.0
+
+# =============================================================================
+# 群聊 LLM 回复决策模型配置（可选）
+# 独立于主 AI 服务的群聊策略规划模型
+# 若不填则退回规则路径
+# =============================================================================
+
+[group_reply_decision]
+enabled = false
+# model = ""
+# api_base = ""
+# api_key = ""
+temperature = 0.7
+max_tokens = 512
+context_window = 8000
+planning_window_size = 20
+timing_gate_ttl = 60.0
+
+# =============================================================================
+# 记忆重排序模型配置（可选）
+# 若不填则不使用重排序
+# =============================================================================
+
+[memory_rerank]
+enabled = false
+# model = ""
+# api_base = ""
+# api_key = ""
+temperature = 0.3
+max_tokens = 2048
+context_window = 32000
+rerank_top_k = 5
+rerank_min_score = 0.3
+
+# =============================================================================
+# 内容分区配置
+# 用于控制不同内容类型的 prompt 预算
+# =============================================================================
+
+# [[content_sections]]
+# enabled = true
+# section_type = "personality"
+# budget_chars = 1000
+
+# [[content_sections]]
+# enabled = true
+# section_type = "dialogue_style"
+# budget_chars = 1000
+
+# [[content_sections]]
+# enabled = true
+# section_type = "behavior"
+# budget_chars = 1000
+
+# =============================================================================
+# 内驱力系统配置
+# 三层架构：情绪层(PAD) → 动机层(baseline+transient) → 关系层
+# =============================================================================
+
+[drive]
+enabled = false
+reflection_trigger_rounds = 5
+reflection_trigger_interval_secs = 3600
+event_decay_tick_interval_secs = 10
+max_rule_weight_adjustment = 0.3
+data_dir = "data"
+
+# =============================================================================
+# 插件配置
+# =============================================================================
+
+[plugin]
+enabled = false
+plugin_dir = "plugins"

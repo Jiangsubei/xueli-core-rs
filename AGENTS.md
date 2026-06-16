@@ -1,6 +1,6 @@
 # AGENTS.md
 
-原项目路径在 `/home/jiangsubei/Documents/xueli-qq-bot`
+原项目路径在 `/home/nyara/文档/project/xueli-qq-bot`
 
 ---
 
