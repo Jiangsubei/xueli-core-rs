@@ -122,7 +122,89 @@ impl PersonFactService {
         Ok(lines.join("\n"))
     }
 
-    /// 从重要记忆构建人物事实
+    /// 从重要记忆元数据构建事实（直接使用 ImportantMemory 的 metadata_json）
+    pub fn build_facts_from_important_memories(
+        &self,
+        user_id: &str,
+        important_memories: &[ImportantMemory],
+    ) -> Vec<PersonFact> {
+        let mut facts = Vec::new();
+        let mut seen = HashSet::new();
+
+        for imp in important_memories {
+            let content = imp.content.trim();
+            if content.len() < 3 {
+                continue;
+            }
+            let normalized = normalize_text(content);
+            if normalized.is_empty() {
+                continue;
+            }
+
+            // 从 metadata_json 中解析分类
+            let category = self.infer_category_from_metadata(&imp.metadata_json);
+
+            let key = (category.clone(), normalized.clone());
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.insert(key);
+
+            let id = format!("{}_{}_{}", user_id, category, normalized);
+            let now = chrono::Utc::now();
+
+            facts.push(PersonFact {
+                id,
+                user_id: user_id.to_string(),
+                fact_text: content.to_string(),
+                category,
+                confidence: imp.score,
+                source_conversation_id: Some(imp.id.clone()),
+                created_at: imp.created_at,
+                updated_at: now,
+            });
+        }
+
+        // 按更新时间和置信度排序
+        facts.sort_by(|a, b| {
+            b.updated_at.cmp(&a.updated_at).then_with(|| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
+
+        facts
+    }
+
+    /// 从 metadata_json 推断分类
+    fn infer_category_from_metadata(&self, metadata_json: &str) -> String {
+        if metadata_json.is_empty() || metadata_json == "{}" {
+            return "profile".to_string();
+        }
+        let meta: serde_json::Value = match serde_json::from_str(metadata_json) {
+            Ok(v) => v,
+            Err(_) => return "profile".to_string(),
+        };
+        // 优先使用 metadata 中的 category 字段
+        if let Some(cat) = meta.get("category").and_then(|v| v.as_str()) {
+            return cat.to_string();
+        }
+        if let Some(cat) = meta.get("memory_category").and_then(|v| v.as_str()) {
+            return cat.to_string();
+        }
+        // 根据 insight_type 推断
+        if let Some(it) = meta.get("insight_type").and_then(|v| v.as_str()) {
+            return match it {
+                "digested" => "profile".to_string(),
+                "reflection" => "boundary".to_string(),
+                _ => "profile".to_string(),
+            };
+        }
+        "profile".to_string()
+    }
+
+    /// 从重要记忆构建人物事实（兼容旧接口）
     fn build_facts_from_memories(
         &self,
         user_id: &str,

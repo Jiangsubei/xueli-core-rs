@@ -17,6 +17,18 @@ use crate::prelude::XueliResult;
 use crate::traits::ai_client::{AIClient, ChatCompletionRequest, ChatMessage};
 use crate::traits::prompt_template::PromptTemplateLoader;
 
+/// 巩固输入 — 用于 LLM 评估记忆半衰期调制器
+#[derive(Debug, Clone)]
+pub struct ConsolidationInput {
+    pub id: String,
+    pub content: String,
+    pub importance: f64,
+    pub mention_count: i64,
+    pub recall_count: i64,
+    pub emotional_tone: String,
+    pub category: String,
+}
+
 pub struct MemoryBackgroundCoordinator<L: PromptTemplateLoader + 'static> {
     config: Arc<MemoryConfig>,
 
@@ -870,11 +882,44 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
             return Ok(());
         }
 
-        let candidates: Vec<serde_json::Value> = unconsolidated.iter().map(|m| {
-            serde_json::json!({"id": m.id, "content": m.content, "importance": m.importance})
-        }).collect();
+        let candidates: Vec<ConsolidationInput> = unconsolidated
+            .iter()
+            .map(|m| {
+                // 从 memory_store 加载元数据获取额外字段（异步循环中批量加载）
+                ConsolidationInput {
+                    id: m.id.clone(),
+                    content: m.content.clone(),
+                    importance: m.importance,
+                    mention_count: 0,
+                    recall_count: 0,
+                    emotional_tone: String::new(),
+                    category: String::new(),
+                }
+            })
+            .collect();
 
-        let modifiers = self.batch_llm_consolidate(&candidates).await;
+        // 批量加载元数据以填充 mention_count / recall_count / emotional_tone / category
+        let mut enriched: Vec<ConsolidationInput> = Vec::new();
+        for candidate in candidates {
+            let mut input = candidate;
+            if let Ok(Some(meta)) = memory_store.load_metadata(user_id, &input.id).await {
+                if let Some(v) = meta.get("mention_count").and_then(|v| v.as_i64()) {
+                    input.mention_count = v;
+                }
+                if let Some(v) = meta.get("recall_count").and_then(|v| v.as_i64()) {
+                    input.recall_count = v;
+                }
+                if let Some(v) = meta.get("emotional_tone").and_then(|v| v.as_str()) {
+                    input.emotional_tone = v.to_string();
+                }
+                if let Some(v) = meta.get("category").and_then(|v| v.as_str()) {
+                    input.category = v.to_string();
+                }
+            }
+            enriched.push(input);
+        }
+
+        let modifiers = self.batch_llm_consolidate(&enriched).await;
 
         for item in &modifiers {
             let mem_id = item["id"].as_str().unwrap_or("");
@@ -899,14 +944,14 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
 
     async fn batch_llm_consolidate(
         &self,
-        candidates: &[serde_json::Value],
+        candidates: &[ConsolidationInput],
     ) -> Vec<serde_json::Value> {
         let llm_client = match &self.llm_client {
             Some(c) => c,
             None => {
                 return candidates
                     .iter()
-                    .map(|c| serde_json::json!({"id": c["id"], "modifier": 1.0}))
+                    .map(|c| serde_json::json!({"id": c.id, "modifier": 1.0}))
                     .collect()
             }
         };
@@ -918,18 +963,34 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
             let lines: Vec<String> = batch
                 .iter()
                 .map(|c| {
-                    let cnt = c["content"].as_str().unwrap_or("");
+                    let cnt = &c.content;
                     let truncated = if cnt.len() > 120 { &cnt[..120] } else { cnt };
+                    let mut extra = Vec::new();
+                    if c.mention_count > 0 {
+                        extra.push(format!("mention_count={}", c.mention_count));
+                    }
+                    if c.recall_count > 0 {
+                        extra.push(format!("recall_count={}", c.recall_count));
+                    }
+                    if !c.emotional_tone.is_empty() {
+                        extra.push(format!("emotional_tone={}", c.emotional_tone));
+                    }
+                    if !c.category.is_empty() {
+                        extra.push(format!("category={}", c.category));
+                    }
+                    let extra_str = if extra.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; {}", extra.join("; "))
+                    };
                     format!(
-                        "- id={}; content={}; importance={}",
-                        c["id"].as_str().unwrap_or(""),
-                        truncated,
-                        c["importance"].as_f64().unwrap_or(3.0)
+                        "- id={}; content={}; importance={}{}",
+                        c.id, truncated, c.importance, extra_str,
                     )
                 })
                 .collect();
             let user_prompt = lines.join("\n");
-            let system_prompt = "评估以下新记忆的长期半衰期调制器。返回JSON数组：[{\"id\":\"...\", \"modifier\":1.0}]，modifier>1.0=更慢遗忘，<1.0=更快遗忘。";
+            let system_prompt = "评估以下新记忆的长期半衰期调制器。返回JSON数组：[{\"id\":\"...\", \"modifier\":1.0}]，modifier>1.0=更慢遗忘，<1.0=更快遗忘。mention_count/recall_count/emotional_tone/category 为辅助参考信息。";
 
             let chat_messages = vec![
                 ChatMessage::text("system", system_prompt),
@@ -956,7 +1017,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
                 Ok(Ok(r)) => parse_consolidation_response(&r.content),
                 _ => batch
                     .iter()
-                    .map(|c| serde_json::json!({"id": c["id"], "modifier": 1.0}))
+                    .map(|c| serde_json::json!({"id": c.id, "modifier": 1.0}))
                     .collect(),
             };
 

@@ -4,12 +4,18 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::character::card_service::CharacterCardService;
+use crate::character::narrative::NarrativeService;
 use crate::core::config::MemoryDisputeConfig;
 use crate::core::types::{MemoryItem, MemoryPatch};
+use crate::memory::extraction::extractor::MemoryExtractor;
+use crate::memory::extraction::reflection::MemoryReflection;
+use crate::memory::internal::background::MemoryBackgroundCoordinator;
 use crate::memory::manager::MemoryManager;
 use crate::memory::memory_dispute_resolver::MemoryDisputeResolver;
 use crate::memory::stores::fact_evidence::{FactEvidence, SqliteFactEvidenceStore};
 use crate::prelude::XueliResult;
+use crate::traits::ai_client::AIClient;
 use crate::traits::prompt_template::PromptTemplateLoader;
 
 const MAX_QUEUE_SIZE: usize = 256;
@@ -18,13 +24,22 @@ const MAX_QUEUE_SIZE: usize = 256;
 ///
 /// 对应 Python 版 `src.memory.memory_flow_service.MemoryFlowService`
 pub struct MemoryFlowService<L: PromptTemplateLoader + 'static> {
-    tx: mpsc::Sender<MemoryJob>,
+    pub tx: mpsc::Sender<MemoryJob>,
     pub memory_manager: Arc<MemoryManager<L>>,
     dispute_resolver: MemoryDisputeResolver,
     evidence_store: Option<Arc<SqliteFactEvidenceStore>>,
     recent_reply_keys: std::sync::Mutex<HashMap<String, u64>>,
     running: Arc<AtomicBool>,
     handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+
+    // Phase 1.1: LLM 服务注入
+    extractor: Option<Arc<MemoryExtractor<dyn AIClient, L>>>,
+    background_coordinator: Option<Arc<MemoryBackgroundCoordinator<L>>>,
+    memory_reflection: Option<Arc<MemoryReflection<dyn AIClient>>>,
+
+    // Phase 1.2: 角色成长/亲密度/叙事
+    character_card_service: Option<Arc<CharacterCardService>>,
+    narrative_service: Option<Arc<NarrativeService>>,
 }
 
 /// 记忆作业
@@ -76,9 +91,50 @@ impl<L: PromptTemplateLoader + 'static> MemoryFlowService<L> {
                 recent_reply_keys: std::sync::Mutex::new(HashMap::new()),
                 running: Arc::new(AtomicBool::new(false)),
                 handle: tokio::sync::Mutex::new(None),
+                extractor: None,
+                background_coordinator: None,
+                memory_reflection: None,
+                character_card_service: None,
+                narrative_service: None,
             },
             rx,
         )
+    }
+
+    /// 设置记忆提取器
+    pub fn with_extractor(mut self, extractor: Arc<MemoryExtractor<dyn AIClient, L>>) -> Self {
+        self.extractor = Some(extractor);
+        self
+    }
+
+    /// 设置后台协调器
+    pub fn with_background_coordinator(
+        mut self,
+        coordinator: Arc<MemoryBackgroundCoordinator<L>>,
+    ) -> Self {
+        self.background_coordinator = Some(coordinator);
+        self
+    }
+
+    /// 设置记忆反思
+    pub fn with_memory_reflection(
+        mut self,
+        reflection: Arc<MemoryReflection<dyn AIClient>>,
+    ) -> Self {
+        self.memory_reflection = Some(reflection);
+        self
+    }
+
+    /// 设置角色卡服务
+    pub fn with_character_card_service(mut self, service: Arc<CharacterCardService>) -> Self {
+        self.character_card_service = Some(service);
+        self
+    }
+
+    /// 设置叙事服务
+    pub fn with_narrative_service(mut self, service: Arc<NarrativeService>) -> Self {
+        self.narrative_service = Some(service);
+        self
     }
 
     /// 启动后台处理循环
@@ -138,7 +194,8 @@ impl<L: PromptTemplateLoader + 'static> MemoryFlowService<L> {
         intimacy_delta: f64,
     ) {
         let has_text = !user_message.trim().is_empty();
-        if !has_text {
+        let has_image = !image_description.trim().is_empty();
+        if !has_text && !has_image {
             return;
         }
 
@@ -183,20 +240,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryFlowService<L> {
 
     /// 检查是否需要去重（基于事件和回复内容）
     pub fn should_dedupe(&self, dedupe_key: &str) -> bool {
-        if dedupe_key.is_empty() {
-            return false;
-        }
-        let now = chrono::Utc::now().timestamp() as u64;
-        let expire_before = now.saturating_sub(30);
-
-        let mut keys = self.recent_reply_keys.lock().unwrap();
-        keys.retain(|_, ts| *ts >= expire_before);
-
-        if keys.contains_key(dedupe_key) {
-            return true;
-        }
-        keys.insert(dedupe_key.to_string(), now);
-        false
+        self.check_dedupe_timestamp(dedupe_key)
     }
 
     /// 构建去重键
@@ -219,20 +263,15 @@ impl<L: PromptTemplateLoader + 'static> MemoryFlowService<L> {
         format!("{:x}", hasher.finalize())
     }
 
-    /// 启动后台处理循环
-    pub async fn run(
-        memory_manager: Arc<MemoryManager<L>>,
-        _dispute_resolver: MemoryDisputeResolver,
-        _evidence_store: Option<Arc<SqliteFactEvidenceStore>>,
-        rx: &mut mpsc::UnboundedReceiver<MemoryJob>,
-    ) {
+    /// 启动后台处理循环（实例方法版本，支持 LLM 服务注入）
+    pub async fn run(&self, rx: &mut mpsc::Receiver<MemoryJob>) {
         while let Some(job) = rx.recv().await {
             match job {
                 MemoryJob::ApplyPatch(patch) => {
                     let add_count = patch.add.len();
                     let update_count = patch.update.len();
                     let remove_count = patch.remove.len();
-                    match memory_manager.apply_patch(patch).await {
+                    match self.memory_manager.apply_patch(patch).await {
                         Ok(()) => {
                             debug!(
                                 add = add_count,
@@ -250,23 +289,78 @@ impl<L: PromptTemplateLoader + 'static> MemoryFlowService<L> {
                     conversation_id,
                     messages,
                 } => {
-                    debug!(
-                        conv_id = %conversation_id,
-                        msg_count = messages.len(),
-                        "[MemoryFlow] 对话记忆提取（待接入 LLM）"
-                    );
+                    if let Some(ref extractor) = self.extractor {
+                        match extractor.extract(&conversation_id, &messages).await {
+                            Ok(patch) => {
+                                let _ = self.memory_manager.apply_patch(patch).await;
+                            }
+                            Err(e) => {
+                                debug!(
+                                    conv_id = %conversation_id,
+                                    "[MemoryFlow] 对话记忆提取失败: {e}"
+                                );
+                            }
+                        }
+                    } else {
+                        debug!(
+                            conv_id = %conversation_id,
+                            msg_count = messages.len(),
+                            "[MemoryFlow] 对话记忆提取（extractor 未配置，跳过）"
+                        );
+                    }
                 }
                 MemoryJob::DigestInsight { user_id } => {
-                    debug!(
-                        user_id = %user_id,
-                        "[MemoryFlow] 离线消化（待接入 LLM）"
-                    );
+                    if self.background_coordinator.is_some() {
+                        // 后台协调器有自己的消化循环，此处标记 receipt
+                        debug!(
+                            user_id = %user_id,
+                            "[MemoryFlow] 离线消化作业已接收（由 BackgroundCoordinator 消化循环处理）"
+                        );
+                    } else {
+                        debug!(
+                            user_id = %user_id,
+                            "[MemoryFlow] 离线消化（background_coordinator 未配置，跳过）"
+                        );
+                    }
                 }
                 MemoryJob::Reflect { user_id } => {
-                    debug!(
-                        user_id = %user_id,
-                        "[MemoryFlow] 记忆反思（待接入 LLM）"
-                    );
+                    if let Some(ref reflection) = self.memory_reflection {
+                        let existing = self
+                            .memory_manager
+                            .get_by_user(&user_id)
+                            .await
+                            .unwrap_or_default();
+                        if existing.is_empty() {
+                            debug!(
+                                user_id = %user_id,
+                                "[MemoryFlow] 记忆反思（无已有记忆，跳过）"
+                            );
+                        } else {
+                            let empty = vec![];
+                            match reflection.reflect(&existing, &empty).await {
+                                Ok(result) => {
+                                    if result.has_conflict {
+                                        debug!(
+                                            user_id = %user_id,
+                                            conflict_count = result.conflicts.len(),
+                                            "[MemoryFlow] 记忆反思发现冲突"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!(
+                                        user_id = %user_id,
+                                        "[MemoryFlow] 记忆反思失败: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        debug!(
+                            user_id = %user_id,
+                            "[MemoryFlow] 记忆反思（memory_reflection 未配置，跳过）"
+                        );
+                    }
                 }
                 MemoryJob::RegisterDialogue {
                     user_id,
@@ -279,9 +373,12 @@ impl<L: PromptTemplateLoader + 'static> MemoryFlowService<L> {
                     image_description,
                     narrative_summary,
                     platform,
-                    ..
+                    warmth_guidance,
+                    user_emotion_label,
+                    intimacy_delta,
                 } => {
-                    let _ = memory_manager
+                    let _ = self
+                        .memory_manager
                         .register_dialogue_turn(
                             &user_id,
                             &user_message,
@@ -295,6 +392,35 @@ impl<L: PromptTemplateLoader + 'static> MemoryFlowService<L> {
                             &platform,
                         )
                         .await;
+
+                    // Phase 1.2: 角色成长/亲密度/叙事
+                    if let Some(ref card_service) = self.character_card_service {
+                        // 记录温暖引导信号
+                        if !warmth_guidance.is_empty() {
+                            let _ =
+                                card_service.record_interaction_signal(&user_id, &warmth_guidance);
+                        }
+                        // 记录用户情绪标签
+                        if !user_emotion_label.is_empty() {
+                            let _ = card_service
+                                .record_interaction_signal(&user_id, &user_emotion_label);
+                        }
+                        // 更新亲密度
+                        if intimacy_delta != 0.0 {
+                            card_service.update_intimacy(&user_id, intimacy_delta, false);
+                        }
+                    }
+
+                    // 叙事事件记录
+                    if let Some(ref narrative) = self.narrative_service {
+                        let event_desc = format!(
+                            "用户: {}, 回复: {}",
+                            &user_message.chars().take(100).collect::<String>(),
+                            &assistant_message.chars().take(100).collect::<String>(),
+                        );
+                        narrative.add_event(&user_id, &event_desc, 0.5);
+                    }
+
                     debug!(
                         user_id = %user_id,
                         dialogue_key = %dialogue_key,
@@ -364,21 +490,6 @@ mod tests {
     use crate::memory::stores::memory_item::SqliteMemoryItemStore;
     use chrono::Utc;
 
-    /// 将有界 Receiver 转换为 UnboundedReceiver（测试辅助）
-    fn convert_to_unbounded(
-        mut rx: mpsc::Receiver<MemoryJob>,
-    ) -> mpsc::UnboundedReceiver<MemoryJob> {
-        let (tx, unbounded_rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            while let Some(job) = rx.recv().await {
-                if tx.send(job).is_err() {
-                    break;
-                }
-            }
-        });
-        unbounded_rx
-    }
-
     fn make_item(id: &str, content: &str) -> MemoryItem {
         MemoryItem {
             id: id.to_string(),
@@ -405,7 +516,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let (service, rx) = MemoryFlowService::new(mgr.clone(), None, None);
+        let (service, mut rx) = MemoryFlowService::new(mgr.clone(), None, None);
 
         let patch = MemoryPatch {
             add: vec![make_item("f1", "内容1"), make_item("f2", "内容2")],
@@ -415,9 +526,8 @@ mod tests {
         service.submit(MemoryJob::ApplyPatch(patch)).unwrap();
 
         // 运行一轮处理
-        let mut unbounded_rx = convert_to_unbounded(rx);
         tokio::select! {
-            _ = MemoryFlowService::run(mgr.clone(), MemoryDisputeResolver::new(Default::default()), None, &mut unbounded_rx) => {},
+            _ = service.run(&mut rx) => {},
             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
         }
 
