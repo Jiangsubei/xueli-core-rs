@@ -17,4 +17,5 @@ pub mod runtime;
 pub mod scope;
 pub mod session_pipeline;
 pub mod session_resolver;
+pub mod storage_scope;
 pub mod types;

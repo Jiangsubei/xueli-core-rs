@@ -2,10 +2,11 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{Local, Timelike};
+use chrono::{Local, Timelike, Utc};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::core::config::{ProactiveShareConfig, XueliConfig};
+use crate::core::drive::{DriveEngine, DriveEvent};
 use crate::core::errors::XueliError;
 use crate::core::log_labels::{LOG_RETRY, LOG_STARTUP_INFO};
 use crate::core::log_text::preview_text_for_log;
@@ -84,6 +85,8 @@ pub struct BotRuntime<P: PlatformAdapter + 'static> {
     proactive_scheduler: Option<Arc<ProactiveShareScheduler>>,
     /// 平台适配器
     adapter: Option<Arc<P>>,
+    /// 内驱力引擎（可选注入）
+    drive_engine: Option<Arc<Mutex<DriveEngine>>>,
     /// 群聊中断标记（group_key → 中断信号）
     group_interrupt_flags: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     /// 群聊中断计数
@@ -141,6 +144,7 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
             proactive_share_store: None,
             proactive_scheduler: None,
             adapter: None,
+            drive_engine: None,
             group_interrupt_flags: Arc::new(Mutex::new(HashMap::new())),
             group_interrupt_counts: Arc::new(Mutex::new(HashMap::new())),
             group_reply_start_times: Arc::new(Mutex::new(HashMap::new())),
@@ -165,6 +169,11 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
     /// 设置平台适配器
     pub fn set_adapter(&mut self, adapter: Arc<P>) {
         self.adapter = Some(adapter);
+    }
+
+    /// 设置内驱力引擎
+    pub fn set_drive_engine(&mut self, engine: Arc<Mutex<DriveEngine>>) {
+        self.drive_engine = Some(engine);
     }
 
     /// 设置主动分享组件
@@ -1099,6 +1108,23 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
                 ));
             }
         };
+
+        // 内驱力事件通知
+        if let Some(drive) = &self.drive_engine {
+            let user_id = event
+                .sender
+                .as_ref()
+                .map(|s| s.user_id.clone())
+                .unwrap_or_default();
+            let mut engine = drive.lock().await;
+            engine
+                .on_event(DriveEvent::MessageProcessed {
+                    user_id,
+                    message: event.text.clone(),
+                    timestamp: Utc::now(),
+                })
+                .await;
+        }
 
         match plan_result {
             Ok(Some(action)) => {

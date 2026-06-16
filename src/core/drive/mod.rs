@@ -12,7 +12,7 @@ pub mod reflection;
 pub mod scheduler;
 pub mod store;
 
-pub use engine::DriveEngine;
+pub use engine::{DriveEngine, DriveEvent};
 pub use event_rules::{build_default_rule_set, DriveEventRuleEngine, WeightAdjustment};
 pub use models::{
     AffectiveState, DriveContext, DriveSnapshot, EventLogEntry, EventRule, EventRuleSet,

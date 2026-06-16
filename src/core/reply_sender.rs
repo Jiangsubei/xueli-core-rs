@@ -278,7 +278,10 @@ mod tests {
             &self,
             _raw: &str,
         ) -> crate::prelude::XueliResult<crate::core::platform_types::InboundEvent> {
-            unimplemented!()
+            tracing::warn!("[ReplySender] NoopPlatformAdapter::parse_event 不支持解析原始事件");
+            Err(crate::core::errors::XueliError::Internal(
+                "NoopPlatformAdapter 不支持 parse_event".into(),
+            ))
         }
     }
 

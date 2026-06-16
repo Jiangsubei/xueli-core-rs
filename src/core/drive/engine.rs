@@ -19,6 +19,17 @@ use super::models::{
 };
 use super::store::DriveStore;
 
+/// 内驱力事件类型 — 由外部系统（如 BotRuntime）在消息处理完成后注入。
+#[derive(Debug, Clone)]
+pub enum DriveEvent {
+    /// 消息处理完成事件
+    MessageProcessed {
+        user_id: String,
+        message: String,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    },
+}
+
 /// 内驱力系统状态管理核心。
 pub struct DriveEngine {
     store: DriveStore,
@@ -168,6 +179,17 @@ impl DriveEngine {
     }
 
     // ─── 状态更新（调度器接口） ─────────────────────────
+
+    /// 外部事件入口 — 将 DriveEvent 映射为事件模式并应用增量。
+    pub async fn on_event(&mut self, event: DriveEvent) {
+        if !self.enabled {
+            return;
+        }
+        let pattern = match event {
+            DriveEvent::MessageProcessed { .. } => "message_processed",
+        };
+        self.apply_event_deltas(&[pattern.to_string()]).await;
+    }
 
     /// 根据事件模式匹配规则，计算并应用瞬时偏移。
     pub async fn apply_event_deltas(&mut self, event_patterns: &[String]) {
@@ -420,5 +442,37 @@ mod tests {
         engine.apply_event_deltas(&patterns).await;
         // 应无变化
         assert_eq!(engine.get_affective_state().valence, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_on_event_message_processed() {
+        let store = make_store();
+        let mut engine = DriveEngine::new(store, "test_scope", true);
+        engine.load().await;
+        let event = DriveEvent::MessageProcessed {
+            user_id: "user1".to_string(),
+            message: "hello".to_string(),
+            timestamp: Utc::now(),
+        };
+        engine.on_event(event).await;
+        // message_processed 无匹配规则，状态应不变
+        let aff = engine.get_affective_state();
+        assert_eq!(aff.valence, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_on_event_disabled() {
+        let store = make_store();
+        let mut engine = DriveEngine::new(store, "test_scope", false);
+        engine.load().await;
+        let event = DriveEvent::MessageProcessed {
+            user_id: "user1".to_string(),
+            message: "hello".to_string(),
+            timestamp: Utc::now(),
+        };
+        engine.on_event(event).await;
+        // 禁用状态下应无变化
+        let aff = engine.get_affective_state();
+        assert_eq!(aff.valence, 0.0);
     }
 }
