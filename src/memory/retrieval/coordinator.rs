@@ -4,9 +4,12 @@ use tokio::sync::RwLock;
 
 use crate::core::scope::ChatScope;
 use crate::core::types::MemoryItem;
+use crate::memory::extraction::chat_summary::ChatSummaryService;
 use crate::memory::internal::access_policy::{MemoryAccessPolicy, PromptEntry};
+use crate::memory::recall_service::ConversationRecallService;
 use crate::memory::retrieval::bm25_index::BM25Index;
 use crate::memory::retrieval::vector_index::VectorIndex;
+use crate::memory::stores::conversation::{ConversationRecord, SqliteConversationStore};
 use crate::memory::stores::important::ImportantMemoryStore;
 use crate::memory::stores::traits::MemoryStore;
 use crate::prelude::XueliResult;
@@ -65,6 +68,10 @@ pub struct RetrievalCoordinator {
     /// 文档 ID → MemoryItem ID 映射
     doc_to_memory: RwLock<HashMap<String, String>>,
     prompt_budgets: PromptBudgets,
+    /// 会话存储（用于 session restore）
+    conversation_store: Option<Arc<SqliteConversationStore>>,
+    /// 对话回忆服务（用于 precise recall）
+    recall_service: Option<Arc<ConversationRecallService>>,
 }
 
 /// 检索结果
@@ -84,6 +91,8 @@ impl RetrievalCoordinator {
             vector: RwLock::new(VectorIndex::default()),
             doc_to_memory: RwLock::new(HashMap::new()),
             prompt_budgets: PromptBudgets::default(),
+            conversation_store: None,
+            recall_service: None,
         }
     }
 
@@ -102,6 +111,18 @@ impl RetrievalCoordinator {
     /// 设置访问策略
     pub fn with_access_policy(mut self, policy: MemoryAccessPolicy) -> Self {
         self.access_policy = policy;
+        self
+    }
+
+    /// 设置会话存储（用于 session restore）
+    pub fn with_conversation_store(mut self, store: Arc<SqliteConversationStore>) -> Self {
+        self.conversation_store = Some(store);
+        self
+    }
+
+    /// 设置回忆服务（用于 precise recall）
+    pub fn with_recall_service(mut self, service: Arc<ConversationRecallService>) -> Self {
+        self.recall_service = Some(service);
         self
     }
 
@@ -369,13 +390,13 @@ impl RetrievalCoordinator {
                 .collect()
         };
 
-        // 4. session restore / precise recall（当前为可选功能，暂无对应服务时为空）
+        // 4. session restore / precise recall（集成对应服务）
         let session_restore: Vec<PromptEntry> = if section_policy
             .get("session_restore")
             .copied()
             .unwrap_or(true)
         {
-            Vec::new()
+            self.build_session_restore_entries(context).await
         } else {
             Vec::new()
         };
@@ -385,7 +406,7 @@ impl RetrievalCoordinator {
             .copied()
             .unwrap_or(true)
         {
-            Vec::new()
+            self.build_precise_recall_entries(query, context).await
         } else {
             Vec::new()
         };
@@ -655,6 +676,171 @@ impl RetrievalCoordinator {
             .filter(|m| self.access_policy.is_accessible(m, &ChatScope::Private))
             .collect();
         Ok(accessible)
+    }
+
+    /// 构建会话恢复条目（session restore）
+    async fn build_session_restore_entries(
+        &self,
+        context: &MemoryAccessContext,
+    ) -> Vec<PromptEntry> {
+        let conversation_store = match &self.conversation_store {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+
+        let recent_limit = 12; // recent_session_limit
+        let entry_limit = 2; // restore_entry_limit
+
+        // 构建 dialogue_key
+        let is_group = context.message_type == "group" && !context.group_id.is_empty();
+        let dialogue_key = if is_group {
+            format!(
+                "{}:{}:{}",
+                context.platform, context.message_type, context.group_id
+            )
+        } else {
+            format!("{}:private:{}", context.platform, context.requester_user_id)
+        };
+
+        // 获取最近消息
+        let recent_messages = if is_group {
+            match conversation_store.get_recent_by_scope(
+                "group",
+                &context.group_id,
+                recent_limit * 20,
+            ) {
+                Ok(msgs) => msgs,
+                Err(_) => return Vec::new(),
+            }
+        } else {
+            match conversation_store
+                .get_recent_by_user(&context.requester_user_id, recent_limit * 20)
+            {
+                Ok(msgs) => msgs,
+                Err(_) => return Vec::new(),
+            }
+        };
+
+        // 按 session_id 分组
+        let mut sessions: HashMap<String, Vec<ConversationRecord>> = HashMap::new();
+        for msg in &recent_messages {
+            let sid = if msg.session_id.is_empty() {
+                dialogue_key.clone()
+            } else {
+                msg.session_id.clone()
+            };
+            sessions.entry(sid).or_default().push(msg.clone());
+        }
+        for msgs in sessions.values_mut() {
+            msgs.sort_by(|a, b| {
+                a.event_time
+                    .partial_cmp(&b.event_time)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        // 按最后消息时间排序 session
+        let mut sorted_sessions: Vec<_> = sessions.into_iter().collect();
+        sorted_sessions.sort_by(|(_, a), (_, b)| {
+            let ta = a.last().map(|m| m.event_time).unwrap_or(0.0);
+            let tb = b.last().map(|m| m.event_time).unwrap_or(0.0);
+            tb.partial_cmp(&ta).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut entries: Vec<PromptEntry> = Vec::new();
+        let mut count = 0;
+
+        for (_session_id, messages) in &sorted_sessions {
+            if count >= entry_limit {
+                break;
+            }
+            if messages.is_empty() {
+                continue;
+            }
+
+            let turn_count = messages.len() as i64;
+            let text_msgs: Vec<String> = messages.iter().map(|m| m.text.clone()).collect();
+            let summary =
+                ChatSummaryService::<crate::services::ai_client::DefaultAIClient>::summarize_simple(
+                    &text_msgs,
+                );
+
+            let last_msg = messages.last().unwrap();
+            let closed_at = format!("{:.0}", last_msg.event_time);
+
+            let label = if count == 0 {
+                "上一轮会话"
+            } else {
+                "更早一轮会话"
+            };
+            let t = if !closed_at.is_empty() {
+                format!("（{}，{}轮）", closed_at, turn_count)
+            } else {
+                format!("（{}轮）", turn_count)
+            };
+            let content = format!("{}{}：{}", label, t, summary);
+
+            let mut entry = HashMap::new();
+            entry.insert("content".to_string(), serde_json::Value::String(content));
+            entry.insert(
+                "source".to_string(),
+                serde_json::Value::String("session_restore".to_string()),
+            );
+            entry.insert(
+                "score".to_string(),
+                serde_json::Value::Number(serde_json::Number::from_f64(0.5).unwrap()),
+            );
+            entries.push(entry);
+            count += 1;
+        }
+
+        entries
+    }
+
+    /// 构建精准回忆条目（precise recall）
+    async fn build_precise_recall_entries(
+        &self,
+        query: &str,
+        context: &MemoryAccessContext,
+    ) -> Vec<PromptEntry> {
+        let recall_service = match &self.recall_service {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+
+        let recalled = match recall_service
+            .recall(&context.requester_user_id, "", query)
+            .await
+        {
+            Ok(items) => items,
+            Err(_) => return Vec::new(),
+        };
+
+        recalled
+            .into_iter()
+            .enumerate()
+            .map(|(idx, item)| {
+                let label = if idx == 0 {
+                    "与当前话题相关的历史"
+                } else {
+                    "前述话题的延续"
+                };
+                let content = format!("{}：{}", label, item.content);
+                let mut entry = HashMap::new();
+                entry.insert("content".to_string(), serde_json::Value::String(content));
+                entry.insert(
+                    "source".to_string(),
+                    serde_json::Value::String("precise_recall".to_string()),
+                );
+                entry.insert(
+                    "score".to_string(),
+                    serde_json::Value::Number(
+                        serde_json::Number::from_f64(item.importance).unwrap_or(0.into()),
+                    ),
+                );
+                entry
+            })
+            .collect()
     }
 
     /// 构建动态记忆条目（混合检索 + 情绪加权 + 场景分桶）
