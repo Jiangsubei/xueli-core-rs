@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Instant;
@@ -69,7 +70,7 @@ pub struct EmojiManager<A: AIClient, L: PromptTemplateLoader> {
     emotion_labels: Vec<String>,
     enabled: bool,
     capture_enabled: bool,
-    initialized: bool,
+    initialized: AtomicBool,
     task_manager: EmojiTaskManager,
 }
 
@@ -89,30 +90,23 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> EmojiManager<A, L
             emotion_labels: Vec::new(),
             enabled: true,
             capture_enabled: true,
-            initialized: false,
+            initialized: AtomicBool::new(false),
             task_manager: EmojiTaskManager::new(),
         }
     }
 
     /// 初始化表情管理器，同步指标并启动后台分类工作线程
-    pub async fn initialize(&mut self) {
-        if !self.enabled || self.initialized {
+    pub async fn initialize(self: &Arc<Self>) {
+        if !self.enabled
+            || self
+                .initialized
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
             return;
         }
-        self.initialized = true;
         self.sync_metrics();
-        self.start_idle_classification_loop_from_init();
-    }
-
-    fn start_idle_classification_loop_from_init(&self) {
-        if !self.classification_enabled {
-            return;
-        }
-        if self.vision_client.is_none() {
-            return;
-        }
-        // Note: start_idle_classification_loop requires Arc<Self>, so we skip here
-        // The caller should use start_idle_classification_loop on an Arc<Self>
+        self.start_idle_classification_loop();
     }
 
     /// 同步指标到数据库统计
@@ -259,7 +253,7 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> EmojiManager<A, L
 
         let empty_tones: Vec<String> = Vec::new();
         let emotion_result = vc
-            .classify_sticker_emotion(&image_b64, &self.emotion_labels, &empty_tones)
+            .classify_sticker_emotion(&image_b64, &self.emotion_labels, &empty_tones, "", "", "")
             .await?;
         let trimmed = emotion_result.primary_emotion.trim().to_string();
 

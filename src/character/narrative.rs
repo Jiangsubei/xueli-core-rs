@@ -206,6 +206,25 @@ impl NarrativeService {
         }
     }
 
+    /// 获取叙事线程摘要 — 合并主题和摘要为单行描述。
+    ///
+    /// 对应上下文构建阶段的叙事线索注入。
+    pub fn get_thread_summary(&self, user_id: &str) -> Option<String> {
+        let thread = self.get_thread(user_id);
+        let has_theme = !thread.theme.is_empty() && thread.theme != "default";
+        let has_summary = !thread.summary.is_empty();
+
+        if has_theme && has_summary {
+            Some(format!("{}：{}", thread.theme, thread.summary))
+        } else if has_summary {
+            Some(thread.summary)
+        } else if has_theme {
+            Some(format!("当前叙事主题：{}", thread.theme))
+        } else {
+            None
+        }
+    }
+
     /// 归一化叙事自我数据，提取有效字段并限制长度
     pub fn normalize_narrative_self(value: &serde_json::Value) -> Option<NarrativeSelf> {
         let story = value

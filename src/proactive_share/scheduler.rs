@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
@@ -5,7 +7,11 @@ use tokio::time::{interval, Duration};
 use chrono::Timelike;
 
 use crate::core::config::ProactiveShareConfig;
-use crate::proactive_share::store::ProactiveShareStore;
+use crate::prelude::XueliResult;
+use crate::proactive_share::store::{ProactiveShareStore, ShareRecord};
+
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+type SendCallback = Arc<dyn Fn(ShareRecord) -> BoxFuture<'static, XueliResult<()>> + Send + Sync>;
 
 /// 主动分享调度器 — 定时检查待发送分享并触发发送。
 pub struct ProactiveShareScheduler {
@@ -31,6 +37,8 @@ pub struct ProactiveShareScheduler {
     time_range_end: String,
     /// 轮询间隔秒数
     check_interval_seconds: f64,
+    /// 发送回调（执行实际的消息发送）
+    send_callback: Option<SendCallback>,
 }
 
 impl ProactiveShareScheduler {
@@ -55,6 +63,7 @@ impl ProactiveShareScheduler {
             last_interaction_at: Arc::new(RwLock::new(0.0)),
             global_cooldown_active: Arc::new(RwLock::new(false)),
             cooldown_seconds,
+            send_callback: None,
         }
     }
 
@@ -62,6 +71,11 @@ impl ProactiveShareScheduler {
     pub fn with_max_per_day(mut self, max: usize) -> Self {
         self.max_per_day = max;
         self
+    }
+
+    /// 注册发送回调。回调在找到待发送分享时被调用，成功返回后才标记已发送并设置冷却。
+    pub fn set_send_callback(&mut self, callback: SendCallback) {
+        self.send_callback = Some(callback);
     }
 
     /// 启动定时调度循环
@@ -85,6 +99,7 @@ impl ProactiveShareScheduler {
         let time_range_start = self.time_range_start.clone();
         let time_range_end = self.time_range_end.clone();
         let check_interval_secs = self.check_interval_seconds;
+        let send_callback = self.send_callback.clone();
 
         tokio::spawn(async move {
             let check_interval = check_interval_secs.max(60.0) as u64;
@@ -135,17 +150,26 @@ impl ProactiveShareScheduler {
                     &time_range_end,
                 ) {
                     for share in pending {
-                        // 标记已发送
-                        let _ = store.mark_sent(&share.id);
-                        // 设置全局冷却
-                        store.set_global_cooldown(cooldown_hours);
-                        // 记录互动时间
-                        let now_ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs_f64();
-                        let mut last = last_interaction.write().await;
-                        *last = now_ts;
+                        let sent_ok = if let Some(ref cb) = send_callback {
+                            cb(share.clone()).await.is_ok()
+                        } else {
+                            // 未注册回调时保持旧行为：直接标记已发送
+                            true
+                        };
+
+                        if sent_ok {
+                            // 标记已发送
+                            let _ = store.mark_sent(&share.id);
+                            // 设置全局冷却
+                            store.set_global_cooldown(cooldown_hours);
+                            // 记录互动时间
+                            let now_ts = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs_f64();
+                            let mut last = last_interaction.write().await;
+                            *last = now_ts;
+                        }
                     }
                 }
             }

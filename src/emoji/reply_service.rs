@@ -10,6 +10,8 @@ use crate::core::config::EmojiConfig;
 use crate::core::platform_types::{InboundEvent, ReplyAction, SessionRef};
 use crate::emoji::database::EmojiDatabase;
 use crate::prelude::{AIClient, PromptTemplateLoader, XueliResult};
+use crate::services::invocation_router::{InvocationTask, ModelInvocationRouter};
+use crate::services::token_counter::TokenCounter;
 use crate::traits::ai_client::{ChatCompletionRequest, ChatMessage};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +51,8 @@ pub struct EmojiReplyService<L: PromptTemplateLoader> {
     template_loader: Arc<L>,
     default_emotion_labels: Vec<String>,
     default_reply_tones: Vec<String>,
+    invocation_router: Option<Arc<ModelInvocationRouter>>,
+    token_counter: Option<Arc<TokenCounter>>,
 }
 
 impl<L: PromptTemplateLoader> EmojiReplyService<L> {
@@ -87,7 +91,19 @@ impl<L: PromptTemplateLoader> EmojiReplyService<L> {
             template_loader,
             default_emotion_labels,
             default_reply_tones,
+            invocation_router: None,
+            token_counter: None,
         }
+    }
+
+    pub fn with_invocation_router(mut self, router: Arc<ModelInvocationRouter>) -> Self {
+        self.invocation_router = Some(router);
+        self
+    }
+
+    pub fn with_token_counter(mut self, counter: Arc<TokenCounter>) -> Self {
+        self.token_counter = Some(counter);
+        self
     }
 
     pub fn enabled(&self) -> bool {
@@ -288,7 +304,7 @@ impl<L: PromptTemplateLoader> EmojiReplyService<L> {
         user_message: &str,
         assistant_reply: &str,
         reply_context: &HashMap<String, serde_json::Value>,
-        _trace_id: &str,
+        trace_id: &str,
         intent_reference: &str,
         window_messages: Option<&Vec<serde_json::Value>>,
     ) -> XueliResult<EmojiReplyDecision> {
@@ -357,31 +373,20 @@ impl<L: PromptTemplateLoader> EmojiReplyService<L> {
 
         let system_prompt = self.build_system_prompt().await?;
 
-        let messages = vec![
-            ChatMessage::text("system", system_prompt),
-            ChatMessage::text("user", user_content),
-        ];
+        let system_msg = ChatMessage::text("system", system_prompt);
+        let user_msg = ChatMessage::text("user", user_content);
 
-        let request = ChatCompletionRequest {
-            model: self.model_name.clone(),
-            messages,
-            temperature: Some(0.1),
-            max_tokens: Some(256),
-            stream: false,
-            tools: None,
-            tool_choice: None,
-            extra_params: Default::default(),
-        };
+        // 优先使用 InvocationRouter + TokenCounter 路径
+        let response_content =
+            if let (Some(router), Some(counter)) = (&self.invocation_router, &self.token_counter) {
+                self.decide_via_router(router, counter, &system_msg, &user_msg, trace_id)
+                    .await?
+            } else {
+                self.decide_via_direct_client(&system_msg, &user_msg)
+                    .await?
+            };
 
-        let response = match self.ai_client.chat_completion(&request).await {
-            Ok(r) => r,
-            Err(_) => {
-                tracing::warn!("[表情服务] 表情包回复意图判断失败");
-                return Ok(EmojiReplyDecision::default());
-            }
-        };
-
-        let data = Self::extract_json_object(&response.content);
+        let data = Self::extract_json_object(&response_content);
         let should_send = data
             .get("should_send")
             .and_then(|v| v.as_bool())
@@ -425,6 +430,90 @@ impl<L: PromptTemplateLoader> EmojiReplyService<L> {
             },
             confidence,
         })
+    }
+
+    /// 通过 InvocationRouter + TokenCounter 路径决策
+    async fn decide_via_router(
+        &self,
+        router: &ModelInvocationRouter,
+        counter: &TokenCounter,
+        system_msg: &ChatMessage,
+        user_msg: &ChatMessage,
+        trace_id: &str,
+    ) -> XueliResult<String> {
+        let budget = 2000;
+        let (trimmed, _skipped) = counter.trim_messages_to_budget(
+            system_msg,
+            user_msg,
+            &[],
+            budget,
+            0,
+            None,
+            "emoji_reply",
+        );
+
+        let model_name = router
+            .get_model(&router.route(&InvocationTask::EmojiReplyDecision))
+            .to_string();
+
+        let ai_client = Arc::clone(&self.ai_client);
+        let result = router
+            .submit(
+                &InvocationTask::EmojiReplyDecision,
+                move || {
+                    let client = Arc::clone(&ai_client);
+                    let model = model_name.clone();
+                    async move {
+                        let request = ChatCompletionRequest {
+                            model,
+                            messages: trimmed,
+                            temperature: Some(0.1),
+                            max_tokens: Some(256),
+                            stream: false,
+                            tools: None,
+                            tool_choice: None,
+                            extra_params: Default::default(),
+                        };
+                        let response = client.chat_completion(&request).await?;
+                        Ok(response.content)
+                    }
+                },
+                trace_id,
+                None,
+            )
+            .await?;
+
+        Ok(result)
+    }
+
+    /// 通过直接 AIClient 调用决策（fallback 路径）
+    async fn decide_via_direct_client(
+        &self,
+        system_msg: &ChatMessage,
+        user_msg: &ChatMessage,
+    ) -> XueliResult<String> {
+        let messages = vec![system_msg.clone(), user_msg.clone()];
+
+        let request = ChatCompletionRequest {
+            model: self.model_name.clone(),
+            messages,
+            temperature: Some(0.1),
+            max_tokens: Some(256),
+            stream: false,
+            tools: None,
+            tool_choice: None,
+            extra_params: Default::default(),
+        };
+
+        let response = match self.ai_client.chat_completion(&request).await {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!("[表情服务] 表情包回复意图判断失败");
+                return Ok(String::new());
+            }
+        };
+
+        Ok(response.content)
     }
 
     fn weighted_pick(
