@@ -382,6 +382,12 @@ fn stringify_json_value(value: &serde_json::Value) -> String {
 /// Noop AI 客户端 — 用于测试和降级场景
 pub struct NoopAIClient;
 
+impl Default for NoopAIClient {
+    fn default() -> Self {
+        Self
+    }
+}
+
 #[async_trait]
 impl AIClient for NoopAIClient {
     async fn chat_completion(

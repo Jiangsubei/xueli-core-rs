@@ -53,6 +53,7 @@ pub enum InvocationTask {
     ImageAnalysis,
     InsightDigestion,
     ChatSummary,
+    EmojiReplyDecision,
 }
 
 impl InvocationTask {
@@ -67,6 +68,7 @@ impl InvocationTask {
             | InvocationTask::ChatSummary => "memory_extraction",
             InvocationTask::Rerank => "memory_rerank",
             InvocationTask::ImageAnalysis => "vision_analysis",
+            InvocationTask::EmojiReplyDecision => "emoji_reply_decision",
         }
     }
 
@@ -81,6 +83,7 @@ impl InvocationTask {
             | InvocationTask::ChatSummary => base,
             InvocationTask::Rerank => base.min(8.0),
             InvocationTask::ImageAnalysis => base,
+            InvocationTask::EmojiReplyDecision => base.min(8.0),
         }
     }
 }
@@ -106,9 +109,10 @@ impl ModelInvocationRouter {
     /// 根据任务类型选择模型目标
     pub fn route(&self, task: &InvocationTask) -> InvocationTarget {
         match task {
-            InvocationTask::TimingGate | InvocationTask::SimpleReply | InvocationTask::Rerank => {
-                InvocationTarget::Light
-            }
+            InvocationTask::TimingGate
+            | InvocationTask::SimpleReply
+            | InvocationTask::Rerank
+            | InvocationTask::EmojiReplyDecision => InvocationTarget::Light,
             InvocationTask::ImageAnalysis => {
                 if self.config.vision_model.is_some() {
                     InvocationTarget::Vision

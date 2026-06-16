@@ -178,7 +178,7 @@ impl PromptTemplateLoader for FilePromptTemplateLoader {
     fn render(&self, template: &str, variables: &HashMap<&str, &str>) -> String {
         let mut result = template.to_string();
         for (key, value) in variables {
-            result = result.replace(&format!("{{{{{}}}}}", key), value);
+            result = result.replace(&format!("{{{}}}", key), value);
         }
         result
     }
@@ -186,6 +186,12 @@ impl PromptTemplateLoader for FilePromptTemplateLoader {
 
 /// 空模板加载器 — 总是返回默认模板（用于测试或未配置模板的场合）
 pub struct NoopPromptTemplateLoader;
+
+impl Default for NoopPromptTemplateLoader {
+    fn default() -> Self {
+        Self
+    }
+}
 
 impl PromptTemplateLoader for NoopPromptTemplateLoader {
     fn load_templates(

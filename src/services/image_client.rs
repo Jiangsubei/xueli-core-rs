@@ -1,4 +1,46 @@
 use crate::prelude::XueliResult;
+use regex::Regex;
+use std::sync::LazyLock;
+
+/// 完整的 HTML 实体解码：命名实体 + 十六进制/十进制数字字符引用。
+fn decode_html_entities(input: &str) -> String {
+    static ENTITY_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"&(?:#(\d+)|#x([0-9a-fA-F]+)|(amp|lt|gt|quot|apos|nbsp));").unwrap()
+    });
+
+    ENTITY_RE
+        .replace_all(input, |caps: &regex::Captures<'_>| {
+            if let Some(dec) = caps.get(1) {
+                // 十进制数字字符引用: &#...;
+                if let Ok(n) = dec.as_str().parse::<u32>() {
+                    if let Some(c) = char::from_u32(n) {
+                        return c.to_string();
+                    }
+                }
+            } else if let Some(hex) = caps.get(2) {
+                // 十六进制数字字符引用: &#x...;
+                if let Ok(n) = u32::from_str_radix(hex.as_str(), 16) {
+                    if let Some(c) = char::from_u32(n) {
+                        return c.to_string();
+                    }
+                }
+            } else if let Some(name) = caps.get(3) {
+                // 命名实体
+                match name.as_str() {
+                    "amp" => return "&".to_string(),
+                    "lt" => return "<".to_string(),
+                    "gt" => return ">".to_string(),
+                    "quot" => return "\"".to_string(),
+                    "apos" => return "'".to_string(),
+                    "nbsp" => return " ".to_string(),
+                    _ => {}
+                }
+            }
+            // 无法识别的实体，保留原文
+            caps.get(0).unwrap().as_str().to_string()
+        })
+        .into_owned()
+}
 
 pub struct ImageClient {
     client: reqwest::Client,
@@ -23,16 +65,7 @@ impl ImageClient {
     }
 
     pub fn fix_url(url: &str) -> String {
-        // 完整 HTML unescape
-        url.replace("&amp;", "&")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&#39;", "'")
-            .replace("&quot;", "\"")
-            .replace("&#x27;", "'")
-            .replace("&#x2F;", "/")
-            .replace("&apos;", "'")
-            .replace("&nbsp;", " ")
+        decode_html_entities(url)
     }
 
     pub async fn download(&self, url: &str) -> XueliResult<Vec<u8>> {

@@ -5,14 +5,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::config::XueliConfig;
 use crate::prelude::XueliResult;
+use crate::services::invocation_router::{InvocationTask, ModelInvocationRouter};
 use crate::traits::ai_client::{AIClient, ChatCompletionRequest, ChatMessage};
 use crate::traits::prompt_template::PromptTemplateLoader;
 
 const DEFAULT_EMOTION_LABELS: &[&str] = &[
-    "开心", "生气", "悲伤", "惊讶", "喜欢", "厌恶", "恐惧", "中性",
+    "开心", "伤心", "生气", "惊讶", "恐惧", "厌恶", "无聊", "撒娇", "无语", "委屈", "嘲讽", "困惑",
+    "焦虑", "疲惫", "期待",
 ];
 
-const DEFAULT_REPLY_TONES: &[&str] = &["轻松", "温柔", "激动", "幽默", "冷淡", "严肃"];
+const DEFAULT_REPLY_TONES: &[&str] = &[
+    "安慰", "附和", "吐槽", "庆祝", "调侃", "拒绝", "提醒", "收尾",
+];
 
 const FALLBACK_VISION_SYSTEM_PROMPT: &str = "你是图片理解助手。输出简洁可靠的 JSON。\n\n【输出格式】\n{\"images\":[{\"description\":\"描述\",\"is_sticker\":false,\"sticker_confidence\":0.0,\"sticker_reason\":\"依据\"}],\"merged_description\":\"整体摘要\"}\n不要输出 JSON 以外的内容。";
 const FALLBACK_VISION_USER_PROMPT: &str =
@@ -112,10 +116,11 @@ impl ImageAnalysisResult {
         let mut fields = HashMap::new();
         if !self.merged_description.trim().is_empty() {
             fields.insert(
-                "merged_image_description".to_string(),
+                "merged_description".to_string(),
                 self.merged_description.clone(),
             );
-        } else if !self.per_image_descriptions.is_empty() {
+        }
+        if !self.per_image_descriptions.is_empty() {
             let descriptions: Vec<String> = self
                 .per_image_descriptions
                 .iter()
@@ -125,7 +130,7 @@ impl ImageAnalysisResult {
                 .collect();
             if !descriptions.is_empty() {
                 fields.insert(
-                    "merged_image_description".to_string(),
+                    "per_image_descriptions".to_string(),
                     descriptions.join("\n"),
                 );
             }
@@ -165,9 +170,10 @@ pub struct VisionClient<A: AIClient, L: PromptTemplateLoader> {
     client: Arc<A>,
     template_loader: Arc<L>,
     locale: String,
+    invocation_router: Option<Arc<ModelInvocationRouter>>,
 }
 
-impl<A: AIClient, L: PromptTemplateLoader> VisionClient<A, L> {
+impl<A: AIClient + 'static, L: PromptTemplateLoader> VisionClient<A, L> {
     pub fn new(
         config: Arc<XueliConfig>,
         client: Arc<A>,
@@ -179,7 +185,13 @@ impl<A: AIClient, L: PromptTemplateLoader> VisionClient<A, L> {
             client,
             template_loader,
             locale: locale.into(),
+            invocation_router: None,
         }
+    }
+
+    pub fn with_invocation_router(mut self, router: Arc<ModelInvocationRouter>) -> Self {
+        self.invocation_router = Some(router);
+        self
     }
 
     pub fn is_available(&self) -> bool {
@@ -311,6 +323,9 @@ impl<A: AIClient, L: PromptTemplateLoader> VisionClient<A, L> {
         image_base64_list: &[String],
         user_text: &str,
         _is_group: bool,
+        trace_id: &str,
+        _session_key: &str,
+        _message_id: &str,
     ) -> XueliResult<ImageAnalysisResult> {
         let image_count = image_base64_list.len();
         if image_count == 0 {
@@ -344,19 +359,51 @@ impl<A: AIClient, L: PromptTemplateLoader> VisionClient<A, L> {
             ChatMessage::multimodal("user", &user_prompt, &image_urls, "image/jpeg"),
         ];
 
-        let request = ChatCompletionRequest {
-            model,
-            messages,
-            temperature: Some(0.1),
-            max_tokens: Some(2048),
-            stream: false,
-            tools: None,
-            tool_choice: None,
-            extra_params: Default::default(),
+        let response_content = if let Some(ref router) = self.invocation_router {
+            let client = Arc::clone(&self.client);
+            let model = model.clone();
+            router
+                .submit(
+                    &InvocationTask::ImageAnalysis,
+                    move || {
+                        let client = Arc::clone(&client);
+                        let model = model.clone();
+                        let messages = messages.clone();
+                        async move {
+                            let request = ChatCompletionRequest {
+                                model,
+                                messages,
+                                temperature: Some(0.1),
+                                max_tokens: Some(2048),
+                                stream: false,
+                                tools: None,
+                                tool_choice: None,
+                                extra_params: Default::default(),
+                            };
+                            let response = client.chat_completion(&request).await?;
+                            Ok(response.content)
+                        }
+                    },
+                    trace_id,
+                    None,
+                )
+                .await?
+        } else {
+            let request = ChatCompletionRequest {
+                model,
+                messages,
+                temperature: Some(0.1),
+                max_tokens: Some(2048),
+                stream: false,
+                tools: None,
+                tool_choice: None,
+                extra_params: Default::default(),
+            };
+            let response = self.client.chat_completion(&request).await?;
+            response.content
         };
 
-        let response = self.client.chat_completion(&request).await?;
-        Ok(parse_vision_response(&response.content, image_count))
+        Ok(parse_vision_response(&response_content, image_count))
     }
 
     pub async fn classify_sticker_emotion(
@@ -364,6 +411,9 @@ impl<A: AIClient, L: PromptTemplateLoader> VisionClient<A, L> {
         image_base64: &str,
         emotion_labels: &[String],
         reply_tones: &[String],
+        trace_id: &str,
+        _session_key: &str,
+        _message_id: &str,
     ) -> XueliResult<StickerEmotionResult> {
         if !self.is_available() {
             return Err("视觉服务不可用".into());
@@ -411,19 +461,51 @@ impl<A: AIClient, L: PromptTemplateLoader> VisionClient<A, L> {
             ChatMessage::multimodal("user", &sticker_prompt, &[image_url], "image/gif"),
         ];
 
-        let request = ChatCompletionRequest {
-            model,
-            messages,
-            temperature: Some(0.1),
-            max_tokens: Some(512),
-            stream: false,
-            tools: None,
-            tool_choice: None,
-            extra_params: Default::default(),
+        let response_content = if let Some(ref router) = self.invocation_router {
+            let client = Arc::clone(&self.client);
+            let model = model.clone();
+            router
+                .submit(
+                    &InvocationTask::ImageAnalysis,
+                    move || {
+                        let client = Arc::clone(&client);
+                        let model = model.clone();
+                        let messages = messages.clone();
+                        async move {
+                            let request = ChatCompletionRequest {
+                                model,
+                                messages,
+                                temperature: Some(0.1),
+                                max_tokens: Some(512),
+                                stream: false,
+                                tools: None,
+                                tool_choice: None,
+                                extra_params: Default::default(),
+                            };
+                            let response = client.chat_completion(&request).await?;
+                            Ok(response.content)
+                        }
+                    },
+                    trace_id,
+                    None,
+                )
+                .await?
+        } else {
+            let request = ChatCompletionRequest {
+                model,
+                messages,
+                temperature: Some(0.1),
+                max_tokens: Some(512),
+                stream: false,
+                tools: None,
+                tool_choice: None,
+                extra_params: Default::default(),
+            };
+            let response = self.client.chat_completion(&request).await?;
+            response.content
         };
 
-        let response = self.client.chat_completion(&request).await?;
-        let data = extract_json_object(&response.content);
+        let data = extract_json_object(&response_content);
         Ok(parse_sticker_emotion_result(&data, &labels_ref, &tones_str))
     }
 }
@@ -731,7 +813,7 @@ mod tests {
         r.merged_description = "合并描述".to_string();
         let fields = r.to_prompt_fields();
         assert_eq!(
-            fields.get("merged_image_description"),
+            fields.get("merged_description"),
             Some(&"合并描述".to_string())
         );
     }
@@ -741,7 +823,7 @@ mod tests {
         let mut r = ImageAnalysisResult::empty();
         r.per_image_descriptions = vec!["猫".to_string(), "狗".to_string()];
         let fields = r.to_prompt_fields();
-        let desc = fields.get("merged_image_description").unwrap();
+        let desc = fields.get("per_image_descriptions").unwrap();
         assert!(desc.contains("第1张: 猫"));
         assert!(desc.contains("第2张: 狗"));
     }
@@ -752,9 +834,10 @@ mod tests {
         r.merged_description = "合并".to_string();
         r.per_image_descriptions = vec!["猫".to_string()];
         let fields = r.to_prompt_fields();
+        assert_eq!(fields.get("merged_description"), Some(&"合并".to_string()));
         assert_eq!(
-            fields.get("merged_image_description"),
-            Some(&"合并".to_string())
+            fields.get("per_image_descriptions"),
+            Some(&"第1张: 猫".to_string())
         );
     }
 
