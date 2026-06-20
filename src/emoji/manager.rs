@@ -162,13 +162,13 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> EmojiManager<A, L
         let file_format = Self::detect_format(file_bytes);
         let file_path = format!("data/emojis/{}.{}", sha256, file_format);
 
-        if !std::path::Path::new(&file_path).exists() {
+        if !tokio::fs::try_exists(&file_path).await.unwrap_or(false) {
             let tmp_path = format!("{}.tmp", file_path);
             if let Some(parent) = std::path::Path::new(&file_path).parent() {
-                let _ = std::fs::create_dir_all(parent);
+                let _ = tokio::fs::create_dir_all(parent).await;
             }
-            if std::fs::write(&tmp_path, file_bytes).is_ok() {
-                let _ = std::fs::rename(&tmp_path, &file_path);
+            if tokio::fs::write(&tmp_path, file_bytes).await.is_ok() {
+                let _ = tokio::fs::rename(&tmp_path, &file_path).await;
             }
         }
 
