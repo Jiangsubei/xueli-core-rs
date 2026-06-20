@@ -111,7 +111,7 @@ impl TokenCounter {
         for tool in tools {
             total += self.count(&tool.name);
             total += self.count(&tool.description);
-            let params_str = serde_json::to_string(&tool.parameters_schema).unwrap_or_default();
+            let params_str = serde_json::to_string(&tool.parameters).unwrap_or_default();
             total += self.count(&params_str);
             total += 8;
         }

@@ -1,21 +1,14 @@
 use async_trait::async_trait;
 
 use crate::prelude::XueliResult;
+use crate::traits::ai_client::ToolCall;
 
 /// 工具调用定义
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
-    pub parameters_schema: serde_json::Value,
-}
-
-/// 工具调用请求
-#[derive(Debug, Clone)]
-pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    pub arguments: serde_json::Value,
+    pub parameters: serde_json::Value,
 }
 
 /// 工具调用结果
