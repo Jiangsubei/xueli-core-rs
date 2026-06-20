@@ -39,6 +39,8 @@ pub struct DriveEngine {
     rule_engine: DriveEventRuleEngine,
     /// 当前轮次累积的谨慎度指导
     current_guidance: Vec<String>,
+    /// 当前轮次累积的事件模式
+    current_event_patterns: Vec<String>,
 }
 
 impl DriveEngine {
@@ -50,6 +52,7 @@ impl DriveEngine {
             snapshot: None,
             rule_engine: DriveEventRuleEngine::new(None),
             current_guidance: Vec::new(),
+            current_event_patterns: Vec::new(),
         }
     }
 
@@ -163,6 +166,8 @@ impl DriveEngine {
             motivational: self.get_motivational_effective(),
             relational: self.get_relational_state(user_id),
             caution_guidance: self.current_guidance.clone(),
+            active_event_patterns: self.current_event_patterns.clone(),
+            memory_context: String::new(),
             scope_key: self.scope_key.clone(),
             user_id: user_id.to_string(),
         }
@@ -173,9 +178,15 @@ impl DriveEngine {
         self.current_guidance.clone()
     }
 
-    /// 清空当前轮次累积的指导（在回复完成后调用）。
+    /// 获取当前累积的活跃事件模式列表。
+    pub fn get_active_event_patterns(&self) -> Vec<String> {
+        self.current_event_patterns.clone()
+    }
+
+    /// 清空当前轮次累积的指导和事件模式（在回复完成后调用）。
     pub fn clear_guidance(&mut self) {
         self.current_guidance.clear();
+        self.current_event_patterns.clear();
     }
 
     // ─── 状态更新（调度器接口） ─────────────────────────
@@ -225,6 +236,10 @@ impl DriveEngine {
         if !guidance_list.is_empty() {
             self.current_guidance.extend(guidance_list);
         }
+
+        // 累积事件模式
+        self.current_event_patterns
+            .extend(event_patterns.iter().cloned());
 
         self.persist().await;
         debug!(
@@ -352,6 +367,11 @@ impl DriveEngine {
     }
 
     // ─── 规则管理 ───────────────────────────────────────
+
+    /// 获取当前完整快照副本（用于反思等需要关系层的场景）。
+    pub fn get_snapshot(&self) -> Option<DriveSnapshot> {
+        self.snapshot.clone()
+    }
 
     /// 获取当前事件规则集。
     pub fn get_event_rules(&self) -> &super::models::EventRuleSet {

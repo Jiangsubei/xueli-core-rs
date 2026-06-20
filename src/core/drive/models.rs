@@ -10,6 +10,24 @@ use std::collections::HashMap;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+// ─── 谨慎度阈值常量 ─────────────────────────────────────
+
+/// caution 动机值 >= 此值视为 medium
+pub const CAUTION_THRESHOLD_MEDIUM: f64 = 0.4;
+/// caution 动机值 >= 此值视为 high
+pub const CAUTION_THRESHOLD_HIGH: f64 = 0.7;
+
+/// 从 caution 动机值映射为谨慎级别字符串。
+pub fn caution_level_from_value(caution_val: f64) -> &'static str {
+    if caution_val >= CAUTION_THRESHOLD_HIGH {
+        "high"
+    } else if caution_val >= CAUTION_THRESHOLD_MEDIUM {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
 // ─── 情绪层 ─────────────────────────────────────────────
 
 /// 情绪层 PAD 向量：愉悦度、唤醒度、支配度。
@@ -355,6 +373,12 @@ pub struct DriveContext {
     /// 谨慎度相关的回复指导
     #[serde(default)]
     pub caution_guidance: Vec<String>,
+    /// 当前活跃的事件模式
+    #[serde(default)]
+    pub active_event_patterns: Vec<String>,
+    /// 动态记忆上下文（会话恢复/精准回忆/相关记忆拼接）
+    #[serde(default)]
+    pub memory_context: String,
     #[serde(default)]
     pub scope_key: String,
     #[serde(default)]
@@ -368,6 +392,8 @@ impl Default for DriveContext {
             motivational: HashMap::new(),
             relational: RelationalState::default(),
             caution_guidance: Vec::new(),
+            active_event_patterns: Vec::new(),
+            memory_context: String::new(),
             scope_key: String::new(),
             user_id: String::new(),
         }
@@ -400,6 +426,24 @@ impl DriveContext {
             ));
         }
 
+        // 动态记忆上下文
+        if !self.memory_context.is_empty() {
+            lines.push(format!("记忆上下文:\n{}", self.memory_context.trim()));
+        }
+
+        // 活跃事件模式
+        if !self.active_event_patterns.is_empty() {
+            // 去重保持顺序
+            let mut seen = std::collections::HashSet::new();
+            let mut unique_patterns: Vec<&str> = Vec::new();
+            for p in &self.active_event_patterns {
+                if seen.insert(p.as_str()) {
+                    unique_patterns.push(p);
+                }
+            }
+            lines.push(format!("活跃事件模式: {}", unique_patterns.join(", ")));
+        }
+
         // 谨慎度指导
         if !self.caution_guidance.is_empty() {
             // 去重保持顺序
@@ -412,13 +456,7 @@ impl DriveContext {
             }
             let guidance_text = unique_guidance.join("；");
             let caution_val = self.motivational.get("caution").copied().unwrap_or(0.0);
-            let level = if caution_val >= 0.7 {
-                "high"
-            } else if caution_val >= 0.4 {
-                "medium"
-            } else {
-                "low"
-            };
+            let level = caution_level_from_value(caution_val);
             if level != "low" {
                 lines.push(format!("谨慎度=级别={}", level));
                 lines.push(format!("回复要求={}", guidance_text));

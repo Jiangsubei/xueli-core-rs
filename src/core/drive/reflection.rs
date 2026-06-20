@@ -13,6 +13,7 @@ use regex::Regex;
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use crate::services::invocation_router::{InvocationTask, ModelInvocationRouter};
 use crate::services::prompt_loader::FilePromptTemplateLoader;
 use crate::traits::ai_client::{AIClient, ChatCompletionRequest, ChatMessage};
 
@@ -39,7 +40,7 @@ pub trait DynTemplateLoader: Send + Sync {
 }
 
 /// 为 FilePromptTemplateLoader 实现 DynTemplateLoader。
-/// 通过 cache_arc() 获取 owned 缓存 Arc，避免 async 块中捕获 &self。
+/// 优先读缓存；缓存未命中时从文件系统实际加载并回填缓存。
 impl DynTemplateLoader for FilePromptTemplateLoader {
     fn get_template_boxed(
         &self,
@@ -52,6 +53,7 @@ impl DynTemplateLoader for FilePromptTemplateLoader {
         >,
     > {
         let cache = self.cache_arc();
+        let dir = self.template_dir(&locale);
         Box::pin(async move {
             // 先检查缓存
             {
@@ -62,9 +64,50 @@ impl DynTemplateLoader for FilePromptTemplateLoader {
                     }
                 }
             }
-            Err(crate::core::errors::XueliError::Template(
-                crate::core::errors::TemplateError::NotFound(format!("{} / {}", locale, name)),
-            ))
+
+            // 缓存未命中：从文件系统加载全部 .prompt 模板
+            let mut map = std::collections::HashMap::new();
+            let mut entries = tokio::fs::read_dir(&dir).await.map_err(|e| {
+                crate::core::errors::XueliError::Template(crate::core::errors::TemplateError::Load(
+                    format!("无法读取模板目录 {:?}: {}", dir, e),
+                ))
+            })?;
+            while let Some(entry) = entries.next_entry().await.map_err(|e| {
+                crate::core::errors::XueliError::Template(crate::core::errors::TemplateError::Load(
+                    format!("无法读取目录条目: {}", e),
+                ))
+            })? {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("prompt") {
+                    let file_name = path
+                        .file_stem()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let content = tokio::fs::read_to_string(&path).await.map_err(|e| {
+                        crate::core::errors::XueliError::Template(
+                            crate::core::errors::TemplateError::Load(format!(
+                                "无法读取模板文件 {:?}: {}",
+                                path, e
+                            )),
+                        )
+                    })?;
+                    map.insert(file_name, content);
+                }
+            }
+
+            // 回填缓存
+            {
+                let mut cache_write = cache.write().await;
+                cache_write.insert(locale.clone(), map.clone());
+            }
+
+            // 返回目标模板
+            map.get(&name).cloned().ok_or_else(|| {
+                crate::core::errors::XueliError::Template(
+                    crate::core::errors::TemplateError::NotFound(format!("{} / {}", locale, name)),
+                )
+            })
         })
     }
 }
@@ -73,6 +116,7 @@ impl DynTemplateLoader for FilePromptTemplateLoader {
 pub struct DriveReflection {
     ai_client: Option<Arc<dyn AIClient>>,
     template_loader: Option<Arc<dyn DynTemplateLoader>>,
+    invocation_router: Option<Arc<ModelInvocationRouter>>,
     max_rule_weight_adjustment: f64,
 }
 
@@ -85,8 +129,15 @@ impl DriveReflection {
         Self {
             ai_client,
             template_loader,
+            invocation_router: None,
             max_rule_weight_adjustment,
         }
+    }
+
+    /// 注入模型调用路由器；存在时优先通过 FIFO 队列提交 Reflection 任务。
+    pub fn with_invocation_router(mut self, router: Arc<ModelInvocationRouter>) -> Self {
+        self.invocation_router = Some(router);
+        self
     }
 
     /// 便捷构造：使用 FilePromptTemplateLoader
@@ -100,6 +151,7 @@ impl DriveReflection {
         Self {
             ai_client,
             template_loader: Some(loader),
+            invocation_router: None,
             max_rule_weight_adjustment,
         }
     }
@@ -110,8 +162,10 @@ impl DriveReflection {
         snapshot: &DriveSnapshot,
         event_log: &[EventLogEntry],
         round_count: usize,
+        trace_id: &str,
     ) -> Option<ReflectionOutput> {
-        let ai_client = self.ai_client.as_ref()?;
+        // ai_client 在 invoke_llm 中按需获取
+        let _ = self.ai_client.as_ref()?;
 
         // 加载模板
         let system_prompt: String = match &self.template_loader {
@@ -137,7 +191,7 @@ impl DriveReflection {
         let user_content = self.build_user_prompt(snapshot, event_log, round_count);
 
         let data = match self
-            .invoke_llm(ai_client.as_ref(), &system_prompt, &user_content)
+            .invoke_llm(&system_prompt, &user_content, trace_id)
             .await
         {
             Ok(d) => d,
@@ -211,16 +265,84 @@ impl DriveReflection {
     }
 
     /// 调用 LLM 并返回解析后的 JSON。
+    /// 若配置了 ModelInvocationRouter，则通过 Reflection 任务队列提交；否则直接调用 AIClient。
     async fn invoke_llm(
         &self,
-        ai_client: &dyn AIClient,
         system_prompt: &str,
         user_content: &str,
+        trace_id: &str,
     ) -> Result<Value, String> {
-        let messages = vec![
-            ChatMessage::text("system", system_prompt),
-            ChatMessage::text("user", user_content),
-        ];
+        let ai_client = self
+            .ai_client
+            .as_ref()
+            .ok_or_else(|| "AIClient 未配置".to_string())?;
+        let system_msg = ChatMessage::text("system", system_prompt);
+        let user_msg = ChatMessage::text("user", user_content);
+
+        let content = if let Some(ref router) = self.invocation_router {
+            self.invoke_via_router(router, ai_client, &system_msg, &user_msg, trace_id)
+                .await?
+        } else {
+            self.invoke_direct(ai_client, &system_msg, &user_msg)
+                .await?
+        };
+
+        Ok(Self::extract_json(&content))
+    }
+
+    /// 通过 ModelInvocationRouter 提交 Reflection 任务。
+    async fn invoke_via_router(
+        &self,
+        router: &ModelInvocationRouter,
+        ai_client: &Arc<dyn AIClient>,
+        system_msg: &ChatMessage,
+        user_msg: &ChatMessage,
+        trace_id: &str,
+    ) -> Result<String, String> {
+        let model_name = router
+            .get_model(&router.route(&InvocationTask::Reflection))
+            .to_string();
+
+        let ai_client_arc = Arc::clone(ai_client);
+        let messages = vec![system_msg.clone(), user_msg.clone()];
+
+        router
+            .submit(
+                &InvocationTask::Reflection,
+                move || {
+                    let client = Arc::clone(&ai_client_arc);
+                    let model = model_name.clone();
+                    let messages = messages.clone();
+                    async move {
+                        let request = ChatCompletionRequest {
+                            model,
+                            messages,
+                            temperature: Some(0.2),
+                            max_tokens: None,
+                            stream: false,
+                            tools: None,
+                            tool_choice: None,
+                            extra_params: HashMap::new(),
+                        };
+                        let response = client.chat_completion(&request).await?;
+                        Ok(response.content)
+                    }
+                },
+                trace_id,
+                None,
+            )
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// 直接调用 AIClient（fallback 路径）。
+    async fn invoke_direct(
+        &self,
+        ai_client: &Arc<dyn AIClient>,
+        system_msg: &ChatMessage,
+        user_msg: &ChatMessage,
+    ) -> Result<String, String> {
+        let messages = vec![system_msg.clone(), user_msg.clone()];
 
         let request = ChatCompletionRequest {
             model: String::new(), // 由 AIClient 实现决定
@@ -238,7 +360,7 @@ impl DriveReflection {
             .await
             .map_err(|e| e.to_string())?;
 
-        Ok(Self::extract_json(&response.content))
+        Ok(response.content)
     }
 
     /// 从 LLM 回复中提取 JSON 对象。

@@ -17,6 +17,8 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::info;
 
+use crate::core::platform_types::InboundEvent;
+use crate::services::invocation_router::ModelInvocationRouter;
 use crate::traits::ai_client::AIClient;
 
 use super::engine::DriveEngine;
@@ -29,6 +31,7 @@ pub struct DriveScheduler {
     data_dir: PathBuf,
     ai_client: Option<Arc<dyn AIClient>>,
     template_loader: Option<Arc<dyn DynTemplateLoader>>,
+    invocation_router: Option<Arc<ModelInvocationRouter>>,
     reflection_trigger_rounds: usize,
     reflection_trigger_interval_secs: u64,
     event_decay_tick_interval_secs: u64,
@@ -65,6 +68,7 @@ impl DriveScheduler {
             data_dir: data_dir.into(),
             ai_client,
             template_loader,
+            invocation_router: None,
             reflection_trigger_rounds: reflection_trigger_rounds.max(1),
             reflection_trigger_interval_secs: reflection_trigger_interval_secs.max(60),
             event_decay_tick_interval_secs: event_decay_tick_interval_secs.max(1),
@@ -78,6 +82,12 @@ impl DriveScheduler {
             reflection_task: None,
             shutdown: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// 注入模型调用路由器，供反思使用。
+    pub fn with_invocation_router(mut self, router: Arc<ModelInvocationRouter>) -> Self {
+        self.invocation_router = Some(router);
+        self
     }
 
     // ─── 生命周期 ───────────────────────────────────────
@@ -118,6 +128,7 @@ impl DriveScheduler {
         let event_log = self.event_log.clone();
         let ai_client = self.ai_client.clone();
         let template_loader = self.template_loader.clone();
+        let invocation_router = self.invocation_router.clone();
         let max_adj = self.max_rule_weight_adjustment;
         let trigger_rounds = self.reflection_trigger_rounds;
         let trigger_interval = self.reflection_trigger_interval_secs;
@@ -165,32 +176,26 @@ impl DriveScheduler {
                                         Some(e) => e,
                                         None => continue,
                                     };
-                                    let ctx = engine.get_drive_context("");
-                                    let snap = super::models::DriveSnapshot {
-                                        affective: super::models::AffectiveState {
-                                            pad: ctx.affective.clone(),
-                                            updated_at: String::new(),
-                                        },
-                                        motivational: engine.get_motivational_state(),
-                                        relational: Default::default(),
-                                        event_rules: engine.get_event_rules().clone(),
-                                        scope_key: scope_key.clone(),
-                                        version: 1,
-                                        created_at: String::new(),
-                                        updated_at: String::new(),
-                                    };
+                                    // 传入完整快照，保留关系层
+                                    let snap = engine.get_snapshot().unwrap_or_else(|| {
+                                        super::models::DriveSnapshot::create_default(&scope_key)
+                                    });
                                     let log = event_log.lock().await.get(&scope_key).cloned().unwrap_or_default();
                                     let count = round_counts.lock().await.get(&scope_key).copied().unwrap_or(0);
                                     (snap, log, count)
                                 };
 
-                                let reflection = DriveReflection::new(
+                                let mut reflection = DriveReflection::new(
                                     Some(ai.clone()),
                                     Some(tpl.clone()),
                                     max_adj,
                                 );
+                                if let Some(ref router) = invocation_router {
+                                    reflection = reflection.with_invocation_router(router.clone());
+                                }
 
-                                if let Some(result) = reflection.run_reflection(&snapshot, &log, round_count).await {
+                                let trace_id = format!("drive_reflection:{}", scope_key);
+                                if let Some(result) = reflection.run_reflection(&snapshot, &log, round_count, &trace_id).await {
                                     let mut engines = eng_clone2.lock().await;
                                     if let Some(engine) = engines.get_mut(&scope_key) {
                                         engine.apply_reflection_result(&result).await;
@@ -229,26 +234,36 @@ impl DriveScheduler {
     // ─── 事件监听接口 ───────────────────────────────────
 
     /// 钩子 A：Phase 1 前触发，用于事件增量。
-    pub async fn on_inbound_event(&self, scope_key: &str, event_patterns: &[String]) {
-        if !self.enabled || scope_key.is_empty() || event_patterns.is_empty() {
+    ///
+    /// 从 InboundEvent 中提取作用域键和事件模式，应用增量并记录事件日志。
+    pub async fn on_inbound_event(&self, event: &InboundEvent) {
+        if !self.enabled {
+            return;
+        }
+
+        let scope_key = Self::extract_scope_key(event);
+        if scope_key.is_empty() {
+            return;
+        }
+
+        let event_patterns = Self::extract_event_patterns(event);
+        if event_patterns.is_empty() {
             return;
         }
 
         let mut engines = self.engines.lock().await;
-        let engine = engines.entry(scope_key.to_string()).or_insert_with(|| {
-            DriveEngine::new(DriveStore::new(&self.data_dir), scope_key, self.enabled)
+        let engine = engines.entry(scope_key.clone()).or_insert_with(|| {
+            DriveEngine::new(DriveStore::new(&self.data_dir), &scope_key, self.enabled)
         });
-        engine.apply_event_deltas(event_patterns).await;
+        engine.apply_event_deltas(&event_patterns).await;
 
         // 记录事件日志
         let mut event_log = self.event_log.lock().await;
-        let log = event_log
-            .entry(scope_key.to_string())
-            .or_insert_with(Vec::new);
+        let log = event_log.entry(scope_key.clone()).or_insert_with(Vec::new);
         let now = chrono::Local::now().format("%H:%M:%S").to_string();
         for pattern in event_patterns {
             log.push(EventLogEntry {
-                pattern: pattern.clone(),
+                pattern,
                 timestamp: now.clone(),
             });
         }
@@ -257,6 +272,65 @@ impl DriveScheduler {
             let drain_count = log.len() - 100;
             log.drain(..drain_count);
         }
+    }
+
+    /// 从 InboundEvent 提取作用域键。
+    fn extract_scope_key(event: &InboundEvent) -> String {
+        if let Some(ref session) = event.session {
+            if !session.session_id.is_empty() {
+                return session.session_id.clone();
+            }
+        }
+        // 兼容：从 platform / scope / sender 构造
+        let platform = event.platform.clone();
+        let scope_str = if let Some(ref session) = event.session {
+            match &session.scope {
+                crate::core::scope::ChatScope::Private => "private".to_string(),
+                crate::core::scope::ChatScope::Group(gid) => format!("group:{}", gid),
+            }
+        } else {
+            "private".to_string()
+        };
+        let channel_id = event
+            .sender
+            .as_ref()
+            .map(|s| s.user_id.clone())
+            .unwrap_or_default();
+        if platform.is_empty() || channel_id.is_empty() {
+            return String::new();
+        }
+        format!("{}:{}:{}", platform, scope_str, channel_id)
+    }
+
+    /// 从 InboundEvent 提取事件模式列表。
+    fn extract_event_patterns(event: &InboundEvent) -> Vec<String> {
+        let mut patterns: Vec<String> = Vec::new();
+
+        // 时间间隔分桶
+        let gap_bucket = event.temporal_gap_bucket.trim();
+        match gap_bucket {
+            "long_resume" | "stale" => {
+                patterns.push("long_silence_resume".to_string());
+                if gap_bucket == "stale" {
+                    patterns.push("stale_resume".to_string());
+                }
+            }
+            "short_resume" => patterns.push("short_resume".to_string()),
+            "same_day_resume" => patterns.push("same_day_resume".to_string()),
+            _ => {}
+        }
+
+        // 反馈标签
+        let feedback = event.feedback_label.trim().to_lowercase();
+        match feedback.as_str() {
+            "negative" | "cold_down" | "cool_down" => {
+                patterns.push("negative_feedback".to_string())
+            }
+            "positive" | "satisfy" | "continue" => patterns.push("positive_feedback".to_string()),
+            _ => {}
+        }
+
+        patterns
     }
 
     /// 钩子 B：Phase 5 后触发，用于轮次计数与反思判断。
@@ -345,8 +419,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let scheduler =
             DriveScheduler::new(dir.path().to_path_buf(), None, None, 5, 3600, 10, 0.3, true);
-        let patterns = vec!["negative_feedback".to_string()];
-        scheduler.on_inbound_event("test_scope", &patterns).await;
+        let mut event = InboundEvent::default();
+        event.platform = "test".to_string();
+        event.session = Some(crate::core::platform_types::SessionRef {
+            session_id: "test_scope".to_string(),
+            scope: crate::core::scope::ChatScope::Private,
+            user_id: Some("user1".to_string()),
+        });
+        event.feedback_label = "negative".to_string();
+        scheduler.on_inbound_event(&event).await;
         let log = scheduler.event_log.lock().await;
         let entries = log.get("test_scope").unwrap();
         assert_eq!(entries.len(), 1);
