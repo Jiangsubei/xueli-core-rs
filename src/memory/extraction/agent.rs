@@ -12,14 +12,14 @@ use super::reflection::MemoryReflection;
 /// Acts as a facade over MemoryExtractor and MemoryReflection.
 pub struct ExtractionAgent<A: AIClient, L: PromptTemplateLoader> {
     extractor: Arc<MemoryExtractor<A, L>>,
-    reflection: Option<Arc<MemoryReflection<A>>>,
+    reflection: Option<Arc<MemoryReflection<A, L>>>,
     config: ExtractionConfig,
 }
 
 impl<A: AIClient, L: PromptTemplateLoader> ExtractionAgent<A, L> {
     pub fn new(
         extractor: Arc<MemoryExtractor<A, L>>,
-        reflection: Option<Arc<MemoryReflection<A>>>,
+        reflection: Option<Arc<MemoryReflection<A, L>>>,
         config: ExtractionConfig,
     ) -> Self {
         Self {

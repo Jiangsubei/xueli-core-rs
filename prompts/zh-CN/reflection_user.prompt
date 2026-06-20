@@ -1,0 +1,9 @@
+请检查以下新旧记忆之间是否有冲突：
+
+【已有记忆】
+{existing_memories}
+
+【新记忆】
+{new_memories}
+
+请输出 JSON。

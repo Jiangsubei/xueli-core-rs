@@ -147,8 +147,8 @@ impl<A: AIClient + ?Sized, L: PromptTemplateLoader> MemoryExtractor<A, L> {
         }
 
         let messages = vec![
-            ChatMessage::text("system", &self.build_system_prompt().await),
-            ChatMessage::text("user", &self.build_user_prompt(&dialogue_text).await),
+            ChatMessage::text("system", &self.build_system_prompt().await?),
+            ChatMessage::text("user", &self.build_user_prompt(&dialogue_text).await?),
         ];
 
         let start = Instant::now();
@@ -233,8 +233,8 @@ impl<A: AIClient + ?Sized, L: PromptTemplateLoader> MemoryExtractor<A, L> {
         }
 
         let conversation = messages.join("\n");
-        let system_prompt = self.build_system_prompt().await;
-        let user_prompt = self.build_user_prompt(&conversation).await;
+        let system_prompt = self.build_system_prompt().await?;
+        let user_prompt = self.build_user_prompt(&conversation).await?;
 
         let chat_messages = vec![
             ChatMessage::text("system", &system_prompt),
@@ -295,58 +295,21 @@ impl<A: AIClient + ?Sized, L: PromptTemplateLoader> MemoryExtractor<A, L> {
         buf.clear_buffer(session_id);
     }
 
-    /// 构建系统提示词 — 使用 PromptTemplateLoader 加载模板，失败则兜底
-    async fn build_system_prompt(&self) -> String {
-        if let Ok(template) = self
-            .prompt_loader
+    /// 构建系统提示词 — 使用 PromptTemplateLoader 加载模板
+    async fn build_system_prompt(&self) -> XueliResult<String> {
+        self.prompt_loader
             .get_template("zh-CN", "memory_extraction")
             .await
-        {
-            return template;
-        }
-        // 兜底：硬编码提示词
-        r#"你是一个记忆提取助手。从对话中提取关于用户的有意义信息。
-
-提取规则：
-- 只提取关于用户的事实、偏好、经历或观点
-- 每条记忆应该是一句简洁的陈述
-- 记忆类型：fact（事实）、preference（偏好）、event（经历）、opinion（观点）、relationship（关系信息）
-- 重要度 0.0-1.0：1.0 表示极其重要（如姓名、关键偏好），0.5 表示一般信息
-- 如果没有值得记忆的内容，返回空列表
-
-输出 JSON 格式：
-```json
-{
-  "memories": [
-    {
-      "content": "记忆内容",
-      "memory_type": "fact|preference|event|opinion|relationship",
-      "importance": 0.8,
-      "confidence": 0.9
-    }
-  ]
-}
-```
-
-只输出 JSON，不要额外说明。"#
-            .to_string()
     }
 
-    /// 构建用户提示词 — 使用 PromptTemplateLoader，失败则兜底
-    async fn build_user_prompt(&self, conversation: &str) -> String {
-        if let Ok(template) = self
+    /// 构建用户提示词 — 使用 PromptTemplateLoader 加载并渲染模板
+    async fn build_user_prompt(&self, conversation: &str) -> XueliResult<String> {
+        let template = self
             .prompt_loader
             .get_template("zh-CN", "memory_extraction_user")
-            .await
-        {
-            let vars = HashMap::from([("conversation", conversation)]);
-            return self.prompt_loader.render(&template, &vars);
-        }
-        // 兜底
-        format!(
-            "请从以下对话中提取关于用户的值得记住的信息：\n\n```\n{}\n```\n\n请输出 JSON。",
-            conversation
-        )
+            .await?;
+        let vars = HashMap::from([("conversation", conversation)]);
+        Ok(self.prompt_loader.render(&template, &vars))
     }
 
     /// 将对话轮次格式化为 LLM 可读的文本 — 对应 Python 版 _format_dialogue
@@ -571,8 +534,13 @@ impl<A: AIClient + Default, L: PromptTemplateLoader + Default> Default for Memor
 mod tests {
     use super::*;
     use crate::services::ai_client::NoopAIClient;
-    use crate::services::prompt_loader::NoopPromptTemplateLoader;
+    use crate::services::prompt_loader::{FilePromptTemplateLoader, NoopPromptTemplateLoader};
     use crate::traits::ai_client::ChatCompletionResponse;
+
+    fn file_loader() -> Arc<FilePromptTemplateLoader> {
+        let base = std::path::PathBuf::from(std::env!("CARGO_MANIFEST_DIR")).join("prompts");
+        Arc::new(FilePromptTemplateLoader::new(base))
+    }
 
     fn make_extractor() -> MemoryExtractor<NoopAIClient, NoopPromptTemplateLoader> {
         MemoryExtractor::new(
@@ -638,8 +606,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_system_prompt_not_empty() {
-        let extractor = make_extractor();
-        let prompt = extractor.build_system_prompt().await;
+        let extractor = MemoryExtractor::new(Arc::new(NoopAIClient), "gpt-4o-mini", file_loader());
+        let prompt = extractor.build_system_prompt().await.unwrap();
         assert!(prompt.contains("记忆提取"));
         assert!(prompt.contains("JSON"));
     }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -6,22 +7,25 @@ use crate::prelude::XueliResult;
 use crate::traits::ai_client::{
     AIClient, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
 };
+use crate::traits::prompt_template::PromptTemplateLoader;
 
 /// 记忆冲突反思 — 检测新旧记忆矛盾并给出解决方案
 ///
 /// 对应 Python 版 `xueli/src/memory/extraction/reflection.py`
-pub struct MemoryReflection<A: AIClient + ?Sized> {
+pub struct MemoryReflection<A: AIClient + ?Sized, L: PromptTemplateLoader> {
     ai_client: Arc<A>,
     model: String,
     max_retries: usize,
+    prompt_loader: Arc<L>,
 }
 
-impl<A: AIClient + ?Sized> MemoryReflection<A> {
-    pub fn new(ai_client: Arc<A>, model: &str) -> Self {
+impl<A: AIClient + ?Sized, L: PromptTemplateLoader> MemoryReflection<A, L> {
+    pub fn new(ai_client: Arc<A>, model: &str, prompt_loader: Arc<L>) -> Self {
         Self {
             ai_client,
             model: model.to_string(),
             max_retries: 3,
+            prompt_loader,
         }
     }
 
@@ -34,8 +38,8 @@ impl<A: AIClient + ?Sized> MemoryReflection<A> {
             return Ok(ReflectionResult::default());
         }
 
-        let system_prompt = self.build_system_prompt();
-        let user_prompt = self.build_user_prompt(existing, new_items);
+        let system_prompt = self.build_system_prompt().await?;
+        let user_prompt = self.build_user_prompt(existing, new_items).await?;
 
         let chat_messages = vec![
             ChatMessage::text("system", &system_prompt),
@@ -83,35 +87,19 @@ impl<A: AIClient + ?Sized> MemoryReflection<A> {
         Ok(ReflectionResult::default())
     }
 
-    fn build_system_prompt(&self) -> String {
-        r#"你是一个记忆反思助手。检测新旧记忆之间的冲突并给出解决方案。
-
-规则：
-- 如果两条记忆信息矛盾，标记为冲突
-- 若新信息纠正了旧信息，建议「更新旧记忆」
-- 若两条记忆可以共存（如不同时间点的状态），建议「保留两者」
-- 如果没有冲突，返回空列表
-
-输出 JSON 格式：
-```json
-{
-  "conflicts": [
-    {
-      "old_memory": "旧记忆内容",
-      "new_memory": "新记忆内容",
-      "type": "contradiction|update|complement",
-      "resolution": "keep_both|update_old|replace_old",
-      "reason": "推理理由"
-    }
-  ]
-}
-```
-
-只输出 JSON，不要额外说明。"#
-            .to_string()
+    async fn build_system_prompt(&self) -> XueliResult<String> {
+        self.prompt_loader.get_template("zh-CN", "reflection").await
     }
 
-    fn build_user_prompt(&self, existing: &[MemoryItem], new_items: &[MemoryItem]) -> String {
+    async fn build_user_prompt(
+        &self,
+        existing: &[MemoryItem],
+        new_items: &[MemoryItem],
+    ) -> XueliResult<String> {
+        let template = self
+            .prompt_loader
+            .get_template("zh-CN", "reflection_user")
+            .await?;
         let old_list: Vec<String> = existing
             .iter()
             .map(|m| format!("- [{}] {}", m.id, m.content))
@@ -120,12 +108,13 @@ impl<A: AIClient + ?Sized> MemoryReflection<A> {
             .iter()
             .map(|m| format!("- [{}] {}", m.id, m.content))
             .collect();
-
-        format!(
-            "请检查以下新旧记忆之间是否有冲突：\n\n【已有记忆】\n{}\n\n【新记忆】\n{}\n\n请输出 JSON。",
-            old_list.join("\n"),
-            new_list.join("\n"),
-        )
+        let existing_memories = old_list.join("\n");
+        let new_memories = new_list.join("\n");
+        let vars = HashMap::from([
+            ("existing_memories", existing_memories.as_str()),
+            ("new_memories", new_memories.as_str()),
+        ]);
+        Ok(self.prompt_loader.render(&template, &vars))
     }
 
     fn parse_response(&self, response: &ChatCompletionResponse) -> XueliResult<ReflectionResult> {
@@ -439,12 +428,16 @@ pub fn build_reflection_evidence(
     evidence
 }
 
-impl<A: AIClient + Default> Default for MemoryReflection<A> {
+impl<A: AIClient + Default, L: PromptTemplateLoader + Default> Default for MemoryReflection<A, L> {
     fn default() -> Self {
         tracing::warn!(
-            "[MemoryReflection] 使用 Default 构造，AI 客户端为默认值，生产环境请使用 new()"
+            "[MemoryReflection] 使用 Default 构造，AI 客户端和模板加载器均为默认值，生产环境请使用 new()"
         );
-        Self::new(Arc::new(A::default()), "gpt-4o-mini")
+        Self::new(
+            Arc::new(A::default()),
+            "gpt-4o-mini",
+            Arc::new(L::default()),
+        )
     }
 }
 
@@ -452,11 +445,21 @@ impl<A: AIClient + Default> Default for MemoryReflection<A> {
 mod tests {
     use super::*;
     use crate::services::ai_client::NoopAIClient;
+    use crate::services::prompt_loader::FilePromptTemplateLoader;
     use crate::traits::ai_client::ChatCompletionResponse;
+
+    fn file_loader() -> Arc<FilePromptTemplateLoader> {
+        let base = std::path::PathBuf::from(std::env!("CARGO_MANIFEST_DIR")).join("prompts");
+        Arc::new(FilePromptTemplateLoader::new(base))
+    }
+
+    fn make_reflection() -> MemoryReflection<NoopAIClient, FilePromptTemplateLoader> {
+        MemoryReflection::new(Arc::new(NoopAIClient), "gpt-4o-mini", file_loader())
+    }
 
     #[test]
     fn test_parse_response_with_conflicts() {
-        let reflection = MemoryReflection::new(Arc::new(NoopAIClient), "gpt-4o-mini");
+        let reflection = make_reflection();
         let json = r#"{
           "conflicts": [
             {
@@ -486,7 +489,7 @@ mod tests {
 
     #[test]
     fn test_parse_response_no_conflicts() {
-        let reflection = MemoryReflection::new(Arc::new(NoopAIClient), "gpt-4o-mini");
+        let reflection = make_reflection();
         let json = r#"{"conflicts": []}"#;
         let response = ChatCompletionResponse {
             content: json.to_string(),
