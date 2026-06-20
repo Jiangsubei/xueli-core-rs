@@ -76,14 +76,13 @@ impl<A: AIClient> SessionRestoreService<A> {
 
         // 获取最近消息，按会话分组
         let recent_messages = if is_group {
-            self.conversation_store.get_recent_by_scope(
-                "group",
-                scope_id,
-                self.recent_session_limit * 20,
-            )
+            self.conversation_store
+                .get_recent_by_scope("group", scope_id, self.recent_session_limit * 20)
+                .await
         } else {
             self.conversation_store
                 .get_recent_by_user(user_id, self.recent_session_limit * 20)
+                .await
         }
         .map_err(|e| format!("获取最近消息失败: {}", e))?;
 
@@ -192,6 +191,7 @@ mod tests {
 
     fn setup() -> (
         Arc<SqliteConversationStore>,
+        tempfile::TempDir,
         SessionRestoreService<crate::services::ai_client::DefaultAIClient>,
     ) {
         let dir = tempfile::TempDir::new().expect("临时目录");
@@ -206,10 +206,10 @@ mod tests {
         .expect("创建 AI 客户端");
         let summary = ChatSummaryService::new(Arc::new(client), "test-model");
         let svc = SessionRestoreService::new(store.clone(), summary, 6, 2);
-        (store, svc)
+        (store, dir, svc)
     }
 
-    fn insert_msgs(store: &SqliteConversationStore, sid: &str, user_id: &str, count: usize) {
+    async fn insert_msgs(store: &SqliteConversationStore, sid: &str, user_id: &str, count: usize) {
         for i in 0..count {
             let rec = ConversationRecord {
                 id: 0,
@@ -224,7 +224,7 @@ mod tests {
                 message_id: format!("m{}", i),
                 platform: "qq".to_string(),
             };
-            store.insert_message(&rec).unwrap();
+            store.insert_message(&rec).await.unwrap();
         }
     }
 
@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn test_format_restore_entry() {
-        let svc = setup().1;
+        let svc = setup().2;
         let entry = svc.format_restore_entry(1, "sid1", "100", 3, "摘要内容");
         assert!(entry.contains("上一轮会话"));
         assert!(entry.contains("摘要内容"));
@@ -255,9 +255,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_restore_entries() {
-        let (store, svc) = setup();
-        insert_msgs(&store, "sid1", "user1", 3);
-        insert_msgs(&store, "sid2", "user1", 2);
+        let (store, _dir, svc) = setup();
+        insert_msgs(&store, "sid1", "user1", 3).await;
+        insert_msgs(&store, "sid2", "user1", 2).await;
 
         let entries = svc
             .build_restore_entries("user1", "private", "", "qq")
@@ -269,7 +269,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_restore_entries_empty() {
-        let (_, svc) = setup();
+        let (_, _dir, svc) = setup();
         let entries = svc
             .build_restore_entries("unknown", "private", "", "qq")
             .await
@@ -306,7 +306,7 @@ mod tests {
                 message_id: format!("gm{}", i),
                 platform: "qq".to_string(),
             };
-            store.insert_message(&rec).unwrap();
+            store.insert_message(&rec).await.unwrap();
         }
 
         let entries = svc
