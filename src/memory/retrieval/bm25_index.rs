@@ -1,9 +1,11 @@
-use jieba_rs::Jieba;
 use std::collections::{HashMap, HashSet};
+
+use crate::services::tokenizer::JiebaTokenizer;
+use crate::traits::tokenizer::Tokenizer;
 
 /// BM25 文本检索索引
 pub struct BM25Index {
-    jieba: Jieba,
+    tokenizer: Box<dyn Tokenizer>,
     /// 文档集合
     documents: Vec<(String, Vec<String>)>,
     /// 平均文档长度
@@ -18,8 +20,13 @@ pub struct BM25Index {
 
 impl BM25Index {
     pub fn new(k1: f64, b: f64) -> Self {
+        Self::with_tokenizer(k1, b, Box::new(JiebaTokenizer::new()))
+    }
+
+    /// 使用指定分词器创建索引
+    pub fn with_tokenizer(k1: f64, b: f64, tokenizer: Box<dyn Tokenizer>) -> Self {
         Self {
-            jieba: Jieba::new(),
+            tokenizer,
             documents: Vec::new(),
             avg_doc_len: 0.0,
             k1,
@@ -40,24 +47,14 @@ impl BM25Index {
 
     /// 添加文档到索引
     pub fn add(&mut self, doc_id: String, text: &str) {
-        let tokens: Vec<String> = self
-            .jieba
-            .cut(text, true)
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect();
+        let tokens = self.tokenizer.tokenize_for_search(text);
         self.documents.push((doc_id, tokens));
         self.update_avg_len();
     }
 
     /// 搜索
     pub fn search(&self, query: &str, top_k: usize) -> Vec<(String, f64)> {
-        let query_tokens: Vec<String> = self
-            .jieba
-            .cut(query, true)
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect();
+        let query_tokens = self.tokenizer.tokenize_for_search(query);
 
         let mut scores: Vec<(String, f64)> = self
             .documents
@@ -115,13 +112,12 @@ impl BM25Index {
         };
     }
 
-    /// 提取关键词：jieba-rs 分词 → 按 IDF 加权取 top-N
+    /// 提取关键词：Tokenizer 分词 → 按 IDF 加权取 top-N
     pub fn extract_keywords(&self, text: &str, top_n: usize) -> Vec<String> {
         let tokens: Vec<String> = self
-            .jieba
-            .cut(text, true)
+            .tokenizer
+            .tokenize_for_search(text)
             .into_iter()
-            .map(|s| s.to_string())
             .filter(|s| s.trim().len() > 1)
             .collect();
 

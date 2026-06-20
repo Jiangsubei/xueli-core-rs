@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use crate::core::types::MemoryItem;
 
 use super::bm25_index::BM25Index;
+use super::reranker::{Reranker, ScoredMemory};
 use super::vector_index::VectorIndex;
 
 /// 检索配置 — 两阶段检索的所有可调参数
@@ -23,6 +24,20 @@ pub struct RetrievalConfig {
     pub scene_same_type_weight: f64,
     pub scene_same_user_weight: f64,
     pub archive_penalty_base: f64,
+    /// 是否启用重排序
+    pub rerank_enabled: bool,
+    /// 重排序后返回数量
+    pub rerank_top_k: usize,
+    /// 进入重排序阶段的候选数
+    pub pre_rerank_top_k: usize,
+    /// 重排序候选文本最大字符数
+    pub rerank_candidate_max_chars: usize,
+    /// 重排序提示词总字符预算
+    pub rerank_total_prompt_budget: usize,
+    /// 重排序器类型：`api` 或 `local`
+    pub reranker_type: String,
+    /// 本地 Cross-Encoder 模型名（占位）
+    pub local_model_name: String,
 }
 
 impl Default for RetrievalConfig {
@@ -40,6 +55,40 @@ impl Default for RetrievalConfig {
             scene_same_type_weight: 1.0,
             scene_same_user_weight: 0.8,
             archive_penalty_base: 0.5,
+            rerank_enabled: false,
+            rerank_top_k: 20,
+            pre_rerank_top_k: 12,
+            rerank_candidate_max_chars: 160,
+            rerank_total_prompt_budget: 2400,
+            reranker_type: "api".to_string(),
+            local_model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2".to_string(),
+        }
+    }
+}
+
+impl RetrievalConfig {
+    /// 从全局配置构造检索配置
+    pub fn from_xueli_config(config: &crate::core::config::XueliConfig) -> Self {
+        Self {
+            bm25_top_k: config.memory.bm25_top_k,
+            bm25_min_score: 0.0,
+            local_bm25_weight: config.memory.retrieval_weights.local_bm25_weight,
+            local_importance_weight: config.memory.retrieval_weights.local_importance_weight,
+            local_mention_weight: config.memory.retrieval_weights.local_mention_weight,
+            local_recency_weight: config.memory.retrieval_weights.local_recency_weight,
+            local_scene_weight: config.memory.retrieval_weights.local_scene_weight,
+            vector_weight: config.memory.retrieval_weights.vector_weight,
+            scene_same_group_weight: config.memory.scene_weights.same_group_weight,
+            scene_same_type_weight: config.memory.scene_weights.same_type_weight,
+            scene_same_user_weight: config.memory.scene_weights.same_user_weight,
+            archive_penalty_base: config.memory.merge.archive_penalty_base,
+            rerank_enabled: config.memory_rerank.enabled,
+            rerank_top_k: config.memory.rerank_top_k,
+            pre_rerank_top_k: config.memory.pre_rerank_top_k,
+            rerank_candidate_max_chars: config.memory.rerank_candidate_max_chars,
+            rerank_total_prompt_budget: config.memory.rerank_total_prompt_budget,
+            reranker_type: "api".to_string(),
+            local_model_name: config.memory_rerank.model.clone(),
         }
     }
 }
@@ -68,6 +117,7 @@ pub struct RetrievedEntry {
     pub memory: MemoryItem,
     pub bm25_score: f64,
     pub local_score: f64,
+    pub rerank_score: Option<f64>,
     pub combined_score: f64,
     pub ranking_stage: String,
 }
@@ -75,12 +125,14 @@ pub struct RetrievedEntry {
 /// 两阶段记忆检索器
 ///
 /// **Stage 1**：BM25 关键词检索 + 可选向量融合，粗筛 Top-K 候选。
-/// **Stage 2**：本地多因子排序（重要性、提及次数、场景关联、新鲜度衰减等），输出最终 Top-K。
+/// **Stage 2**：本地多因子排序（重要性、提及次数、场景关联、新鲜度衰减等），
+/// 可选调用 `Reranker` 进行模型级重排，输出最终 Top-K。
 pub struct TwoStageRetriever {
     bm25_index: Arc<Mutex<BM25Index>>,
     vector_index: Option<Arc<Mutex<VectorIndex>>>,
     config: RetrievalConfig,
     memory_map: Arc<Mutex<HashMap<String, MemoryItem>>>,
+    reranker: Option<Arc<dyn Reranker>>,
 }
 
 impl TwoStageRetriever {
@@ -90,7 +142,14 @@ impl TwoStageRetriever {
             vector_index,
             config,
             memory_map: Arc::new(Mutex::new(HashMap::new())),
+            reranker: None,
         }
+    }
+
+    /// 注入重排序器
+    pub fn with_reranker(mut self, reranker: Arc<dyn Reranker>) -> Self {
+        self.reranker = Some(reranker);
+        self
     }
 
     /// 添加记忆到索引
@@ -142,15 +201,22 @@ impl TwoStageRetriever {
     /// - `user_id`：请求用户 ID（用于过滤）
     /// - `query`：检索查询文本
     /// - `top_k`：最终返回结果数
+    /// - `use_rerank`：是否尝试使用重排序器（仍需配置开启且已注入）
     /// - `context`：检索上下文（场景、时间等）
-    pub fn search(
+    pub async fn search(
         &self,
         user_id: &str,
         query: &str,
         top_k: usize,
+        use_rerank: bool,
         context: Option<&RetrievalContext>,
     ) -> Vec<RetrievedEntry> {
-        let recall_k = self.config.bm25_top_k;
+        let final_top_k = top_k;
+        let recall_k = if self.config.rerank_enabled {
+            self.config.bm25_top_k
+        } else {
+            final_top_k
+        };
 
         let bm25_results = {
             let bm25 = self.bm25_index.lock().expect("bm25 lock");
@@ -193,9 +259,62 @@ impl TwoStageRetriever {
 
         let locally_ranked = self.apply_local_ranking(&candidate_list, context);
 
+        let should_rerank = use_rerank
+            && self.config.rerank_enabled
+            && self.reranker.is_some()
+            && locally_ranked.len() > 1;
+
+        if should_rerank {
+            let reranker = self.reranker.clone().expect("reranker exists");
+            let rerank_input_count = final_top_k.max(self.config.pre_rerank_top_k);
+            let rerank_candidates: Vec<(MemoryItem, f64)> = locally_ranked
+                .iter()
+                .take(rerank_input_count)
+                .cloned()
+                .collect();
+
+            let id_to_local_score: HashMap<String, f64> = locally_ranked
+                .iter()
+                .map(|(mem, score)| (mem.id.clone(), *score))
+                .collect();
+
+            match reranker
+                .rerank(query, rerank_candidates, final_top_k, context)
+                .await
+            {
+                reranked if !reranked.is_empty() => {
+                    return reranked
+                        .into_iter()
+                        .map(|ScoredMemory { memory, score }| {
+                            let bm25_score = bm25_results
+                                .iter()
+                                .find(|(id, _)| id == &memory.id)
+                                .map(|(_, s)| *s)
+                                .unwrap_or(0.0);
+                            let local_score = id_to_local_score
+                                .get(&memory.id)
+                                .copied()
+                                .unwrap_or(bm25_score);
+                            RetrievedEntry {
+                                memory,
+                                bm25_score,
+                                local_score,
+                                rerank_score: Some(score),
+                                combined_score: score,
+                                ranking_stage: "model_rerank".to_string(),
+                            }
+                        })
+                        .collect();
+                }
+                _ => {
+                    tracing::debug!("[检索] 重排序返回空，回退到本地预排序");
+                }
+            }
+        }
+
         locally_ranked
             .into_iter()
-            .take(top_k)
+            .take(final_top_k)
             .map(|(mem, local_score)| {
                 let bm25_score = bm25_results
                     .iter()
@@ -206,6 +325,7 @@ impl TwoStageRetriever {
                     combined_score: local_score,
                     bm25_score,
                     local_score,
+                    rerank_score: None,
                     ranking_stage: "local_prerank".to_string(),
                     memory: mem,
                 }
@@ -445,7 +565,8 @@ impl SuppressionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::MemoryType;
+    use crate::core::types::{MemoryItem, MemoryType};
+    use async_trait::async_trait;
 
     fn make_memory(id: &str, user_id: &str, content: &str, importance: f64) -> MemoryItem {
         MemoryItem {
@@ -460,8 +581,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_add_and_search() {
+    #[tokio::test]
+    async fn test_add_and_search() {
         let config = RetrievalConfig::default();
         let retriever = TwoStageRetriever::new(config, None);
 
@@ -469,17 +590,17 @@ mod tests {
         retriever.add_memory(&make_memory("m2", "u1", "用户住在北京", 0.6));
         retriever.add_memory(&make_memory("m3", "u2", "用户喜欢苹果", 0.9));
 
-        let results = retriever.search("u1", "咖啡", 5, None);
+        let results = retriever.search("u1", "咖啡", 5, false, None).await;
         assert!(!results.is_empty());
         assert_eq!(results[0].memory.id, "m1");
     }
 
-    #[test]
-    fn test_search_empty_index() {
+    #[tokio::test]
+    async fn test_search_empty_index() {
         let config = RetrievalConfig::default();
         let retriever = TwoStageRetriever::new(config, None);
 
-        let results = retriever.search("u1", "任何查询", 5, None);
+        let results = retriever.search("u1", "任何查询", 5, false, None).await;
         assert!(results.is_empty());
     }
 
@@ -511,8 +632,8 @@ mod tests {
         assert!(not_found.is_none());
     }
 
-    #[test]
-    fn test_remove_memory() {
+    #[tokio::test]
+    async fn test_remove_memory() {
         let config = RetrievalConfig::default();
         let retriever = TwoStageRetriever::new(config, None);
 
@@ -522,32 +643,32 @@ mod tests {
         retriever.remove_memory("m1");
         assert_eq!(retriever.memory_count(), 0);
 
-        let results = retriever.search("u1", "咖啡", 5, None);
+        let results = retriever.search("u1", "咖啡", 5, false, None).await;
         assert!(results.is_empty());
     }
 
-    #[test]
-    fn test_user_id_filtering() {
+    #[tokio::test]
+    async fn test_user_id_filtering() {
         let config = RetrievalConfig::default();
         let retriever = TwoStageRetriever::new(config, None);
 
         retriever.add_memory(&make_memory("m1", "u1", "用户喜欢咖啡", 0.8));
         retriever.add_memory(&make_memory("m2", "u2", "用户喜欢苹果", 0.9));
 
-        let results_u1 = retriever.search("u1", "用户喜欢", 5, None);
+        let results_u1 = retriever.search("u1", "用户喜欢", 5, false, None).await;
         assert_eq!(results_u1.len(), 1);
         assert_eq!(results_u1[0].memory.id, "m1");
 
-        let results_u2 = retriever.search("u2", "用户喜欢", 5, None);
+        let results_u2 = retriever.search("u2", "用户喜欢", 5, false, None).await;
         assert_eq!(results_u2.len(), 1);
         assert_eq!(results_u2[0].memory.id, "m2");
 
-        let results_all = retriever.search("", "用户喜欢", 10, None);
+        let results_all = retriever.search("", "用户喜欢", 10, false, None).await;
         assert_eq!(results_all.len(), 2);
     }
 
-    #[test]
-    fn test_local_ranking_order() {
+    #[tokio::test]
+    async fn test_local_ranking_order() {
         let config = RetrievalConfig::default();
         let retriever = TwoStageRetriever::new(config, None);
 
@@ -559,13 +680,13 @@ mod tests {
             0.9,
         ));
 
-        let results = retriever.search("u1", "咖啡", 5, None);
+        let results = retriever.search("u1", "咖啡", 5, false, None).await;
         assert!(!results.is_empty());
         assert_eq!(results[0].memory.id, "m_high");
     }
 
-    #[test]
-    fn test_context_scene_scoring() {
+    #[tokio::test]
+    async fn test_context_scene_scoring() {
         let config = RetrievalConfig::default();
         let retriever = TwoStageRetriever::new(config, None);
 
@@ -577,11 +698,60 @@ mod tests {
             hour_of_day: -1,
         };
 
-        let results_with_ctx = retriever.search("u1", "咖啡", 5, Some(&ctx));
+        let results_with_ctx = retriever.search("u1", "咖啡", 5, false, Some(&ctx)).await;
         assert!(!results_with_ctx.is_empty());
 
-        let results_no_ctx = retriever.search("u1", "咖啡", 5, None);
+        let results_no_ctx = retriever.search("u1", "咖啡", 5, false, None).await;
         assert!(!results_no_ctx.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reranker_integration() {
+        /// 测试用的 Mock Reranker：按候选输入的逆序返回，score 固定为 0.99
+        struct ReverseReranker;
+
+        #[async_trait]
+        impl Reranker for ReverseReranker {
+            async fn rerank(
+                &self,
+                _query: &str,
+                candidates: Vec<(MemoryItem, f64)>,
+                top_k: usize,
+                _context: Option<&RetrievalContext>,
+            ) -> Vec<ScoredMemory> {
+                candidates
+                    .into_iter()
+                    .rev()
+                    .take(top_k)
+                    .map(|(memory, _)| ScoredMemory {
+                        memory,
+                        score: 0.99,
+                    })
+                    .collect()
+            }
+        }
+
+        let mut config = RetrievalConfig::default();
+        config.rerank_enabled = true;
+        config.pre_rerank_top_k = 10;
+
+        let retriever =
+            TwoStageRetriever::new(config, None).with_reranker(Arc::new(ReverseReranker));
+
+        retriever.add_memory(&make_memory("m1", "u1", "用户喜欢咖啡", 0.9));
+        retriever.add_memory(&make_memory("m2", "u1", "用户喜欢茶", 0.5));
+
+        // 无重排时按本地得分，m1 在前
+        let local_results = retriever.search("u1", "饮料", 2, false, None).await;
+        assert_eq!(local_results[0].memory.id, "m1");
+        assert_eq!(local_results[0].ranking_stage, "local_prerank");
+        assert!(local_results[0].rerank_score.is_none());
+
+        // 启用重排后 Mock 会反转顺序，m2 在前
+        let reranked_results = retriever.search("u1", "饮料", 2, true, None).await;
+        assert_eq!(reranked_results[0].memory.id, "m2");
+        assert_eq!(reranked_results[0].ranking_stage, "model_rerank");
+        assert_eq!(reranked_results[0].rerank_score, Some(0.99));
     }
 
     #[test]

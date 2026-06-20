@@ -704,17 +704,17 @@ impl RetrievalCoordinator {
 
         // 获取最近消息
         let recent_messages = if is_group {
-            match conversation_store.get_recent_by_scope(
-                "group",
-                &context.group_id,
-                recent_limit * 20,
-            ) {
+            match conversation_store
+                .get_recent_by_scope("group", &context.group_id, recent_limit * 20)
+                .await
+            {
                 Ok(msgs) => msgs,
                 Err(_) => return Vec::new(),
             }
         } else {
             match conversation_store
                 .get_recent_by_user(&context.requester_user_id, recent_limit * 20)
+                .await
             {
                 Ok(msgs) => msgs,
                 Err(_) => return Vec::new(),
