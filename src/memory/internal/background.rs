@@ -523,8 +523,8 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
         }
 
         let conversation = messages.join("\n");
-        let system_prompt = self.build_extraction_system_prompt().await;
-        let user_prompt = self.build_extraction_user_prompt(&conversation).await;
+        let system_prompt = self.build_extraction_system_prompt().await?;
+        let user_prompt = self.build_extraction_user_prompt(&conversation).await?;
 
         let chat_messages = vec![
             ChatMessage::text("system", &system_prompt),
@@ -797,7 +797,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
             .collect();
 
         let user_prompt = format!("【近期记忆】\n{}", memory_lines.join("\n"));
-        let system_prompt = self.build_insight_system_prompt().await;
+        let system_prompt = self.build_insight_system_prompt().await?;
 
         let chat_messages = vec![
             ChatMessage::text("system", &system_prompt),
@@ -1139,84 +1139,28 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
 
     // ── Prompt Building (using PromptTemplateLoader) ────────────
 
-    /// 构建记忆提取系统提示词 — 优先从模板加载，失败则兜底
-    async fn build_extraction_system_prompt(&self) -> String {
-        if let Ok(template) = self
-            .prompt_loader
+    /// 构建记忆提取系统提示词 — 从模板加载
+    async fn build_extraction_system_prompt(&self) -> XueliResult<String> {
+        self.prompt_loader
             .get_template("zh-CN", "memory_extraction")
             .await
-        {
-            return template;
-        }
-        // 兜底
-        r#"你是一个记忆提取助手。从对话中提取关于用户的有意义信息。
-
-提取规则：
-- 只提取关于用户的事实、偏好、经历或观点
-- 每条记忆应该是一句简洁的陈述
-- 记忆类型：fact（事实）、preference（偏好）、event（经历）、opinion（观点）、relationship（关系信息）
-- 重要度 0.0-1.0：1.0 表示极其重要（如姓名、关键偏好），0.5 表示一般信息
-- 如果没有值得记忆的内容，返回空列表
-
-输出 JSON 格式：
-```json
-{
-  "memories": [
-    {
-      "content": "记忆内容",
-      "memory_type": "fact|preference|event|opinion|relationship",
-      "importance": 0.8,
-      "confidence": 0.9
-    }
-  ]
-}
-```
-
-只输出 JSON，不要额外说明。"#
-        .to_string()
     }
 
-    /// 构建记忆提取用户提示词 — 优先从模板加载，失败则兜底
-    async fn build_extraction_user_prompt(&self, conversation: &str) -> String {
-        if let Ok(template) = self
+    /// 构建记忆提取用户提示词 — 从模板加载并渲染变量
+    async fn build_extraction_user_prompt(&self, conversation: &str) -> XueliResult<String> {
+        let template = self
             .prompt_loader
             .get_template("zh-CN", "memory_extraction_user")
-            .await
-        {
-            let vars = std::collections::HashMap::from([("conversation", conversation)]);
-            return self.prompt_loader.render(&template, &vars);
-        }
-        // 兜底
-        format!(
-            "请从以下对话中提取关于用户的值得记住的信息：\n\n```\n{}\n```\n\n请输出 JSON。",
-            conversation
-        )
+            .await?;
+        let vars = std::collections::HashMap::from([("conversation", conversation)]);
+        Ok(self.prompt_loader.render(&template, &vars))
     }
 
-    /// 构建 insight 消化系统提示词 — 优先从模板加载，失败则兜底
-    async fn build_insight_system_prompt(&self) -> String {
-        if let Ok(template) = self
-            .prompt_loader
+    /// 构建 insight 消化系统提示词 — 从模板加载
+    async fn build_insight_system_prompt(&self) -> XueliResult<String> {
+        self.prompt_loader
             .get_template("zh-CN", "insight_digestion")
             .await
-        {
-            return template;
-        }
-        // 兜底
-        r#"你是记忆分析助手。分析近期记忆，判断是否有可提炼的深层洞察。
-
-输出 JSON 格式：
-```json
-{
-  "has_insight": true,
-  "content": "洞察内容（一句简洁的陈述）",
-  "confidence": 0.8
-}
-```
-
-如果近期记忆中没有值得提炼的洞察，has_insight 设为 false。
-只输出 JSON，不要额外说明。"#
-            .to_string()
     }
 }
 

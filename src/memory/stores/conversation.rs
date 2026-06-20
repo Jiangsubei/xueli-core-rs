@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tokio::sync::Semaphore;
 
 use crate::prelude::XueliResult;
 
@@ -179,13 +178,11 @@ impl SessionRecord {
 }
 
 pub struct SqliteConversationStore {
-    conn: Mutex<Connection>,
     db_path: PathBuf,
-    _write_sem: Semaphore,
     /// 内存中的活跃会话缓存（session_id → SessionRecord）
-    sessions: Mutex<HashMap<String, SessionRecord>>,
+    sessions: std::sync::Mutex<HashMap<String, SessionRecord>>,
     /// dialogue_key → 活跃 session_id 的映射
-    active_session_by_dialogue: Mutex<HashMap<String, String>>,
+    active_session_by_dialogue: std::sync::Mutex<HashMap<String, String>>,
     /// 会话超时秒数
     session_timeout_seconds: u64,
 }
@@ -265,25 +262,8 @@ CREATE INDEX IF NOT EXISTS idx_gm_group_time
 CREATE INDEX IF NOT EXISTS idx_gm_message_id
     ON group_messages(message_id);
 
-CREATE TABLE IF NOT EXISTS private_messages (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id          TEXT DEFAULT '',
-    user_id             TEXT DEFAULT '',
-    display_name        TEXT DEFAULT '',
-    message_text        TEXT NOT NULL,
-    raw_text            TEXT NOT NULL,
-    image_descriptions  TEXT DEFAULT '[]',
-    message_kind        TEXT DEFAULT 'text',
-    segments            TEXT DEFAULT '[]',
-    timestamp           INTEGER NOT NULL,
-    message_id          TEXT DEFAULT '0',
-    speaker_role        TEXT DEFAULT 'user'
-);
-
-CREATE INDEX IF NOT EXISTS idx_pm_user_time
-    ON private_messages(user_id, timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_pm_message_id
-    ON private_messages(message_id);
+-- 注意：private_messages 表已移除，私聊消息统一存入 group_messages 表，
+-- 通过 group_id 字段使用 user_id 来区分私聊会话，实现私聊/群聊共用一条消息主链。
 "#;
 
 impl SqliteConversationStore {
@@ -305,48 +285,24 @@ impl SqliteConversationStore {
         conn.execute_batch(INIT_SCHEMA)
             .map_err(|e| format!("建表失败: {e}"))?;
 
+        // conn 在后续每次 spawn_blocking 中按需打开，避免在 async 路径上持有同步锁
+        drop(conn);
+
         Ok(Self {
-            conn: Mutex::new(conn),
             db_path,
-            _write_sem: Semaphore::new(5),
             sessions: Mutex::new(HashMap::new()),
             active_session_by_dialogue: Mutex::new(HashMap::new()),
             session_timeout_seconds: session_timeout_seconds.max(1),
         })
     }
 
-    pub fn insert_message(&self, record: &ConversationRecord) -> XueliResult<i64> {
-        let conn = self.conn.lock().map_err(|e| format!("锁错误: {e}"))?;
-        conn.execute(
-            "INSERT INTO conversation_messages
-             (session_id, user_id, sender_name, text, is_bot, scope_type, scope_id, event_time, message_id, platform)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                record.session_id,
-                record.user_id,
-                record.sender_name,
-                record.text,
-                record.is_bot as i32,
-                record.scope_type,
-                record.scope_id,
-                record.event_time,
-                record.message_id,
-                record.platform,
-            ],
-        )
-        .map_err(|e| format!("插入失败: {e}"))?;
+    pub async fn insert_message(&self, record: &ConversationRecord) -> XueliResult<i64> {
+        let record = record.clone();
+        let db_path = self.db_path.clone();
 
-        Ok(conn.last_insert_rowid())
-    }
-
-    pub fn insert_messages(&self, records: &[ConversationRecord]) -> XueliResult<usize> {
-        let conn = self.conn.lock().map_err(|e| format!("锁错误: {e}"))?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("事务失败: {e}"))?;
-
-        for record in records {
-            tx.execute(
+        tokio::task::spawn_blocking(move || -> XueliResult<i64> {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+            conn.execute(
                 "INSERT INTO conversation_messages
                  (session_id, user_id, sender_name, text, is_bot, scope_type, scope_id, event_time, message_id, platform)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -363,141 +319,203 @@ impl SqliteConversationStore {
                     record.platform,
                 ],
             )
-            .map_err(|e| format!("批量插入失败: {e}"))?;
-        }
+            .map_err(|e| format!("插入失败: {e}"))?;
 
-        tx.commit().map_err(|e| format!("提交事务失败: {e}"))?;
-        Ok(records.len())
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
     }
 
-    pub fn get_recent_by_session(
+    pub async fn insert_messages(&self, records: &[ConversationRecord]) -> XueliResult<usize> {
+        let records = records.to_vec();
+        let db_path = self.db_path.clone();
+        let count = records.len();
+
+        tokio::task::spawn_blocking(move || -> XueliResult<usize> {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| format!("事务失败: {e}"))?;
+
+            for record in &records {
+                tx.execute(
+                    "INSERT INTO conversation_messages
+                     (session_id, user_id, sender_name, text, is_bot, scope_type, scope_id, event_time, message_id, platform)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        record.session_id,
+                        record.user_id,
+                        record.sender_name,
+                        record.text,
+                        record.is_bot as i32,
+                        record.scope_type,
+                        record.scope_id,
+                        record.event_time,
+                        record.message_id,
+                        record.platform,
+                    ],
+                )
+                .map_err(|e| format!("批量插入失败: {e}"))?;
+            }
+
+            tx.commit().map_err(|e| format!("提交事务失败: {e}"))?;
+            Ok(count)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
+    }
+
+    pub async fn get_recent_by_session(
         &self,
         session_id: &str,
         limit: usize,
     ) -> XueliResult<Vec<ConversationRecord>> {
-        let conn = self.conn.lock().map_err(|e| format!("锁错误: {e}"))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, session_id, user_id, sender_name, text, is_bot,
-                        scope_type, scope_id, event_time, message_id, platform
-                 FROM conversation_messages
-                 WHERE session_id = ?1
-                 ORDER BY event_time DESC
-                 LIMIT ?2",
-            )
-            .map_err(|e| format!("准备查询失败: {e}"))?;
+        let session_id = session_id.to_string();
+        let db_path = self.db_path.clone();
 
-        let rows = stmt
-            .query_map(params![session_id, limit as i64], |row| {
-                Ok(ConversationRecord {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    user_id: row.get(2)?,
-                    sender_name: row.get(3)?,
-                    text: row.get(4)?,
-                    is_bot: row.get::<_, i32>(5)? != 0,
-                    scope_type: row.get(6)?,
-                    scope_id: row.get(7)?,
-                    event_time: row.get(8)?,
-                    message_id: row.get(9)?,
-                    platform: row.get(10)?,
+        tokio::task::spawn_blocking(move || -> XueliResult<Vec<ConversationRecord>> {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, session_id, user_id, sender_name, text, is_bot,
+                            scope_type, scope_id, event_time, message_id, platform
+                     FROM conversation_messages
+                     WHERE session_id = ?1
+                     ORDER BY event_time DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| format!("准备查询失败: {e}"))?;
+
+            let rows = stmt
+                .query_map(params![session_id, limit as i64], |row| {
+                    Ok(ConversationRecord {
+                        id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        user_id: row.get(2)?,
+                        sender_name: row.get(3)?,
+                        text: row.get(4)?,
+                        is_bot: row.get::<_, i32>(5)? != 0,
+                        scope_type: row.get(6)?,
+                        scope_id: row.get(7)?,
+                        event_time: row.get(8)?,
+                        message_id: row.get(9)?,
+                        platform: row.get(10)?,
+                    })
                 })
-            })
-            .map_err(|e| format!("查询失败: {e}"))?;
+                .map_err(|e| format!("查询失败: {e}"))?;
 
-        let mut records: Vec<ConversationRecord> = Vec::new();
-        for row in rows {
-            records.push(row.map_err(|e| format!("读取行失败: {e}"))?);
-        }
-        records.reverse();
-        Ok(records)
+            let mut records: Vec<ConversationRecord> = Vec::new();
+            for row in rows {
+                records.push(row.map_err(|e| format!("读取行失败: {e}"))?);
+            }
+            records.reverse();
+            Ok(records)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
     }
 
-    pub fn get_recent_by_scope(
+    pub async fn get_recent_by_scope(
         &self,
         scope_type: &str,
         scope_id: &str,
         limit: usize,
     ) -> XueliResult<Vec<ConversationRecord>> {
-        let conn = self.conn.lock().map_err(|e| format!("锁错误: {e}"))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, session_id, user_id, sender_name, text, is_bot,
-                        scope_type, scope_id, event_time, message_id, platform
-                 FROM conversation_messages
-                 WHERE scope_type = ?1 AND scope_id = ?2
-                 ORDER BY event_time DESC
-                 LIMIT ?3",
-            )
-            .map_err(|e| format!("准备查询失败: {e}"))?;
+        let scope_type = scope_type.to_string();
+        let scope_id = scope_id.to_string();
+        let db_path = self.db_path.clone();
 
-        let rows = stmt
-            .query_map(params![scope_type, scope_id, limit as i64], |row| {
-                Ok(ConversationRecord {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    user_id: row.get(2)?,
-                    sender_name: row.get(3)?,
-                    text: row.get(4)?,
-                    is_bot: row.get::<_, i32>(5)? != 0,
-                    scope_type: row.get(6)?,
-                    scope_id: row.get(7)?,
-                    event_time: row.get(8)?,
-                    message_id: row.get(9)?,
-                    platform: row.get(10)?,
+        tokio::task::spawn_blocking(move || -> XueliResult<Vec<ConversationRecord>> {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, session_id, user_id, sender_name, text, is_bot,
+                            scope_type, scope_id, event_time, message_id, platform
+                     FROM conversation_messages
+                     WHERE scope_type = ?1 AND scope_id = ?2
+                     ORDER BY event_time DESC
+                     LIMIT ?3",
+                )
+                .map_err(|e| format!("准备查询失败: {e}"))?;
+
+            let rows = stmt
+                .query_map(params![scope_type, scope_id, limit as i64], |row| {
+                    Ok(ConversationRecord {
+                        id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        user_id: row.get(2)?,
+                        sender_name: row.get(3)?,
+                        text: row.get(4)?,
+                        is_bot: row.get::<_, i32>(5)? != 0,
+                        scope_type: row.get(6)?,
+                        scope_id: row.get(7)?,
+                        event_time: row.get(8)?,
+                        message_id: row.get(9)?,
+                        platform: row.get(10)?,
+                    })
                 })
-            })
-            .map_err(|e| format!("查询失败: {e}"))?;
+                .map_err(|e| format!("查询失败: {e}"))?;
 
-        let mut records: Vec<ConversationRecord> = Vec::new();
-        for row in rows {
-            records.push(row.map_err(|e| format!("读取行失败: {e}"))?);
-        }
-        records.reverse();
-        Ok(records)
+            let mut records: Vec<ConversationRecord> = Vec::new();
+            for row in rows {
+                records.push(row.map_err(|e| format!("读取行失败: {e}"))?);
+            }
+            records.reverse();
+            Ok(records)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
     }
 
-    pub fn get_recent_by_user(
+    pub async fn get_recent_by_user(
         &self,
         user_id: &str,
         limit: usize,
     ) -> XueliResult<Vec<ConversationRecord>> {
-        let conn = self.conn.lock().map_err(|e| format!("锁错误: {e}"))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, session_id, user_id, sender_name, text, is_bot,
-                        scope_type, scope_id, event_time, message_id, platform
-                 FROM conversation_messages
-                 WHERE user_id = ?1
-                 ORDER BY event_time DESC
-                 LIMIT ?2",
-            )
-            .map_err(|e| format!("准备查询失败: {e}"))?;
+        let user_id = user_id.to_string();
+        let db_path = self.db_path.clone();
 
-        let rows = stmt
-            .query_map(params![user_id, limit as i64], |row| {
-                Ok(ConversationRecord {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    user_id: row.get(2)?,
-                    sender_name: row.get(3)?,
-                    text: row.get(4)?,
-                    is_bot: row.get::<_, i32>(5)? != 0,
-                    scope_type: row.get(6)?,
-                    scope_id: row.get(7)?,
-                    event_time: row.get(8)?,
-                    message_id: row.get(9)?,
-                    platform: row.get(10)?,
+        tokio::task::spawn_blocking(move || -> XueliResult<Vec<ConversationRecord>> {
+            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, session_id, user_id, sender_name, text, is_bot,
+                            scope_type, scope_id, event_time, message_id, platform
+                     FROM conversation_messages
+                     WHERE user_id = ?1
+                     ORDER BY event_time DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| format!("准备查询失败: {e}"))?;
+
+            let rows = stmt
+                .query_map(params![user_id, limit as i64], |row| {
+                    Ok(ConversationRecord {
+                        id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        user_id: row.get(2)?,
+                        sender_name: row.get(3)?,
+                        text: row.get(4)?,
+                        is_bot: row.get::<_, i32>(5)? != 0,
+                        scope_type: row.get(6)?,
+                        scope_id: row.get(7)?,
+                        event_time: row.get(8)?,
+                        message_id: row.get(9)?,
+                        platform: row.get(10)?,
+                    })
                 })
-            })
-            .map_err(|e| format!("查询失败: {e}"))?;
+                .map_err(|e| format!("查询失败: {e}"))?;
 
-        let mut records: Vec<ConversationRecord> = Vec::new();
-        for row in rows {
-            records.push(row.map_err(|e| format!("读取行失败: {e}"))?);
-        }
-        records.reverse();
-        Ok(records)
+            let mut records: Vec<ConversationRecord> = Vec::new();
+            for row in rows {
+                records.push(row.map_err(|e| format!("读取行失败: {e}"))?);
+            }
+            records.reverse();
+            Ok(records)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
     }
 
     pub async fn active_session_ids(&self) -> XueliResult<Vec<String>> {
@@ -1087,43 +1105,10 @@ impl SqliteConversationStore {
         .map_err(|e| format!("spawn_blocking 失败: {e}"))?
     }
 
+    /// 添加私聊消息 — 统一存入 group_messages 表，使用 user_id 作为 group_id，
+    /// 从而与群聊共用一条消息主链。
     pub async fn add_private_message(&self, user_id: &str, msg: &MessageRecord) -> XueliResult<()> {
-        let user_id = user_id.to_string();
-        let msg = msg.clone();
-        let db_path = self.db_path.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
-            let image_json =
-                serde_json::to_string(&msg.image_descriptions).unwrap_or_else(|_| "[]".to_string());
-            let segments_json =
-                serde_json::to_string(&msg.segments).unwrap_or_else(|_| "[]".to_string());
-
-            conn.execute(
-                "INSERT INTO private_messages
-                 (session_id, user_id, display_name, message_text, raw_text, image_descriptions,
-                  message_kind, segments, timestamp, message_id, speaker_role)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    "",
-                    user_id,
-                    msg.display_name,
-                    msg.message_text,
-                    msg.raw_text,
-                    image_json,
-                    msg.message_kind,
-                    segments_json,
-                    msg.timestamp,
-                    msg.message_id,
-                    msg.speaker_role,
-                ],
-            )
-            .map_err(|e| format!("插入私聊消息失败: {e}"))?;
-
-            Ok(())
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
+        self.add_group_message(user_id, msg).await
     }
 
     pub async fn get_messages_after_id(
@@ -1532,54 +1517,13 @@ impl SqliteConversationStore {
         .map_err(|e| format!("spawn_blocking 失败: {e}"))?
     }
 
-    /// 获取私聊最近消息 — 对应 Python 版 get_recent_private_messages
+    /// 获取私聊最近消息 — 统一从 group_messages 表查询，使用 user_id 作为 group_id。
     pub async fn get_recent_private_messages(
         &self,
         user_id: &str,
         limit: usize,
     ) -> XueliResult<Vec<MessageRecord>> {
-        let user_id = user_id.to_string();
-        let db_path = self.db_path.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
-            let mut stmt = conn
-                .prepare(
-                    "SELECT user_id, display_name, message_text, raw_text, image_descriptions,
-                            message_kind, segments, timestamp, message_id, speaker_role
-                     FROM private_messages
-                     WHERE user_id = ?1
-                     ORDER BY timestamp DESC
-                     LIMIT ?2",
-                )
-                .map_err(|e| format!("查询失败: {e}"))?;
-
-            let mut records: Vec<MessageRecord> = stmt
-                .query_map(params![user_id, limit as i64], |row| {
-                    let img_str: String = row.get(4)?;
-                    let seg_str: String = row.get(6)?;
-                    Ok(MessageRecord {
-                        user_id: row.get(0)?,
-                        display_name: row.get(1)?,
-                        message_text: row.get(2)?,
-                        raw_text: row.get(3)?,
-                        image_descriptions: serde_json::from_str(&img_str).unwrap_or_default(),
-                        message_kind: row.get(5)?,
-                        segments: serde_json::from_str(&seg_str).unwrap_or_default(),
-                        timestamp: row.get(7)?,
-                        message_id: row.get(8)?,
-                        speaker_role: row.get(9)?,
-                    })
-                })
-                .map_err(|e| format!("查询失败: {e}"))?
-                .filter_map(|r| r.ok())
-                .collect();
-
-            records.reverse();
-            Ok(records)
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
+        self.get_recent_group_messages(user_id, limit).await
     }
 
     /// 清除指定群的所有消息 — 对应 Python 版 clear_group_messages
@@ -1600,22 +1544,9 @@ impl SqliteConversationStore {
         .map_err(|e| format!("spawn_blocking 失败: {e}"))?
     }
 
-    /// 清除指定用户的所有私聊消息 — 对应 Python 版 clear_private_messages
+    /// 清除指定用户的所有私聊消息 — 统一从 group_messages 表删除，使用 user_id 作为 group_id。
     pub async fn clear_private_messages(&self, user_id: &str) -> XueliResult<()> {
-        let user_id = user_id.to_string();
-        let db_path = self.db_path.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {e}"))?;
-            conn.execute(
-                "DELETE FROM private_messages WHERE user_id = ?1",
-                params![user_id],
-            )
-            .map_err(|e| format!("删除私聊消息失败: {e}"))?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
+        self.clear_group_messages(user_id).await
     }
 
     /// 获取内存中所有活跃会话 ID
@@ -1658,19 +1589,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_insert_and_retrieve() {
+    #[tokio::test]
+    async fn test_insert_and_retrieve() {
         let (store, _dir) = setup_test_store();
 
         let sid = "qq:private:user1";
         store
             .insert_message(&make_record(sid, "user1", "Alice", "你好", false, 100.0))
+            .await
             .expect("插入失败");
         store
             .insert_message(&make_record(sid, "user1", "Bot", "你好呀！", true, 101.0))
+            .await
             .expect("插入失败");
 
-        let records = store.get_recent_by_session(sid, 10).expect("查询失败");
+        let records = store
+            .get_recent_by_session(sid, 10)
+            .await
+            .expect("查询失败");
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].text, "你好");
         assert!(!records[0].is_bot);
@@ -1678,8 +1614,8 @@ mod tests {
         assert!(records[1].is_bot);
     }
 
-    #[test]
-    fn test_get_recent_by_scope() {
+    #[tokio::test]
+    async fn test_get_recent_by_scope() {
         let (store, _dir) = setup_test_store();
 
         let sid_group = "qq:group:g123";
@@ -1694,7 +1630,7 @@ mod tests {
             );
             rec.scope_type = "group".to_string();
             rec.scope_id = "g123".to_string();
-            store.insert_message(&rec).expect("插入失败");
+            store.insert_message(&rec).await.expect("插入失败");
         }
 
         let sid_private = "qq:private:user1";
@@ -1707,22 +1643,24 @@ mod tests {
                 false,
                 200.0 + i as f64,
             );
-            store.insert_message(&rec).expect("插入失败");
+            store.insert_message(&rec).await.expect("插入失败");
         }
 
         let group_records = store
             .get_recent_by_scope("group", "g123", 10)
+            .await
             .expect("查询失败");
         assert_eq!(group_records.len(), 5);
 
         let private_records = store
             .get_recent_by_scope("private", "", 10)
+            .await
             .expect("查询失败");
         assert_eq!(private_records.len(), 3);
     }
 
-    #[test]
-    fn test_limit() {
+    #[tokio::test]
+    async fn test_limit() {
         let (store, _dir) = setup_test_store();
         let sid = "qq:private:user1";
 
@@ -1736,17 +1674,18 @@ mod tests {
                     false,
                     100.0 + i as f64,
                 ))
+                .await
                 .expect("插入失败");
         }
 
-        let records = store.get_recent_by_session(sid, 3).expect("查询失败");
+        let records = store.get_recent_by_session(sid, 3).await.expect("查询失败");
         assert_eq!(records.len(), 3);
         assert_eq!(records[0].text, "msg7");
         assert_eq!(records[2].text, "msg9");
     }
 
-    #[test]
-    fn test_batch_insert() {
+    #[tokio::test]
+    async fn test_batch_insert() {
         let (store, _dir) = setup_test_store();
         let sid = "qq:private:user1";
 
@@ -1763,10 +1702,13 @@ mod tests {
             })
             .collect();
 
-        let count = store.insert_messages(&records).expect("批量插入失败");
+        let count = store.insert_messages(&records).await.expect("批量插入失败");
         assert_eq!(count, 5);
 
-        let fetched = store.get_recent_by_session(sid, 10).expect("查询失败");
+        let fetched = store
+            .get_recent_by_session(sid, 10)
+            .await
+            .expect("查询失败");
         assert_eq!(fetched.len(), 5);
     }
 
@@ -1802,12 +1744,12 @@ mod tests {
             let user_msg = MessageRecord::user(
                 "user1",
                 "Alice",
-                &format!("用户消息{}", i),
+                format!("用户消息{}", i),
                 100 + i * 10,
-                &format!("msg_{}", i),
+                format!("msg_{}", i),
             );
             let assistant_msg =
-                MessageRecord::assistant(&format!("助手回复{}", i), 100 + i * 10 + 1);
+                MessageRecord::assistant(format!("助手回复{}", i), 100 + i * 10 + 1);
             store
                 .add_turn(&sid, &user_msg, &assistant_msg)
                 .await
@@ -1923,7 +1865,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_add_private_message() {
+    async fn test_add_private_message_uses_shared_chain() {
         let (store, _dir) = setup_test_store();
 
         let msg = MessageRecord::user("user1", "Alice", "私聊消息", 1000, "msg_p1");
@@ -1931,6 +1873,14 @@ mod tests {
             .add_private_message("user1", &msg)
             .await
             .expect("添加私聊消息失败");
+
+        // 私聊消息应统一存入 group_messages 主链，可通过 get_recent_private_messages 读回
+        let msgs = store
+            .get_recent_private_messages("user1", 10)
+            .await
+            .expect("查询私聊消息失败");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].message_text, "私聊消息");
     }
 
     #[tokio::test]
@@ -1941,9 +1891,9 @@ mod tests {
             let msg = MessageRecord::user(
                 "user1",
                 "Alice",
-                &format!("消息{}", i),
+                format!("消息{}", i),
                 1000 + i,
-                &format!("msg_{}", i),
+                format!("msg_{}", i),
             );
             store
                 .add_group_message("g123", &msg)

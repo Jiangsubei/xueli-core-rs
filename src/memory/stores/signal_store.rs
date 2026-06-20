@@ -1,9 +1,7 @@
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
 
 use crate::prelude::XueliResult;
 
@@ -12,7 +10,6 @@ use crate::prelude::XueliResult;
 /// 对应 Python 版 `xueli/src/memory/storage/signal_store.py`
 pub struct SignalStore {
     db_path: PathBuf,
-    lock: Arc<Mutex<()>>,
 }
 
 /// 信号的元数据（不含 payload 本体）
@@ -30,10 +27,7 @@ impl SignalStore {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
         }
 
-        let store = Self {
-            db_path,
-            lock: Arc::new(Mutex::new(())),
-        };
+        let store = Self { db_path };
         store.init_db()?;
         Ok(store)
     }
@@ -198,7 +192,6 @@ impl SignalStore {
         let expires_at = now + ttl;
 
         let db_path = self.db_path.clone();
-        let _guard = self.lock.lock().await;
 
         tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {}", e))?;
@@ -230,7 +223,6 @@ impl SignalStore {
     pub async fn cleanup_expired(&self) -> XueliResult<()> {
         let now = Self::now();
         let db_path = self.db_path.clone();
-        let _guard = self.lock.lock().await;
 
         tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {}", e))?;
@@ -251,7 +243,6 @@ impl SignalStore {
 
         let db_path = self.db_path.clone();
         let key = key.to_string();
-        let _guard = self.lock.lock().await;
 
         tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {}", e))?;
@@ -272,7 +263,6 @@ impl SignalStore {
 
         let db_path = self.db_path.clone();
         let like_pattern = format!("{}%", normalized);
-        let _guard = self.lock.lock().await;
 
         tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&db_path).map_err(|e| format!("打开 DB 失败: {}", e))?;

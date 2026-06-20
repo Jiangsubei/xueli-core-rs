@@ -425,23 +425,28 @@ impl SqliteMemoryItemStore {
     }
 
     pub async fn get_by_id(&self, id: &str) -> XueliResult<Option<MemoryItem>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, user_id, content, memory_type, importance, created_at, last_accessed_at, access_count
-                 FROM memory_items WHERE id = ?1",
-            )
-            .map_err(|e| XueliError::Database(format!("准备查询失败: {e}")))?;
+        let id = id.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<Option<MemoryItem>> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, user_id, content, memory_type, importance, created_at, last_accessed_at, access_count
+                     FROM memory_items WHERE id = ?1",
+                )
+                .map_err(|e| XueliError::Database(format!("准备查询失败: {e}")))?;
 
-        let result = stmt
-            .query_row(params![id], row_to_memory_item)
-            .optional()
-            .map_err(|e| XueliError::Database(format!("查询失败: {e}")))?;
+            let result = stmt
+                .query_row(params![id], row_to_memory_item)
+                .optional()
+                .map_err(|e| XueliError::Database(format!("查询失败: {e}")))?;
 
-        Ok(result)
+            Ok(result)
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
     }
 
     pub async fn get_effective_importance(&self, mem_id: &str) -> XueliResult<f64> {
@@ -1148,44 +1153,13 @@ impl SqliteMemoryItemStore {
 impl MemoryStore for SqliteMemoryItemStore {
     async fn store(&self, item: MemoryItem) -> XueliResult<String> {
         let id = item.id.clone();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<String> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
 
-        conn.execute(
-            "INSERT OR REPLACE INTO memory_items
-             (id, user_id, content, memory_type, importance, created_at, last_accessed_at, access_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                item.id,
-                item.user_id,
-                item.content,
-                memory_type_to_str(&item.memory_type),
-                item.importance,
-                item.created_at.to_rfc3339(),
-                item.last_accessed_at.to_rfc3339(),
-                item.access_count as i64,
-            ],
-        )
-        .map_err(|e| XueliError::Database(format!("插入失败: {e}")))?;
-
-        Ok(id)
-    }
-
-    async fn store_batch(&self, items: Vec<MemoryItem>) -> XueliResult<Vec<String>> {
-        let mut ids = Vec::with_capacity(items.len());
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| XueliError::Database(format!("事务失败: {e}")))?;
-
-        for item in &items {
-            ids.push(item.id.clone());
-            tx.execute(
+            conn.execute(
                 "INSERT OR REPLACE INTO memory_items
                  (id, user_id, content, memory_type, importance, created_at, last_accessed_at, access_count)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -1200,120 +1174,183 @@ impl MemoryStore for SqliteMemoryItemStore {
                     item.access_count as i64,
                 ],
             )
-            .map_err(|e| XueliError::Database(format!("批量插入失败: {e}")))?;
-        }
+            .map_err(|e| XueliError::Database(format!("插入失败: {e}")))?;
 
-        tx.commit()
-            .map_err(|e| XueliError::Database(format!("提交事务失败: {e}")))?;
-        Ok(ids)
+            Ok(id)
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
+    }
+
+    async fn store_batch(&self, items: Vec<MemoryItem>) -> XueliResult<Vec<String>> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<Vec<String>> {
+            let mut ids = Vec::with_capacity(items.len());
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| XueliError::Database(format!("事务失败: {e}")))?;
+
+            for item in &items {
+                ids.push(item.id.clone());
+                tx.execute(
+                    "INSERT OR REPLACE INTO memory_items
+                     (id, user_id, content, memory_type, importance, created_at, last_accessed_at, access_count)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        item.id,
+                        item.user_id,
+                        item.content,
+                        memory_type_to_str(&item.memory_type),
+                        item.importance,
+                        item.created_at.to_rfc3339(),
+                        item.last_accessed_at.to_rfc3339(),
+                        item.access_count as i64,
+                    ],
+                )
+                .map_err(|e| XueliError::Database(format!("批量插入失败: {e}")))?;
+            }
+
+            tx.commit()
+                .map_err(|e| XueliError::Database(format!("提交事务失败: {e}")))?;
+            Ok(ids)
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
     }
 
     async fn get(&self, id: &str) -> XueliResult<Option<MemoryItem>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, user_id, content, memory_type, importance, created_at, last_accessed_at, access_count
-                 FROM memory_items WHERE id = ?1",
-            )
-            .map_err(|e| XueliError::Database(format!("准备查询失败: {e}")))?;
+        let id = id.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<Option<MemoryItem>> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, user_id, content, memory_type, importance, created_at, last_accessed_at, access_count
+                     FROM memory_items WHERE id = ?1",
+                )
+                .map_err(|e| XueliError::Database(format!("准备查询失败: {e}")))?;
 
-        let result = stmt
-            .query_row(params![id], row_to_memory_item)
-            .optional()
-            .map_err(|e| XueliError::Database(format!("查询失败: {e}")))?;
+            let result = stmt
+                .query_row(params![id], row_to_memory_item)
+                .optional()
+                .map_err(|e| XueliError::Database(format!("查询失败: {e}")))?;
 
-        Ok(result)
+            Ok(result)
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
     }
 
     async fn get_by_user(&self, user_id: &str) -> XueliResult<Vec<MemoryItem>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, user_id, content, memory_type, importance, created_at, last_accessed_at, access_count
-                 FROM memory_items WHERE user_id = ?1 ORDER BY created_at DESC",
-            )
-            .map_err(|e| XueliError::Database(format!("准备查询失败: {e}")))?;
+        let user_id = user_id.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<Vec<MemoryItem>> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, user_id, content, memory_type, importance, created_at, last_accessed_at, access_count
+                     FROM memory_items WHERE user_id = ?1 ORDER BY created_at DESC",
+                )
+                .map_err(|e| XueliError::Database(format!("准备查询失败: {e}")))?;
 
-        let rows = stmt
-            .query_map(params![user_id], row_to_memory_item)
-            .map_err(|e| XueliError::Database(format!("查询失败: {e}")))?;
+            let rows = stmt
+                .query_map(params![user_id], row_to_memory_item)
+                .map_err(|e| XueliError::Database(format!("查询失败: {e}")))?;
 
-        let mut items = Vec::new();
-        for row in rows {
-            items.push(row.map_err(|e| XueliError::Database(format!("读取行失败: {e}")))?);
-        }
-        Ok(items)
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row.map_err(|e| XueliError::Database(format!("读取行失败: {e}")))?);
+            }
+            Ok(items)
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
     }
 
     async fn update(&self, item: MemoryItem) -> XueliResult<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
-        let affected = conn
-            .execute(
-                "UPDATE memory_items SET
-                    content = ?2,
-                    memory_type = ?3,
-                    importance = ?4,
-                    last_accessed_at = ?5,
-                    access_count = ?6
-                 WHERE id = ?1",
-                params![
-                    item.id,
-                    item.content,
-                    memory_type_to_str(&item.memory_type),
-                    item.importance,
-                    item.last_accessed_at.to_rfc3339(),
-                    item.access_count as i64,
-                ],
-            )
-            .map_err(|e| XueliError::Database(format!("更新失败: {e}")))?;
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<()> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            let affected = conn
+                .execute(
+                    "UPDATE memory_items SET
+                        content = ?2,
+                        memory_type = ?3,
+                        importance = ?4,
+                        last_accessed_at = ?5,
+                        access_count = ?6
+                     WHERE id = ?1",
+                    params![
+                        item.id,
+                        item.content,
+                        memory_type_to_str(&item.memory_type),
+                        item.importance,
+                        item.last_accessed_at.to_rfc3339(),
+                        item.access_count as i64,
+                    ],
+                )
+                .map_err(|e| XueliError::Database(format!("更新失败: {e}")))?;
 
-        if affected == 0 {
-            return Err(XueliError::Database(format!("未找到记忆: {}", item.id)));
-        }
-        Ok(())
+            if affected == 0 {
+                return Err(XueliError::Database(format!("未找到记忆: {}", item.id)));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
     }
 
     async fn delete(&self, id: &str) -> XueliResult<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
-        conn.execute("DELETE FROM memory_items WHERE id = ?1", params![id])
-            .map_err(|e| XueliError::Database(format!("删除失败: {e}")))?;
-        Ok(())
+        let id = id.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<()> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            conn.execute("DELETE FROM memory_items WHERE id = ?1", params![id])
+                .map_err(|e| XueliError::Database(format!("删除失败: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
     }
 
     async fn search(&self, query: &str, limit: usize) -> XueliResult<Vec<MemoryItem>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
-        let pattern = format!("%{}%", query);
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, user_id, content, memory_type, importance, created_at, last_accessed_at, access_count
-                 FROM memory_items WHERE content LIKE ?1 ORDER BY importance DESC LIMIT ?2",
-            )
-            .map_err(|e| XueliError::Database(format!("准备查询失败: {e}")))?;
+        let query = query.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<Vec<MemoryItem>> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            let pattern = format!("%{}%", query);
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, user_id, content, memory_type, importance, created_at, last_accessed_at, access_count
+                     FROM memory_items WHERE content LIKE ?1 ORDER BY importance DESC LIMIT ?2",
+                )
+                .map_err(|e| XueliError::Database(format!("准备查询失败: {e}")))?;
 
-        let rows = stmt
-            .query_map(params![pattern, limit as i64], row_to_memory_item)
-            .map_err(|e| XueliError::Database(format!("搜索失败: {e}")))?;
+            let rows = stmt
+                .query_map(params![pattern, limit as i64], row_to_memory_item)
+                .map_err(|e| XueliError::Database(format!("搜索失败: {e}")))?;
 
-        let mut items = Vec::new();
-        for row in rows {
-            items.push(row.map_err(|e| XueliError::Database(format!("读取行失败: {e}")))?);
-        }
-        Ok(items)
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row.map_err(|e| XueliError::Database(format!("读取行失败: {e}")))?);
+            }
+            Ok(items)
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
     }
 }
 

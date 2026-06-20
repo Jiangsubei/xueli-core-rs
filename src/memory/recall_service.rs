@@ -91,9 +91,10 @@ impl ConversationRecallService {
             return Ok(vec![]);
         }
 
-        let records =
-            self.store
-                .get_recent_by_scope("private", user_id, self.recent_session_limit)?;
+        let records = self
+            .store
+            .get_recent_by_scope("private", user_id, self.recent_session_limit)
+            .await?;
 
         let mut matches: Vec<ScoredTurn> = Vec::new();
         for record in records.iter().rev() {

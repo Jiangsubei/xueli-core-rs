@@ -35,7 +35,7 @@ pub struct MemoryFlowService<L: PromptTemplateLoader + 'static> {
     // Phase 1.1: LLM 服务注入
     extractor: Option<Arc<MemoryExtractor<dyn AIClient, L>>>,
     background_coordinator: Option<Arc<MemoryBackgroundCoordinator<L>>>,
-    memory_reflection: Option<Arc<MemoryReflection<dyn AIClient>>>,
+    memory_reflection: Option<Arc<MemoryReflection<dyn AIClient, L>>>,
 
     // Phase 1.2: 角色成长/亲密度/叙事
     character_card_service: Option<Arc<CharacterCardService>>,
@@ -119,7 +119,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryFlowService<L> {
     /// 设置记忆反思
     pub fn with_memory_reflection(
         mut self,
-        reflection: Arc<MemoryReflection<dyn AIClient>>,
+        reflection: Arc<MemoryReflection<dyn AIClient, L>>,
     ) -> Self {
         self.memory_reflection = Some(reflection);
         self

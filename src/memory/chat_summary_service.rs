@@ -111,7 +111,7 @@ impl ChatSummaryService {
         session_id: &str,
         _user_id: &str,
     ) -> XueliResult<Option<String>> {
-        let records = store.get_recent_by_session(session_id, 1000)?;
+        let records = store.get_recent_by_session(session_id, 1000).await?;
         if records.is_empty() {
             return Ok(None);
         }

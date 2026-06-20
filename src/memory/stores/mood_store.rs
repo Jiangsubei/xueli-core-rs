@@ -1,8 +1,6 @@
 use chrono::Utc;
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use crate::core::types::MoodState;
 use crate::prelude::XueliResult;
@@ -13,7 +11,6 @@ use crate::prelude::XueliResult;
 /// Python 原版使用 JSON 文件，本项目改为 SQLite 存储。
 pub struct MoodStore {
     db_path: PathBuf,
-    lock: Arc<Mutex<()>>,
 }
 
 impl MoodStore {
@@ -23,10 +20,7 @@ impl MoodStore {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
         }
 
-        let store = Self {
-            db_path,
-            lock: Arc::new(Mutex::new(())),
-        };
+        let store = Self { db_path };
         store.init_db()?;
         Ok(store)
     }
@@ -140,8 +134,6 @@ impl MoodStore {
         let arousal = state.arousal;
         let energy = state.energy;
         let updated_at = updated_at.to_string();
-
-        let _guard = self.lock.lock().await;
 
         let result: XueliResult<()> = tokio::task::spawn_blocking(move || {
             let conn =

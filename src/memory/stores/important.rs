@@ -161,30 +161,34 @@ impl ImportantMemoryStore {
     }
 
     pub async fn mark(&self, entry: ImportantMemory) -> XueliResult<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
-        conn.execute(
-            "INSERT OR REPLACE INTO important_memories
-             (id, user_id, content, priority, score, created_at, updated_at, source, metadata_json, recall_count, last_recalled_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                entry.id,
-                entry.user_id,
-                entry.content,
-                entry.priority,
-                entry.score,
-                entry.created_at.to_rfc3339(),
-                entry.updated_at.to_rfc3339(),
-                entry.source,
-                entry.metadata_json,
-                entry.recall_count,
-                entry.last_recalled_at.map(|t| t.to_rfc3339()),
-            ],
-        )
-        .map_err(|e| XueliError::Database(format!("标记失败: {e}")))?;
-        Ok(())
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<()> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            conn.execute(
+                "INSERT OR REPLACE INTO important_memories
+                 (id, user_id, content, priority, score, created_at, updated_at, source, metadata_json, recall_count, last_recalled_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    entry.id,
+                    entry.user_id,
+                    entry.content,
+                    entry.priority,
+                    entry.score,
+                    entry.created_at.to_rfc3339(),
+                    entry.updated_at.to_rfc3339(),
+                    entry.source,
+                    entry.metadata_json,
+                    entry.recall_count,
+                    entry.last_recalled_at.map(|t| t.to_rfc3339()),
+                ],
+            )
+            .map_err(|e| XueliError::Database(format!("标记失败: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
     }
 
     pub async fn get_important(
@@ -193,43 +197,52 @@ impl ImportantMemoryStore {
         limit: usize,
     ) -> XueliResult<Vec<ImportantMemory>> {
         let user_id = user_id.to_string();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, user_id, content, priority, score, created_at, updated_at, source,
-                        metadata_json, recall_count, last_recalled_at
-                 FROM important_memories
-                 WHERE user_id = ?1
-                 ORDER BY score DESC, priority DESC
-                 LIMIT ?2",
-            )
-            .map_err(|e| XueliError::Database(format!("准备查询失败: {e}")))?;
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<Vec<ImportantMemory>> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, user_id, content, priority, score, created_at, updated_at, source,
+                            metadata_json, recall_count, last_recalled_at
+                     FROM important_memories
+                     WHERE user_id = ?1
+                     ORDER BY score DESC, priority DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| XueliError::Database(format!("准备查询失败: {e}")))?;
 
-        let rows = stmt
-            .query_map(params![user_id, limit as i64], row_to_important_memory)
-            .map_err(|e| XueliError::Database(format!("查询失败: {e}")))?;
+            let rows = stmt
+                .query_map(params![user_id, limit as i64], row_to_important_memory)
+                .map_err(|e| XueliError::Database(format!("查询失败: {e}")))?;
 
-        let mut items = Vec::new();
-        for row in rows {
-            items.push(row.map_err(|e| XueliError::Database(format!("读取行失败: {e}")))?);
-        }
-        Ok(items)
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row.map_err(|e| XueliError::Database(format!("读取行失败: {e}")))?);
+            }
+            Ok(items)
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
     }
 
     pub async fn unmark(&self, memory_id: &str) -> XueliResult<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
-        conn.execute(
-            "DELETE FROM important_memories WHERE id = ?1",
-            params![memory_id],
-        )
-        .map_err(|e| XueliError::Database(format!("取消标记失败: {e}")))?;
-        Ok(())
+        let memory_id = memory_id.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<()> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            conn.execute(
+                "DELETE FROM important_memories WHERE id = ?1",
+                params![memory_id],
+            )
+            .map_err(|e| XueliError::Database(format!("取消标记失败: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
     }
 
     pub async fn add_memory(
@@ -249,91 +262,106 @@ impl ImportantMemoryStore {
         let priority = priority.max(1);
         let metadata_json = metadata_json.unwrap_or("{}").to_string();
         let now = Utc::now();
+        let conn = Arc::clone(&self.conn);
 
-        // 去重检查
-        let existing = self.get_memories(&user_id, 1).await?;
-        for mem in &existing {
-            if is_same_memory(&mem.content, &content) {
-                // 合并：保留较高优先级和较长内容
-                let new_priority = mem.priority.max(priority);
-                let new_content = if content.len() > mem.content.len() {
-                    content.clone()
-                } else {
-                    mem.content.clone()
-                };
-                let new_source = if source.is_empty() || mem.source == "unknown" {
-                    source.clone()
-                } else {
-                    mem.source.clone()
-                };
-                // 更新现有记录
-                let conn = Arc::clone(&self.conn);
-                let mem_id = mem.id.clone();
-                let now_iso = now.to_rfc3339();
-                let new_content_clone = new_content.clone();
-                let new_source_clone = new_source.clone();
-                tokio::task::spawn_blocking(move || -> XueliResult<()> {
-                    let conn = conn.lock().map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+        tokio::task::spawn_blocking(move || -> XueliResult<Option<ImportantMemory>> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+
+            // 去重检查
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, user_id, content, priority, score, created_at, updated_at, source,
+                            metadata_json, recall_count, last_recalled_at
+                     FROM important_memories
+                     WHERE user_id = ?1 AND priority >= 1
+                     ORDER BY priority DESC, created_at DESC",
+                )
+                .map_err(|e| XueliError::Database(format!("准备查询失败: {e}")))?;
+            let existing: Vec<ImportantMemory> = stmt
+                .query_map(params![user_id], row_to_important_memory)
+                .map_err(|e| XueliError::Database(format!("查询失败: {e}")))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            for mem in &existing {
+                if is_same_memory(&mem.content, &content) {
+                    let new_priority = mem.priority.max(priority);
+                    let new_content = if content.len() > mem.content.len() {
+                        content.clone()
+                    } else {
+                        mem.content.clone()
+                    };
+                    let new_source = if source.is_empty() || mem.source == "unknown" {
+                        source.clone()
+                    } else {
+                        mem.source.clone()
+                    };
+                    let now_iso = now.to_rfc3339();
                     conn.execute(
                         "UPDATE important_memories SET content=?1, source=?2, priority=?3, updated_at=?4 WHERE id=?5",
-                        params![new_content_clone, new_source_clone, new_priority, now_iso, mem_id],
+                        params![new_content, new_source, new_priority, now_iso, mem.id],
                     )
                     .map_err(|e| XueliError::Database(format!("更新失败: {e}")))?;
-                    Ok(())
-                })
-                .await
-                .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))??;
-                return Ok(Some(ImportantMemory {
-                    id: mem.id.clone(),
-                    user_id: user_id.clone(),
-                    content: new_content,
-                    priority: new_priority,
-                    score: mem.score,
-                    created_at: mem.created_at,
-                    updated_at: now,
-                    source: new_source,
-                    metadata_json: mem.metadata_json.clone(),
-                    recall_count: mem.recall_count,
-                    last_recalled_at: mem.last_recalled_at,
-                }));
+                    return Ok(Some(ImportantMemory {
+                        id: mem.id.clone(),
+                        user_id: user_id.clone(),
+                        content: new_content,
+                        priority: new_priority,
+                        score: mem.score,
+                        created_at: mem.created_at,
+                        updated_at: now,
+                        source: new_source,
+                        metadata_json: mem.metadata_json.clone(),
+                        recall_count: mem.recall_count,
+                        last_recalled_at: mem.last_recalled_at,
+                    }));
+                }
             }
-        }
 
-        // 新建记忆
-        let mem_id = format!(
-            "imp_{}_{:04x}",
-            now.format("%Y%m%d%H%M%S"),
-            (content.len() as u16)
-        );
+            // 新建记忆
+            let mem_id = format!(
+                "imp_{}_{:04x}",
+                now.format("%Y%m%d%H%M%S"),
+                (content.len() as u16)
+            );
+            conn.execute(
+                "INSERT INTO important_memories
+                 (id, user_id, content, priority, score, created_at, updated_at, source, metadata_json, recall_count, last_recalled_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    mem_id,
+                    user_id,
+                    content,
+                    priority,
+                    0.0,
+                    now.to_rfc3339(),
+                    now.to_rfc3339(),
+                    source,
+                    metadata_json,
+                    0,
+                    None::<String>,
+                ],
+            )
+            .map_err(|e| XueliError::Database(format!("插入失败: {e}")))?;
 
-        let entry = ImportantMemory {
-            id: mem_id.clone(),
-            user_id: user_id.clone(),
-            content: content.clone(),
-            priority,
-            score: 0.0,
-            created_at: now,
-            updated_at: now,
-            source: source.clone(),
-            metadata_json: metadata_json.clone(),
-            recall_count: 0,
-            last_recalled_at: None,
-        };
-
-        self.mark(entry).await?;
-        Ok(Some(ImportantMemory {
-            id: mem_id,
-            user_id,
-            content,
-            priority,
-            score: 0.0,
-            created_at: now,
-            updated_at: now,
-            source,
-            metadata_json,
-            recall_count: 0,
-            last_recalled_at: None,
-        }))
+            Ok(Some(ImportantMemory {
+                id: mem_id,
+                user_id,
+                content: content.clone(),
+                priority,
+                score: 0.0,
+                created_at: now,
+                updated_at: now,
+                source: source.clone(),
+                metadata_json: metadata_json.clone(),
+                recall_count: 0,
+                last_recalled_at: None,
+            }))
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
     }
 
     pub async fn get_memories(
@@ -342,29 +370,33 @@ impl ImportantMemoryStore {
         min_priority: i32,
     ) -> XueliResult<Vec<ImportantMemory>> {
         let user_id = user_id.to_string();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, user_id, content, priority, score, created_at, updated_at, source,
-                        metadata_json, recall_count, last_recalled_at
-                 FROM important_memories
-                 WHERE user_id = ?1 AND priority >= ?2
-                 ORDER BY priority DESC, created_at DESC",
-            )
-            .map_err(|e| XueliError::Database(format!("准备查询失败: {e}")))?;
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<Vec<ImportantMemory>> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, user_id, content, priority, score, created_at, updated_at, source,
+                            metadata_json, recall_count, last_recalled_at
+                     FROM important_memories
+                     WHERE user_id = ?1 AND priority >= ?2
+                     ORDER BY priority DESC, created_at DESC",
+                )
+                .map_err(|e| XueliError::Database(format!("准备查询失败: {e}")))?;
 
-        let rows = stmt
-            .query_map(params![user_id, min_priority], row_to_important_memory)
-            .map_err(|e| XueliError::Database(format!("查询失败: {e}")))?;
+            let rows = stmt
+                .query_map(params![user_id, min_priority], row_to_important_memory)
+                .map_err(|e| XueliError::Database(format!("查询失败: {e}")))?;
 
-        let mut items = Vec::new();
-        for row in rows {
-            items.push(row.map_err(|e| XueliError::Database(format!("读取行失败: {e}")))?);
-        }
-        Ok(items)
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row.map_err(|e| XueliError::Database(format!("读取行失败: {e}")))?);
+            }
+            Ok(items)
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
     }
 
     pub async fn search_memories(

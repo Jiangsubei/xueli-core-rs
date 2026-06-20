@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::prelude::XueliResult;
 
@@ -21,7 +21,7 @@ pub struct PersonFact {
 
 /// SQLite 人物事实存储
 pub struct SqlitePersonFactStore {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 const INIT_SCHEMA: &str = "
@@ -78,52 +78,63 @@ impl SqlitePersonFactStore {
             .map_err(|e| format!("建表失败: {e}"))?;
 
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         })
     }
 
     /// 存储人物事实
     pub async fn store(&self, fact: PersonFact) -> XueliResult<String> {
         let id = fact.id.clone();
-        let conn = self.conn.lock().map_err(|e| format!("锁错误: {e}"))?;
-        conn.execute(
-            "INSERT OR REPLACE INTO person_facts
-             (id, user_id, fact_text, category, confidence, source_conversation_id, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                fact.id,
-                fact.user_id,
-                fact.fact_text,
-                fact.category,
-                fact.confidence,
-                fact.source_conversation_id,
-                fact.created_at.to_rfc3339(),
-                fact.updated_at.to_rfc3339(),
-            ],
-        )
-        .map_err(|e| format!("插入失败: {e}"))?;
-        Ok(id)
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<String> {
+            let conn = conn.lock().map_err(|e| format!("锁错误: {e}"))?;
+            conn.execute(
+                "INSERT OR REPLACE INTO person_facts
+                 (id, user_id, fact_text, category, confidence, source_conversation_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    fact.id,
+                    fact.user_id,
+                    fact.fact_text,
+                    fact.category,
+                    fact.confidence,
+                    fact.source_conversation_id,
+                    fact.created_at.to_rfc3339(),
+                    fact.updated_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|e| format!("插入失败: {e}"))?;
+            Ok(id)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
     }
 
     /// 按用户查询人物事实
     pub async fn get_by_user(&self, user_id: &str) -> XueliResult<Vec<PersonFact>> {
-        let conn = self.conn.lock().map_err(|e| format!("锁错误: {e}"))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, user_id, fact_text, category, confidence, source_conversation_id, created_at, updated_at
-                 FROM person_facts WHERE user_id = ?1 ORDER BY confidence DESC",
-            )
-            .map_err(|e| format!("准备查询失败: {e}"))?;
+        let user_id = user_id.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<Vec<PersonFact>> {
+            let conn = conn.lock().map_err(|e| format!("锁错误: {e}"))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, user_id, fact_text, category, confidence, source_conversation_id, created_at, updated_at
+                     FROM person_facts WHERE user_id = ?1 ORDER BY confidence DESC",
+                )
+                .map_err(|e| format!("准备查询失败: {e}"))?;
 
-        let rows = stmt
-            .query_map(params![user_id], row_to_person_fact)
-            .map_err(|e| format!("查询失败: {e}"))?;
+            let rows = stmt
+                .query_map(params![user_id], row_to_person_fact)
+                .map_err(|e| format!("查询失败: {e}"))?;
 
-        let mut facts = Vec::new();
-        for row in rows {
-            facts.push(row.map_err(|e| format!("读取行失败: {e}"))?);
-        }
-        Ok(facts)
+            let mut facts = Vec::new();
+            for row in rows {
+                facts.push(row.map_err(|e| format!("读取行失败: {e}"))?);
+            }
+            Ok(facts)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
     }
 
     /// 按分类查询人物事实
@@ -132,31 +143,44 @@ impl SqlitePersonFactStore {
         user_id: &str,
         category: &str,
     ) -> XueliResult<Vec<PersonFact>> {
-        let conn = self.conn.lock().map_err(|e| format!("锁错误: {e}"))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, user_id, fact_text, category, confidence, source_conversation_id, created_at, updated_at
-                 FROM person_facts WHERE user_id = ?1 AND category = ?2 ORDER BY confidence DESC",
-            )
-            .map_err(|e| format!("准备查询失败: {e}"))?;
+        let user_id = user_id.to_string();
+        let category = category.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<Vec<PersonFact>> {
+            let conn = conn.lock().map_err(|e| format!("锁错误: {e}"))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, user_id, fact_text, category, confidence, source_conversation_id, created_at, updated_at
+                     FROM person_facts WHERE user_id = ?1 AND category = ?2 ORDER BY confidence DESC",
+                )
+                .map_err(|e| format!("准备查询失败: {e}"))?;
 
-        let rows = stmt
-            .query_map(params![user_id, category], row_to_person_fact)
-            .map_err(|e| format!("查询失败: {e}"))?;
+            let rows = stmt
+                .query_map(params![user_id, category], row_to_person_fact)
+                .map_err(|e| format!("查询失败: {e}"))?;
 
-        let mut facts = Vec::new();
-        for row in rows {
-            facts.push(row.map_err(|e| format!("读取行失败: {e}"))?);
-        }
-        Ok(facts)
+            let mut facts = Vec::new();
+            for row in rows {
+                facts.push(row.map_err(|e| format!("读取行失败: {e}"))?);
+            }
+            Ok(facts)
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
     }
 
     /// 删除人物事实
     pub async fn delete(&self, id: &str) -> XueliResult<()> {
-        let conn = self.conn.lock().map_err(|e| format!("锁错误: {e}"))?;
-        conn.execute("DELETE FROM person_facts WHERE id = ?1", params![id])
-            .map_err(|e| format!("删除失败: {e}"))?;
-        Ok(())
+        let id = id.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<()> {
+            let conn = conn.lock().map_err(|e| format!("锁错误: {e}"))?;
+            conn.execute("DELETE FROM person_facts WHERE id = ?1", params![id])
+                .map_err(|e| format!("删除失败: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking 失败: {e}"))?
     }
 }
 
