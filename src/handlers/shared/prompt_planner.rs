@@ -195,6 +195,31 @@ impl PromptPlanner {
                 &["plain", "colloquial", "companion"],
                 &default_plan.expression_profile,
             ),
+            personality_mode: Self::normalize_choice(
+                raw_plan.get("personality_mode").and_then(|v| v.as_str()),
+                &["balanced", "playful", "serious", "warm", "reserved"],
+                &default_plan.personality_mode,
+            ),
+            conversation_style: Self::normalize_choice(
+                raw_plan.get("conversation_style").and_then(|v| v.as_str()),
+                &["standard", "casual", "formal", "intimate", "distant"],
+                &default_plan.conversation_style,
+            ),
+            mood_instruction: raw_plan
+                .get("mood_instruction")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or(default_plan.mood_instruction),
+            planner_reminder: raw_plan
+                .get("planner_reminder")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or(default_plan.planner_reminder),
+            emoji_instruction: raw_plan
+                .get("emoji_instruction")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or(default_plan.emoji_instruction),
             policy,
             notes: raw_plan
                 .get("notes")
@@ -356,6 +381,11 @@ impl PromptPlanner {
             tone_profile: tone_profile.to_string(),
             initiative: initiative.to_string(),
             expression_profile: expression_profile.to_string(),
+            personality_mode: "balanced".to_string(),
+            conversation_style: "standard".to_string(),
+            mood_instruction: String::new(),
+            planner_reminder: String::new(),
+            emoji_instruction: String::new(),
             policy,
             notes,
             emoji_should_send: false,

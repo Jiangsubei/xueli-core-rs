@@ -6,13 +6,15 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::config::XueliConfig;
 use crate::core::metrics::RuntimeMetrics;
+use crate::core::platform_types::InboundEvent;
 use crate::handlers::command::registry::{CommandContext, CommandRegistry, CommandSpec};
+use crate::handlers::session_manager::ConversationSessionManager;
 
 /// 状态提供者：返回当前运行状态键值对
 pub type StatusProvider = Arc<dyn Fn() -> HashMap<String, serde_json::Value> + Send + Sync>;
 
 /// 重置回调：清空指定事件的会话上下文
-pub type ResetCallback = Arc<dyn Fn(&str) + Send + Sync>;
+pub type ResetCallback = Arc<dyn Fn(&InboundEvent) + Send + Sync>;
 
 /// 命令处理器
 ///
@@ -26,18 +28,18 @@ pub struct CommandHandler {
     metrics: Option<Arc<Mutex<RuntimeMetrics>>>,
     config: Arc<XueliConfig>,
     reset_callback: Option<ResetCallback>,
-    /// 会话计数回调（可选，由下游注入）
-    active_session_counter: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    session_manager: Arc<ConversationSessionManager>,
 }
 
 impl CommandHandler {
     pub fn new(
         config: Arc<XueliConfig>,
+        session_manager: Arc<ConversationSessionManager>,
         metrics: Option<Arc<Mutex<RuntimeMetrics>>>,
         reset_callback: Option<ResetCallback>,
     ) -> Self {
         let mut registry = CommandRegistry::new();
-        // 注册内置命令时先用占位 execute，后续在 set_self_references 中替换
+        // 注册内置命令时先用占位 execute，后续在 init_builtins 中替换
         let help_spec = make_builtin_help_spec();
         let status_spec = make_builtin_status_spec();
         let reset_spec = make_builtin_reset_spec();
@@ -51,7 +53,7 @@ impl CommandHandler {
             metrics,
             config,
             reset_callback,
-            active_session_counter: None,
+            session_manager,
         }
     }
 
@@ -78,24 +80,45 @@ impl CommandHandler {
         self.status_provider = Some(provider);
     }
 
-    pub fn set_active_session_counter(&mut self, counter: Arc<dyn Fn() -> usize + Send + Sync>) {
-        self.active_session_counter = Some(counter);
-    }
-
     /// 处理命令文本，返回响应文本或 None（表示不匹配任何命令）
-    pub fn handle(&self, text: &str) -> Option<String> {
-        let reg = self.registry.lock().unwrap();
-        let spec = reg.r#match(text)?;
+    pub fn handle(&self, text: &str, event: &InboundEvent) -> Option<String> {
+        let (name, is_builtin) = {
+            let reg = self.registry.lock().unwrap();
+            let spec = reg.r#match(text)?;
+            (spec.name.clone(), reg.is_builtin(&spec.name))
+        };
 
         // 记录命令命中
         if let Some(ref metrics) = self.metrics {
             if let Ok(m) = metrics.lock() {
-                m.record_reply_sent(0.0);
+                m.record_command_hit(&name);
             }
         }
 
+        // 内置命令直接分发，避免闭包需要自引用
+        if is_builtin {
+            return Some(match name.as_str() {
+                "/help" => self.get_help_text(),
+                "/status" => self.get_status_text(),
+                "/reset" => self.execute_reset_for_event(event),
+                _ => {
+                    // 理论上不会进入此分支，兜底调用注册表执行体
+                    let reg = self.registry.lock().unwrap();
+                    let spec = reg.r#match(text)?;
+                    let ctx = CommandContext {
+                        raw_text: text.to_string(),
+                        event: Some(event.clone()),
+                    };
+                    (spec.execute)(&ctx)
+                }
+            });
+        }
+
+        let reg = self.registry.lock().unwrap();
+        let spec = reg.r#match(text)?;
         let ctx = CommandContext {
             raw_text: text.to_string(),
+            event: Some(event.clone()),
         };
         Some((spec.execute)(&ctx))
     }
@@ -117,21 +140,23 @@ impl CommandHandler {
     pub fn get_status_text(&self) -> String {
         let status = self.snapshot_status();
         let assistant_name = self.assistant_name();
-        let active_sessions = self
-            .active_session_counter
-            .as_ref()
-            .map(|c| c())
-            .unwrap_or(0);
+
+        let status_bool = |key: &str| status.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+        let status_u64 = |key: &str| status.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+        let _status_f64 = |key: &str| status.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+        let vision_status = match self.config.vision_service_status() {
+            "enabled" => "已启用",
+            "disabled" => "已禁用",
+            _ => "未配置",
+        };
+        let vision_model = self.config.vision.model.as_deref().unwrap_or("-");
 
         let mut lines = vec![
             format!("{} 状态", assistant_name),
             format!(
                 "运行状态：{}",
-                if status
-                    .get("ready")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
+                if status_bool("ready") {
                     "就绪"
                 } else {
                     "未就绪"
@@ -139,102 +164,108 @@ impl CommandHandler {
             ),
             format!(
                 "连接状态：{}",
-                if status
-                    .get("connected")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
+                if status_bool("connected") {
                     "已连接"
                 } else {
                     "未连接"
                 }
             ),
+            format!("运行时长：{} 秒", status_u64("uptime_seconds")),
+            format!("活跃消息任务：{}", status_u64("active_message_tasks")),
+            format!("活跃会话数：{}", status_u64("active_conversations")),
+            format!(
+                "消息接收/回复：{} / {}",
+                status_u64("total_messages_received"),
+                status_u64("total_replies_sent")
+            ),
+            format!("回复分片数：{}", status_u64("reply_parts_sent")),
+            format!("命令命中：{}", status_u64("command_hits")),
+            format!(
+                "群规划 reply/wait/ignore：{} / {} / {}",
+                status_u64("planner_reply"),
+                status_u64("planner_wait"),
+                status_u64("planner_ignore")
+            ),
+            format!(
+                "视觉请求/图片处理/失败：{} / {} / {}",
+                status_u64("vision_requests"),
+                status_u64("vision_images_processed"),
+                status_u64("vision_failures")
+            ),
+            format!("视觉结果复用：{}", status_u64("vision_reused_from_plan")),
+            format!(
+                "Memory 读取/共享读取：{} / {}",
+                status_u64("memory_reads"),
+                status_u64("memory_shared_reads")
+            ),
+            format!(
+                "Memory 场景命中/拒绝：{} / {}",
+                status_u64("memory_scene_rule_hits"),
+                status_u64("memory_access_denied")
+            ),
+            format!(
+                "Memory 写入/迁移/压缩：{} / {} / {}",
+                status_u64("memory_writes"),
+                status_u64("memory_migrations"),
+                status_u64("memory_compactions")
+            ),
+            format!("后台任务数：{}", status_u64("background_tasks")),
+            format!("AI 服务：{}", self.config.model.api_base),
+            format!("模型：{}", self.config.model.primary_model),
+            format!("视觉状态：{}", vision_status),
+            format!("视觉模型：{}", vision_model),
+            format!("响应超时：{} 秒", self.config.bot_behavior.response_timeout),
+            format!(
+                "消息长度限制：{} 字符",
+                self.config.bot_behavior.max_message_length
+            ),
         ];
 
-        if let Some(m) = status.get("uptime_seconds").and_then(|v| v.as_u64()) {
-            lines.push(format!("运行时长：{} 秒", m));
-        }
-        if let Some(m) = status.get("active_message_tasks").and_then(|v| v.as_u64()) {
-            lines.push(format!("活跃消息任务：{}", m));
-        }
-        lines.push(format!("活跃会话数：{}", active_sessions));
-
-        if let Some(ref metrics) = self.metrics {
-            if let Ok(m) = metrics.lock() {
-                let snap = m.snapshot();
-                let msg_recv = snap
-                    .get("total_messages_received")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let msg_sent = snap
-                    .get("total_replies_sent")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let ai_calls = snap
-                    .get("total_ai_calls")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let tokens = snap
-                    .get("total_tokens_used")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let avg_latency = snap
-                    .get("avg_response_latency_ms")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-                let errors = snap
-                    .get("error_count")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let ignored = snap
-                    .get("total_ignored")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                lines.push(format!("消息接收/回复：{} / {}", msg_recv, msg_sent));
-                lines.push(format!("AI 调用次数/token：{} / {}", ai_calls, tokens));
-                lines.push(format!("平均延迟：{:.0} ms", avg_latency));
-                lines.push(format!("错误计数：{}", errors));
-                lines.push(format!("忽略消息数：{}", ignored));
+        if let Some(last_error) = status.get("last_error_at").and_then(|v| v.as_str()) {
+            if !last_error.is_empty() {
+                lines.push(format!("最近错误时间：{}", last_error));
             }
         }
 
-        lines.push(format!(
-            "消息长度限制：{} 字符",
-            self.config.reply.max_reply_chars
-        ));
-
         lines.join("\n")
-    }
-
-    /// 执行重置命令（供外部直接调用）
-    pub fn execute_reset(&self) -> String {
-        if let Some(ref cb) = self.reset_callback {
-            cb("reset");
-        }
-        "对话历史已清空。".to_string()
     }
 
     // ============ 私有方法 ============
 
     fn assistant_name(&self) -> String {
-        let name = self.config.identity.name.trim();
-        if name.is_empty() {
-            "助手".to_string()
-        } else {
-            name.to_string()
-        }
+        self.config.get_assistant_name().to_string()
     }
 
     fn snapshot_status(&self) -> HashMap<String, serde_json::Value> {
         if let Some(ref provider) = self.status_provider {
             return provider();
         }
+        if let Some(ref metrics) = self.metrics {
+            if let Ok(m) = metrics.lock() {
+                return m.snapshot();
+            }
+        }
         let mut status = HashMap::new();
         status.insert("ready".into(), serde_json::json!(false));
         status.insert("connected".into(), serde_json::json!(false));
         status.insert("uptime_seconds".into(), serde_json::json!(0));
         status.insert("active_message_tasks".into(), serde_json::json!(0));
+        status.insert("active_conversations".into(), serde_json::json!(0));
         status
+    }
+
+    fn execute_reset_for_event(&self, event: &InboundEvent) -> String {
+        if let Some(ref cb) = self.reset_callback {
+            cb(event);
+        }
+        let sm = self.session_manager.clone();
+        let event = event.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                sm.clear_for_event(&event).await;
+            });
+        }
+        "对话历史已清空。".to_string()
     }
 
     fn make_help_spec(&self) -> CommandSpec {
@@ -259,13 +290,23 @@ impl CommandHandler {
 
     fn make_reset_spec(&self) -> CommandSpec {
         let reset_callback = self.reset_callback.clone();
+        let session_manager = self.session_manager.clone();
         CommandSpec::new(
             "/reset",
             vec!["/清除".into(), "/清空".into()],
             "清空当前会话上下文",
-            Box::new(move |_ctx| {
-                if let Some(ref cb) = reset_callback {
-                    cb("reset");
+            Box::new(move |ctx| {
+                if let Some(ref event) = ctx.event {
+                    if let Some(ref cb) = reset_callback {
+                        cb(event);
+                    }
+                    let sm = session_manager.clone();
+                    let event = event.clone();
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.spawn(async move {
+                            sm.clear_for_event(&event).await;
+                        });
+                    }
                 }
                 "对话历史已清空。".to_string()
             }),
@@ -305,6 +346,9 @@ fn make_builtin_reset_spec() -> CommandSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::platform_types::EventType;
+    use crate::core::scope::ChatScope;
+    use crate::core::types::UserMessage;
 
     fn test_config() -> Arc<XueliConfig> {
         let mut config = XueliConfig::default();
@@ -312,13 +356,37 @@ mod tests {
         Arc::new(config)
     }
 
+    fn test_session_manager() -> Arc<ConversationSessionManager> {
+        Arc::new(ConversationSessionManager::new(None))
+    }
+
+    fn dummy_event(user_id: &str) -> InboundEvent {
+        InboundEvent {
+            id: "e1".into(),
+            platform: "test".into(),
+            event_type: EventType::Message,
+            message: Some(UserMessage {
+                id: "m1".into(),
+                sender_id: user_id.into(),
+                sender_name: "T".into(),
+                text: "hi".into(),
+                timestamp: chrono::Utc::now(),
+                scope: ChatScope::Private,
+                is_mention: false,
+            }),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn test_handle_help_command() {
         let config = test_config();
-        let handler = CommandHandler::new(config, None, None);
+        let session_mgr = test_session_manager();
+        let handler = CommandHandler::new(config, session_mgr, None, None);
         handler.init_builtins();
 
-        let result = handler.handle("/help").expect("应匹配 /help");
+        let event = dummy_event("u1");
+        let result = handler.handle("/help", &event).expect("应匹配 /help");
         assert!(result.contains("使用帮助"));
         assert!(result.contains("测试助手"));
     }
@@ -326,50 +394,64 @@ mod tests {
     #[test]
     fn test_handle_help_alias() {
         let config = test_config();
-        let handler = CommandHandler::new(config, None, None);
+        let session_mgr = test_session_manager();
+        let handler = CommandHandler::new(config, session_mgr, None, None);
         handler.init_builtins();
 
-        let result = handler.handle("帮助").expect("应匹配别名");
+        let event = dummy_event("u1");
+        let result = handler.handle("帮助", &event).expect("应匹配别名");
         assert!(result.contains("使用帮助"));
     }
 
     #[test]
     fn test_handle_status_command() {
         let config = test_config();
-        let handler = CommandHandler::new(config, None, None);
+        let session_mgr = test_session_manager();
+        let handler = CommandHandler::new(config, session_mgr, None, None);
         handler.init_builtins();
 
-        let result = handler.handle("/status").expect("应匹配 /status");
+        let event = dummy_event("u1");
+        let result = handler.handle("/status", &event).expect("应匹配 /status");
         assert!(result.contains("状态"));
         assert!(result.contains("未就绪"));
+        assert!(result.contains("群规划 reply/wait/ignore"));
+        assert!(result.contains("视觉请求/图片处理/失败"));
+        assert!(result.contains("Memory 读取/共享读取"));
+        assert!(result.contains("后台任务数"));
     }
 
     #[test]
     fn test_handle_reset_command() {
         let config = test_config();
-        let handler = CommandHandler::new(config, None, None);
+        let session_mgr = test_session_manager();
+        let handler = CommandHandler::new(config, session_mgr, None, None);
         handler.init_builtins();
 
-        let result = handler.handle("/reset").expect("应匹配 /reset");
+        let event = dummy_event("u1");
+        let result = handler.handle("/reset", &event).expect("应匹配 /reset");
         assert_eq!(result, "对话历史已清空。");
     }
 
     #[test]
     fn test_handle_unknown_command() {
         let config = test_config();
-        let handler = CommandHandler::new(config, None, None);
+        let session_mgr = test_session_manager();
+        let handler = CommandHandler::new(config, session_mgr, None, None);
         handler.init_builtins();
 
-        assert!(handler.handle("/unknown").is_none());
+        let event = dummy_event("u1");
+        assert!(handler.handle("/unknown", &event).is_none());
     }
 
     #[test]
     fn test_handle_reset_alias_clear() {
         let config = test_config();
-        let handler = CommandHandler::new(config, None, None);
+        let session_mgr = test_session_manager();
+        let handler = CommandHandler::new(config, session_mgr, None, None);
         handler.init_builtins();
 
-        let result = handler.handle("/清除").expect("应匹配 /清除");
+        let event = dummy_event("u1");
+        let result = handler.handle("/清除", &event).expect("应匹配 /清除");
         assert_eq!(result, "对话历史已清空。");
     }
 
@@ -377,10 +459,61 @@ mod tests {
     fn test_assistant_name_fallback() {
         let mut config = XueliConfig::default();
         config.identity.name = String::new();
-        let handler = CommandHandler::new(Arc::new(config), None, None);
+        let session_mgr = test_session_manager();
+        let handler = CommandHandler::new(Arc::new(config), session_mgr, None, None);
         handler.init_builtins();
 
-        let result = handler.handle("/help").unwrap();
+        let event = dummy_event("u1");
+        let result = handler.handle("/help", &event).unwrap();
         assert!(result.contains("助手"));
+    }
+
+    #[tokio::test]
+    async fn test_reset_clears_session() {
+        let config = test_config();
+        let session_mgr = test_session_manager();
+        let handler = CommandHandler::new(config, session_mgr.clone(), None, None);
+        handler.init_builtins();
+
+        let event = dummy_event("u_reset");
+        let key = session_mgr.get_key_for_event(&event);
+        session_mgr
+            .add_message(&key, "user", "hello", None, "", "", false)
+            .await;
+        assert_eq!(session_mgr.count_active().await, 1);
+
+        let result = handler.handle("/reset", &event).expect("应匹配 /reset");
+        assert_eq!(result, "对话历史已清空。");
+
+        // 让后台 clear_for_event 任务执行
+        tokio::task::yield_now().await;
+        assert_eq!(session_mgr.count_active().await, 0);
+    }
+
+    #[test]
+    fn test_reset_callback_receives_event() {
+        let config = test_config();
+        let session_mgr = test_session_manager();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cb: ResetCallback = Arc::new(move |event: &InboundEvent| {
+            let _ = tx.send(
+                event
+                    .message
+                    .as_ref()
+                    .map(|m| m.sender_id.clone())
+                    .unwrap_or_default(),
+            );
+        });
+        let handler = CommandHandler::new(config, session_mgr, None, Some(cb));
+        handler.init_builtins();
+
+        let event = dummy_event("u_callback");
+        let result = handler.handle("/reset", &event).expect("应匹配 /reset");
+        assert_eq!(result, "对话历史已清空。");
+
+        let received = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("应收到回调事件");
+        assert_eq!(received, "u_callback");
     }
 }

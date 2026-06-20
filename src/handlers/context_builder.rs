@@ -9,13 +9,15 @@ use crate::core::drive::engine::DriveEngine;
 use crate::core::drive::models::DriveContext;
 use crate::core::platform_types::InboundEvent;
 use crate::core::scope::ChatScope;
-use crate::core::types::ReplyPlan;
+use crate::core::types::{MemoryType, ReplyPlan};
+use crate::handlers::image_pipeline::ImagePipeline;
 use crate::handlers::reply::style_policy::{FinalStyleGuide, SoftUncertaintySignal};
 use crate::handlers::session_manager::ConversationSessionManager;
+use crate::memory::internal::access_policy::PromptEntry;
 use crate::memory::manager::MemoryManager;
+use crate::memory::retrieval::coordinator::{PromptContextResult, RetrievalCoordinator};
 use crate::memory::stores::conversation::{ConversationRecord, SqliteConversationStore};
-use crate::memory::stores::fact_evidence::SqliteFactEvidenceStore;
-use crate::prelude::XueliResult;
+use crate::prelude::{AIClient, XueliResult};
 use crate::traits::prompt_template::PromptTemplateLoader;
 
 /// 构建好的上下文 — 规划器和 ReplyAgent 的共享输入。
@@ -83,26 +85,29 @@ pub struct ConversationContext {
 /// ReplyStylePolicy 等组件，对应 Python 版 `ConversationContextBuilder`。
 pub struct ConversationContextBuilder<
     L: PromptTemplateLoader + 'static = crate::services::prompt_loader::NoopPromptTemplateLoader,
+    A: AIClient + 'static = crate::services::ai_client::NoopAIClient,
 > {
     store: Arc<SqliteConversationStore>,
     session_manager: Option<Arc<ConversationSessionManager>>,
     memory_manager: Option<Arc<MemoryManager<L>>>,
+    retrieval_coordinator: Option<Arc<RetrievalCoordinator>>,
     character_card_service: Option<Arc<CharacterCardService>>,
     narrative_service: Option<Arc<NarrativeService>>,
     drive_engine: Option<Arc<DriveEngine>>,
-    fact_evidence_store: Option<Arc<SqliteFactEvidenceStore>>,
+    image_pipeline: Option<Arc<ImagePipeline<A, L>>>,
 }
 
-impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
+impl<L: PromptTemplateLoader + 'static, A: AIClient + 'static> ConversationContextBuilder<L, A> {
     pub fn new(store: Arc<SqliteConversationStore>) -> Self {
         Self {
             store,
             session_manager: None,
             memory_manager: None,
+            retrieval_coordinator: None,
             character_card_service: None,
             narrative_service: None,
             drive_engine: None,
-            fact_evidence_store: None,
+            image_pipeline: None,
         }
     }
 
@@ -115,6 +120,12 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
     /// 设置记忆管理器（用于记忆上下文加载）
     pub fn with_memory_manager(mut self, mgr: Arc<MemoryManager<L>>) -> Self {
         self.memory_manager = Some(mgr);
+        self
+    }
+
+    /// 设置统一检索协调器（用于多记忆层上下文组装）
+    pub fn with_retrieval_coordinator(mut self, coord: Arc<RetrievalCoordinator>) -> Self {
+        self.retrieval_coordinator = Some(coord);
         self
     }
 
@@ -136,9 +147,9 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
         self
     }
 
-    /// 设置事实证据存储（用于加载软不确定性信号）
-    pub fn with_fact_evidence_store(mut self, store: Arc<SqliteFactEvidenceStore>) -> Self {
-        self.fact_evidence_store = Some(store);
+    /// 设置图片管线（用于视觉上下文分析）
+    pub fn with_image_pipeline(mut self, pipeline: Arc<ImagePipeline<A, L>>) -> Self {
+        self.image_pipeline = Some(pipeline);
         self
     }
 
@@ -172,7 +183,10 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
         let scope_type = if is_group { "group" } else { "private" };
         let scope_id = scope.group_id().unwrap_or("");
 
-        let stored_records = self.store.get_recent_by_scope(scope_type, scope_id, 20)?;
+        let stored_records = self
+            .store
+            .get_recent_by_scope(scope_type, scope_id, 20)
+            .await?;
 
         let is_first_turn = stored_records.is_empty();
         let recent_message_count = stored_records.len();
@@ -203,23 +217,34 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
                 (None, false, None)
             };
 
-        // 从存储构建动态记忆上下文
-        let dynamic_memory = if !stored_records.is_empty() {
-            Some(format!(
-                "近期对话总计 {} 条，当前为{}聊。",
-                stored_records.len(),
-                scope_type
-            ))
-        } else {
-            None
-        };
+        // 构建用户情绪标签（提前计算，供记忆检索使用）
+        let user_emotion_label = self.build_user_emotion_label(&user_id);
 
-        // 加载记忆上下文（通过 MemoryManager）
-        let (person_facts, persistent_memory, precise_recall) =
-            self.load_memory_context(&user_id).await;
+        // 加载记忆上下文（通过 RetrievalCoordinator 统一检索）
+        let (person_facts, persistent_memory, precise_recall, dynamic_memory) = self
+            .load_memory_context(
+                &user_id,
+                &user_message,
+                &scope,
+                user_emotion_label.as_deref(),
+            )
+            .await;
 
-        // 加载视觉上下文（从事件附件中提取）
-        let vision_description = self.load_vision_context(event);
+        // 若统一检索未产生动态记忆，回退到会话摘要
+        let dynamic_memory = dynamic_memory.or_else(|| {
+            if !stored_records.is_empty() {
+                Some(format!(
+                    "近期对话总计 {} 条，当前为{}聊。",
+                    stored_records.len(),
+                    scope_type
+                ))
+            } else {
+                None
+            }
+        });
+
+        // 加载视觉上下文（通过 ImagePipeline 实际分析）
+        let vision_description = self.load_vision_context(event).await;
 
         // 加载角色卡快照
         let character_card_snapshot = self.load_character_card_snapshot(&user_id);
@@ -233,9 +258,6 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
 
         // 加载软不确定性信号
         let soft_uncertainty_signals = self.load_soft_uncertainty_signals(&user_id).await;
-
-        // 构建用户画像信号
-        let user_emotion_label = self.build_user_emotion_label(&user_id);
 
         // 检测谨慎事件
         let caution_events = self.detect_caution_events(&user_message, &recent_messages);
@@ -283,16 +305,83 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
         })
     }
 
-    /// 通过 MemoryManager 加载记忆上下文
+    /// 通过 RetrievalCoordinator 统一检索加载多记忆层上下文
+    ///
+    /// 返回：(人物事实, 持久记忆, 精确回忆, 动态记忆)
     async fn load_memory_context(
         &self,
         user_id: &str,
-    ) -> (Option<Vec<String>>, Option<String>, Option<String>) {
+        query: &str,
+        scope: &ChatScope,
+        user_emotion_label: Option<&str>,
+    ) -> (
+        Option<Vec<String>>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) {
+        // 无查询文本时回退到简单用户记忆过滤（避免无意义检索）
+        if query.trim().is_empty() {
+            debug!("查询文本为空，回退到按用户加载记忆");
+            return self.load_memory_context_fallback(user_id).await;
+        }
+
+        let rc = match &self.retrieval_coordinator {
+            Some(c) => c,
+            None => {
+                debug!("跳过统一记忆检索：retrieval_coordinator 未注入");
+                return self.load_memory_context_fallback(user_id).await;
+            }
+        };
+
+        let emotion = user_emotion_label.unwrap_or("");
+        let result = match rc
+            .search_memories_with_context(user_id, query, scope, true, emotion)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("统一记忆检索失败: {}", e);
+                return self.load_memory_context_fallback(user_id).await;
+            }
+        };
+
+        // 若检索结果完全为空，回退到按用户过滤
+        let has_any = result.sections.values().any(|v| !v.is_empty())
+            || !result.precise_recall.is_empty()
+            || !result.dynamic_memories.is_empty();
+        if !has_any {
+            return self.load_memory_context_fallback(user_id).await;
+        }
+
+        let person_facts = Self::extract_person_facts(&result);
+        let persistent_memory = Self::format_persistent_memory(&result);
+        let precise_recall = Self::format_precise_recall(&result);
+        let dynamic_memory = Self::format_dynamic_memory(&result);
+
+        (
+            person_facts,
+            persistent_memory,
+            precise_recall,
+            dynamic_memory,
+        )
+    }
+
+    /// 按用户简单过滤记忆的回退实现
+    async fn load_memory_context_fallback(
+        &self,
+        user_id: &str,
+    ) -> (
+        Option<Vec<String>>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) {
         let mm = match &self.memory_manager {
             Some(m) => m,
             None => {
                 debug!("跳过记忆上下文加载：memory_manager 未注入");
-                return (None, None, None);
+                return (None, None, None, None);
             }
         };
 
@@ -304,9 +393,7 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
                     .filter(|item| {
                         matches!(
                             item.memory_type,
-                            crate::core::types::MemoryType::Fact
-                                | crate::core::types::MemoryType::Preference
-                                | crate::core::types::MemoryType::Relationship
+                            MemoryType::Fact | MemoryType::Preference | MemoryType::Relationship
                         )
                     })
                     .take(6)
@@ -350,10 +437,85 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
             Err(_) => None,
         };
 
-        // 精确回忆（搜索与当前用户消息相关的记忆）
-        let precise_recall: Option<String> = None; // 由调用方按需注入
+        (person_facts, persistent_memory, None, None)
+    }
 
-        (person_facts, persistent_memory, precise_recall)
+    fn extract_person_facts(result: &PromptContextResult) -> Option<Vec<String>> {
+        let mut facts: Vec<String> = Vec::new();
+        for key in &["user_important", "addressing", "shared"] {
+            if let Some(entries) = result.sections.get(*key) {
+                for entry in entries {
+                    if let Some(content) = entry.get("content").and_then(|v| v.as_str()) {
+                        let text = content.trim();
+                        if !text.is_empty() && !facts.contains(&text.to_string()) {
+                            facts.push(text.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if facts.is_empty() {
+            None
+        } else {
+            Some(facts)
+        }
+    }
+
+    fn format_persistent_memory(result: &PromptContextResult) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(entries) = result.sections.get("user_important") {
+            if !entries.is_empty() {
+                parts.push("=== 当前用户重要记忆 ===".to_string());
+                parts.push(Self::format_entries(entries));
+            }
+        }
+        if let Some(entries) = result.sections.get("addressing") {
+            if !entries.is_empty() {
+                parts.push("=== 当前场景称呼要求 ===".to_string());
+                parts.push(Self::format_entries(entries));
+            }
+        }
+        if let Some(entries) = result.sections.get("shared") {
+            if !entries.is_empty() {
+                parts.push("=== 当前场景共享规则 / 共享重要记忆 ===".to_string());
+                parts.push(Self::format_entries(entries));
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n"))
+        }
+    }
+
+    fn format_precise_recall(result: &PromptContextResult) -> Option<String> {
+        if result.precise_recall.is_empty() {
+            return None;
+        }
+        Some(Self::format_entries(&result.precise_recall))
+    }
+
+    fn format_dynamic_memory(result: &PromptContextResult) -> Option<String> {
+        if result.dynamic_memories.is_empty() {
+            return None;
+        }
+        Some(Self::format_entries(&result.dynamic_memories))
+    }
+
+    fn format_entries(entries: &[PromptEntry]) -> String {
+        entries
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                let content = entry
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                format!("{}. {}", idx + 1, content)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// 通过 CharacterCardService 加载角色卡快照
@@ -521,23 +683,71 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
         Some(map)
     }
 
-    /// 加载视觉上下文 — 从事件附件中提取图片描述
+    /// 加载视觉上下文 — 通过 ImagePipeline 分析图片并生成描述
     ///
     /// 对应 Python 版 `_load_vision_context()`
-    fn load_vision_context(&self, event: &InboundEvent) -> Option<String> {
-        let image_attachments: Vec<&crate::core::platform_types::AttachmentRef> = event
-            .attachments
-            .iter()
-            .filter(|a| a.kind.to_lowercase() == "image")
-            .collect();
+    async fn load_vision_context(&self, event: &InboundEvent) -> Option<String> {
+        let pipeline = match &self.image_pipeline {
+            Some(p) => p,
+            None => {
+                debug!("跳过视觉上下文加载：image_pipeline 未注入");
+                return Self::placeholder_vision_context(event);
+            }
+        };
 
-        if image_attachments.is_empty() {
+        if !pipeline.is_enabled() {
+            return Self::placeholder_vision_context(event);
+        }
+
+        if !Self::event_has_image(event) {
             return None;
         }
 
-        // 如果有图片但没有视觉分析结果，返回占位描述
-        let count = image_attachments.len();
-        if count == 1 {
+        let user_message = event
+            .message
+            .as_ref()
+            .map(|m| m.text.clone())
+            .unwrap_or_default();
+        let is_group = event
+            .message
+            .as_ref()
+            .map(|m| m.scope.is_group())
+            .unwrap_or(false);
+
+        match pipeline.analyze(event, &user_message, is_group).await {
+            Ok(analysis) => {
+                if analysis.has_usable_description() {
+                    Some(format!("[图片] {}", analysis.merged_description))
+                } else {
+                    Some(format!(
+                        "[图片] 分析未返回可用描述（成功{}，失败{}）",
+                        analysis.success_count, analysis.failure_count
+                    ))
+                }
+            }
+            Err(e) => {
+                debug!("视觉分析失败: {}", e);
+                Some(format!("[图片] 分析失败: {}", e))
+            }
+        }
+    }
+
+    fn event_has_image(event: &InboundEvent) -> bool {
+        event
+            .attachments
+            .iter()
+            .any(|a| a.kind.to_lowercase() == "image")
+    }
+
+    fn placeholder_vision_context(event: &InboundEvent) -> Option<String> {
+        let count = event
+            .attachments
+            .iter()
+            .filter(|a| a.kind.to_lowercase() == "image")
+            .count();
+        if count == 0 {
+            None
+        } else if count == 1 {
             Some("[图片]（视觉分析待处理）".to_string())
         } else {
             Some(format!("[图片] {}张图片（视觉分析待处理）", count))
@@ -576,32 +786,56 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
         Some(engine.get_drive_context(user_id))
     }
 
-    /// 加载软不确定性信号 — 从 FactEvidenceStore 获取高置信度争议信号
+    /// 加载软不确定性信号 — 按事实查询证据数量，识别证据不足的事实
     async fn load_soft_uncertainty_signals(
         &self,
         user_id: &str,
     ) -> Option<Vec<SoftUncertaintySignal>> {
-        let store = match &self.fact_evidence_store {
-            Some(s) => s,
+        let mm = match &self.memory_manager {
+            Some(m) => m,
             None => {
-                debug!("跳过软不确定性信号加载：fact_evidence_store 未注入");
+                debug!("跳过软不确定性信号加载：memory_manager 未注入");
                 return None;
             }
         };
-        let evidences = store.get_by_user(user_id).await.ok()?;
-        if evidences.is_empty() {
+
+        let memories = match mm.get_by_user(user_id).await {
+            Ok(items) => items,
+            Err(e) => {
+                debug!("加载用户记忆失败: {}", e);
+                return None;
+            }
+        };
+        if memories.is_empty() {
             return None;
         }
-        let signals: Vec<SoftUncertaintySignal> = evidences
-            .iter()
-            .map(|e| SoftUncertaintySignal {
-                reason: format!(
-                    "事实'{}'的证据来源有限（仅{}条证据）",
-                    e.fact_id,
-                    evidences.len()
-                ),
-            })
-            .collect();
+
+        let store = mm.fact_evidence_store();
+        let mut signals: Vec<SoftUncertaintySignal> = Vec::new();
+
+        for memory in memories.iter().filter(|m| {
+            matches!(
+                m.memory_type,
+                MemoryType::Fact | MemoryType::Preference | MemoryType::Relationship
+            )
+        }) {
+            let evidence_count = match store.get_by_fact(&memory.id).await {
+                Ok(ev) => ev.len(),
+                Err(e) => {
+                    debug!("查询事实证据失败: {}", e);
+                    0
+                }
+            };
+            if evidence_count < 2 {
+                signals.push(SoftUncertaintySignal {
+                    reason: format!(
+                        "事实'{}'的证据来源有限（仅{}条证据）",
+                        memory.id, evidence_count
+                    ),
+                });
+            }
+        }
+
         if signals.is_empty() {
             None
         } else {
@@ -965,7 +1199,10 @@ impl<L: PromptTemplateLoader + 'static> ConversationContextBuilder<L> {
 }
 
 impl Default
-    for ConversationContextBuilder<crate::services::prompt_loader::FilePromptTemplateLoader>
+    for ConversationContextBuilder<
+        crate::services::prompt_loader::FilePromptTemplateLoader,
+        crate::services::ai_client::NoopAIClient,
+    >
 {
     fn default() -> Self {
         let dir = std::path::PathBuf::from("data/conversations");

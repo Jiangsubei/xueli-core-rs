@@ -4,9 +4,9 @@ use std::sync::Arc;
 use crate::character::card_service::{CharacterCardService, CharacterCardSnapshot};
 use crate::core::platform_types::InboundEvent;
 use crate::core::scope::ChatScope;
-use crate::core::types::{PromptPlan, ReplyPlan};
-use crate::handlers::context_builder::ConversationContextBuilder;
-use crate::handlers::planner::{ConversationPlanner, PlanResult};
+use crate::core::types::{MessageHandlingPlan, PromptPlan, ReplyPlan};
+use crate::handlers::context_builder::{ConversationContext, ConversationContextBuilder};
+use crate::handlers::planner::ConversationPlanner;
 use crate::handlers::session_manager::ConversationSessionManager;
 use crate::memory::stores::conversation::{ConversationRecord, SqliteConversationStore};
 use crate::prelude::XueliResult;
@@ -22,12 +22,12 @@ use crate::traits::prompt_template::PromptTemplateLoader;
 ///
 /// 它是群聊消息处理的核心调度枢纽，负责：构建消息上下文、调用规划器、记录对话历史。
 pub struct ConversationPlanCoordinator<
-    A: AIClient,
+    A: AIClient + 'static,
     L: PromptTemplateLoader + 'static = crate::services::prompt_loader::NoopPromptTemplateLoader,
 > {
-    pub planner: Arc<ConversationPlanner<A>>,
+    pub planner: Arc<ConversationPlanner<A, L>>,
     pub session_manager: Arc<ConversationSessionManager>,
-    pub context_builder: Arc<ConversationContextBuilder<L>>,
+    pub context_builder: Arc<ConversationContextBuilder<L, A>>,
     conversation_store: Option<Arc<SqliteConversationStore>>,
     character_card_service: Option<Arc<CharacterCardService>>,
     /// 上下文窗口大小
@@ -98,9 +98,9 @@ impl Default for MessageContext {
 
 impl<A: AIClient, L: PromptTemplateLoader + 'static> ConversationPlanCoordinator<A, L> {
     pub fn new(
-        planner: Arc<ConversationPlanner<A>>,
+        planner: Arc<ConversationPlanner<A, L>>,
         session_manager: Arc<ConversationSessionManager>,
-        context_builder: Arc<ConversationContextBuilder<L>>,
+        context_builder: Arc<ConversationContextBuilder<L, A>>,
         assistant_name: impl Into<String>,
     ) -> Self {
         Self {
@@ -141,7 +141,7 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ConversationPlanCoordinator
     // ── 主协调入口 ──
 
     /// 主协调入口：构建消息上下文并调用规划器
-    pub async fn coordinate(&self, event: &InboundEvent) -> XueliResult<PlanResult> {
+    pub async fn coordinate(&self, event: &InboundEvent) -> XueliResult<MessageHandlingPlan> {
         let user_message = event
             .message
             .as_ref()
@@ -149,7 +149,7 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ConversationPlanCoordinator
             .unwrap_or_default();
 
         // a. 构建消息上下文
-        let _msg_ctx = self
+        let msg_ctx = self
             .build_message_context(event, &user_message)
             .await
             .unwrap_or_default();
@@ -165,19 +165,22 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ConversationPlanCoordinator
             use_emoji: false,
             priority: 0,
         };
-        let context = self.context_builder.build(event, &default_plan).await?;
+        let mut context = self.context_builder.build(event, &default_plan).await?;
+
+        // b. 将协调器层构建的上下文（时间、视觉、信号等）补充到 ConversationContext
+        self.enrich_context_from_message_context(&mut context, &msg_ctx);
 
         // c. 调用规划器
-        let plan_result = self.planner.plan(event, &context).await?;
+        let plan = self.planner.plan(event, &context).await?;
 
         tracing::debug!(
-            "[计划协调器] conversation={} plan_result={:?}",
+            "[计划协调器] conversation={} should_reply={}",
             conversation_key,
-            plan_result.should_reply
+            plan.should_reply
         );
 
         // d. 加载角色卡（若已配置）
-        if self.character_card_service.is_some() && plan_result.should_reply {
+        if self.character_card_service.is_some() && plan.should_reply {
             let user_id = event
                 .message
                 .as_ref()
@@ -192,7 +195,40 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ConversationPlanCoordinator
             }
         }
 
-        Ok(plan_result)
+        Ok(plan)
+    }
+
+    /// 将 plan_coordinator 构建的 MessageContext 中的视觉/时间/信号等补充到 ConversationContext
+    fn enrich_context_from_message_context(
+        &self,
+        context: &mut ConversationContext,
+        msg_ctx: &MessageContext,
+    ) {
+        if context.continuity_hint.is_none() && !msg_ctx.temporal_context.summary_text.is_empty() {
+            context.continuity_hint = Some(msg_ctx.temporal_context.summary_text.clone());
+        }
+        if context.vision_description.is_none() {
+            if let Some(merged) = msg_ctx
+                .vision_analysis
+                .get("merged_description")
+                .and_then(|v| v.as_str())
+            {
+                context.vision_description = Some(merged.to_string());
+            } else if !msg_ctx.vision_analysis.is_empty() {
+                // 兜底：把 vision_analysis 整体序列化
+                context.vision_description = Some(format!(
+                    "[图片] {}",
+                    serde_json::to_string(&msg_ctx.vision_analysis).unwrap_or_default()
+                ));
+            }
+        }
+        if context.narrative_thread_summary.is_none() && msg_ctx.narrative_thread_summary.is_some()
+        {
+            context.narrative_thread_summary = msg_ctx.narrative_thread_summary.clone();
+        }
+        if context.user_emotion_label.is_none() && msg_ctx.user_emotion_label.is_some() {
+            context.user_emotion_label = msg_ctx.user_emotion_label.clone();
+        }
     }
 
     /// 记录助手的回复到对话历史
@@ -1128,9 +1164,9 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ConversationPlanCoordinator
 
         let is_private_key = group_id.contains(":private:");
         let records = if is_private_key {
-            store.get_recent_by_session(group_id, count)?
+            store.get_recent_by_session(group_id, count).await?
         } else {
-            store.get_recent_by_session(group_id, count)?
+            store.get_recent_by_session(group_id, count).await?
         };
 
         Ok(records.iter().map(Self::record_to_hashmap).collect())
@@ -1376,7 +1412,11 @@ mod tests {
         >::new(store));
         let planner = Arc::new(ConversationPlanner::new(
             Arc::new(crate::services::ai_client::NoopAIClient),
+            Arc::new(crate::services::prompt_loader::NoopPromptTemplateLoader),
             "test-model",
+            "测试助手",
+            "",
+            "zh-CN",
         ));
         let session_mgr = Arc::new(ConversationSessionManager::new(None));
 
@@ -1397,7 +1437,11 @@ mod tests {
         >::new(store));
         let planner = Arc::new(ConversationPlanner::new(
             Arc::new(crate::services::ai_client::NoopAIClient),
+            Arc::new(crate::services::prompt_loader::NoopPromptTemplateLoader),
             "test-model",
+            "测试助手",
+            "",
+            "zh-CN",
         ));
         let session_mgr = Arc::new(ConversationSessionManager::new(None));
 
@@ -1460,7 +1504,11 @@ mod tests {
         >::new(store));
         let planner = Arc::new(ConversationPlanner::new(
             Arc::new(crate::services::ai_client::NoopAIClient),
+            Arc::new(crate::services::prompt_loader::NoopPromptTemplateLoader),
             "test-model",
+            "测试助手",
+            "",
+            "zh-CN",
         ));
         let session_mgr = Arc::new(ConversationSessionManager::new(None));
 
@@ -1491,7 +1539,11 @@ mod tests {
         >::new(store));
         let planner = Arc::new(ConversationPlanner::new(
             Arc::new(crate::services::ai_client::NoopAIClient),
+            Arc::new(crate::services::prompt_loader::NoopPromptTemplateLoader),
             "test-model",
+            "测试助手",
+            "",
+            "zh-CN",
         ));
         let session_mgr = Arc::new(ConversationSessionManager::new(None));
 
@@ -1553,7 +1605,11 @@ mod tests {
         >::new(store));
         let planner = Arc::new(ConversationPlanner::new(
             Arc::new(crate::services::ai_client::NoopAIClient),
+            Arc::new(crate::services::prompt_loader::NoopPromptTemplateLoader),
             "test-model",
+            "测试助手",
+            "",
+            "zh-CN",
         ));
         let session_mgr = Arc::new(ConversationSessionManager::new(None));
 
@@ -1581,7 +1637,11 @@ mod tests {
         >::new(store));
         let planner = Arc::new(ConversationPlanner::new(
             Arc::new(crate::services::ai_client::NoopAIClient),
+            Arc::new(crate::services::prompt_loader::NoopPromptTemplateLoader),
             "test-model",
+            "测试助手",
+            "",
+            "zh-CN",
         ));
         let session_mgr = Arc::new(ConversationSessionManager::new(None));
 
@@ -1609,7 +1669,11 @@ mod tests {
         >::new(store));
         let planner = Arc::new(ConversationPlanner::new(
             Arc::new(crate::services::ai_client::NoopAIClient),
+            Arc::new(crate::services::prompt_loader::NoopPromptTemplateLoader),
             "test-model",
+            "测试助手",
+            "",
+            "zh-CN",
         ));
         let session_mgr = Arc::new(ConversationSessionManager::new(None));
 
@@ -1650,7 +1714,11 @@ mod tests {
         >::new(store));
         let planner = Arc::new(ConversationPlanner::new(
             Arc::new(crate::services::ai_client::NoopAIClient),
+            Arc::new(crate::services::prompt_loader::NoopPromptTemplateLoader),
             "test-model",
+            "测试助手",
+            "",
+            "zh-CN",
         ));
         let session_mgr = Arc::new(ConversationSessionManager::new(None));
 

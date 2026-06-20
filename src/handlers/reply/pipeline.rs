@@ -9,7 +9,11 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::core::config::XueliConfig;
+use crate::core::types::MessageHandlingPlan;
 use crate::handlers::planner::MemoryProfile;
+use crate::handlers::shared::unified_history_renderer::{
+    render_unified_history, UnifiedHistoryItem,
+};
 use crate::memory::manager::MemoryManager;
 use crate::memory::stores::conversation::{ConversationRecord, SqliteConversationStore};
 
@@ -204,7 +208,7 @@ impl<L: PromptTemplateLoader + 'static> ReplyPipeline<L> {
 
         // 历史消息：从 conversation store 加载
         if let Some(ref store) = self.conversation_store {
-            match store.get_recent_by_scope(scope_type, scope_id, 30) {
+            match store.get_recent_by_scope(scope_type, scope_id, 30).await {
                 Ok(records) => {
                     result.history_messages = records;
                     if result.history_messages.is_empty() {
@@ -279,7 +283,7 @@ impl<L: PromptTemplateLoader + 'static> ReplyPipeline<L> {
 
         // 历史消息：从 conversation store 加载
         if let Some(ref store) = self.conversation_store {
-            match store.get_recent_by_scope(scope_type, scope_id, 30) {
+            match store.get_recent_by_scope(scope_type, scope_id, 30).await {
                 Ok(records) => {
                     result.history_messages = records;
                     if result.history_messages.is_empty() {
@@ -435,8 +439,10 @@ impl<L: PromptTemplateLoader + 'static> ReplyPipeline<L> {
         result.narrative_thread_summary = Some(summary);
     }
 
-    /// 从历史图片描述列表中提取可复用的视觉分析
-    pub fn extract_reusable_vision_analysis(image_descriptions: &[String]) -> Option<String> {
+    /// 从历史图片描述列表中提取可复用的视觉分析（兼容旧接口）
+    pub fn extract_reusable_vision_analysis_from_descriptions(
+        image_descriptions: &[String],
+    ) -> Option<String> {
         let non_empty: Vec<&str> = image_descriptions
             .iter()
             .map(|s| s.as_str())
@@ -459,23 +465,47 @@ impl<L: PromptTemplateLoader + 'static> ReplyPipeline<L> {
         }
     }
 
-    /// 构建对话历史文本 — 格式化带身份标签的消息流
+    /// 从规划上下文中提取可复用的视觉分析
+    pub fn extract_reusable_vision_analysis(plan: &MessageHandlingPlan) -> Option<String> {
+        plan.reply_context
+            .get("vision_analysis")
+            .and_then(|v| v.get("merged_description"))
+            .and_then(|v| v.as_str())
+            .filter(|s| {
+                let s = s.trim();
+                !s.is_empty() && !s.contains("未成功识别") && !s.contains("分析失败")
+            })
+            .map(|s| format!("[图片] {}", s))
+    }
+
+    /// 构建对话历史文本 — 使用带时间戳的统一历史渲染
     pub fn build_conversation_history_text(
         records: &[ConversationRecord],
         assistant_name: &str,
     ) -> String {
-        let mut lines: Vec<String> = Vec::with_capacity(records.len());
-        for rec in records {
-            let label = if rec.is_bot {
-                assistant_name.to_string()
-            } else if rec.sender_name.is_empty() {
-                "用户".to_string()
-            } else {
-                format!("用户{}", rec.sender_name)
-            };
-            lines.push(format!("{}: {}", label, rec.text));
-        }
-        lines.join("\n")
+        let items: Vec<UnifiedHistoryItem> = records
+            .iter()
+            .map(|rec| UnifiedHistoryItem {
+                timestamp: rec.event_time,
+                role: if rec.is_bot {
+                    "assistant".to_string()
+                } else {
+                    "user".to_string()
+                },
+                content: format!(
+                    "{}: {}",
+                    if rec.is_bot {
+                        assistant_name.to_string()
+                    } else if rec.sender_name.is_empty() {
+                        "用户".to_string()
+                    } else {
+                        format!("用户{}", rec.sender_name)
+                    },
+                    rec.text
+                ),
+            })
+            .collect();
+        render_unified_history(&items, "", false, 0)
     }
 }
 
@@ -531,14 +561,14 @@ mod tests {
     #[test]
     fn test_extract_reusable_vision_analysis_single() {
         let descs = vec!["图片显示一只猫".to_string()];
-        let result = ReplyPipeline::<crate::services::prompt_loader::NoopPromptTemplateLoader>::extract_reusable_vision_analysis(&descs);
+        let result = ReplyPipeline::<crate::services::prompt_loader::NoopPromptTemplateLoader>::extract_reusable_vision_analysis_from_descriptions(&descs);
         assert!(result.is_some());
         assert!(result.unwrap().contains("猫"));
     }
 
     #[test]
     fn test_extract_reusable_vision_analysis_empty() {
-        let result = ReplyPipeline::<crate::services::prompt_loader::NoopPromptTemplateLoader>::extract_reusable_vision_analysis(&[]);
+        let result = ReplyPipeline::<crate::services::prompt_loader::NoopPromptTemplateLoader>::extract_reusable_vision_analysis_from_descriptions(&[]);
         assert!(result.is_none());
     }
 

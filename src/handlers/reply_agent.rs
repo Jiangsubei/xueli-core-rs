@@ -16,16 +16,10 @@ use crate::memory::manager::MemoryManager;
 use crate::memory::stores::person_fact::SqlitePersonFactStore;
 use crate::prelude::XueliResult;
 use crate::services::token_counter::TokenCounter;
+use crate::services::tool_calling_strategy::OpenAIToolCallingStrategy;
 use crate::traits::ai_client::{AIClient, ChatCompletionRequest, ChatMessage};
 use crate::traits::prompt_template::PromptTemplateLoader;
-
-/// 工具定义
-#[derive(Debug, Clone)]
-pub struct ToolDefinition {
-    pub name: String,
-    pub description: String,
-    pub parameters: serde_json::Value,
-}
+use crate::traits::tool_calling::{ToolCallingStrategy, ToolDefinition};
 
 /// 可执行工具 trait
 #[async_trait]
@@ -321,6 +315,8 @@ pub struct ReplyAgent<A: AIClient, L: PromptTemplateLoader + 'static> {
     plugin_handlers: HashMap<String, Arc<dyn Tool>>,
     /// 延迟工具列表（tool_search 可激活）
     deferred_tools: PlMutex<Vec<serde_json::Value>>,
+    /// 工具调用策略
+    tool_calling_strategy: Box<dyn ToolCallingStrategy>,
 }
 
 /// 最大内部工具调用轮数（对应 Python MAX_INTERNAL_ROUNDS）
@@ -361,7 +357,14 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
             interrupt_notify: Arc::new(Notify::new()),
             plugin_handlers: HashMap::new(),
             deferred_tools: PlMutex::new(Vec::new()),
+            tool_calling_strategy: Box::new(OpenAIToolCallingStrategy::new()),
         }
+    }
+
+    /// 设置自定义工具调用策略
+    pub fn with_tool_calling_strategy(mut self, strategy: Box<dyn ToolCallingStrategy>) -> Self {
+        self.tool_calling_strategy = strategy;
+        self
     }
 
     /// 注册插件工具
@@ -534,20 +537,13 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
         let tools = self.build_tools(&user_id);
 
         // 序列化工具定义为 API 格式
-        let mut serialized_tools: Vec<serde_json::Value> = tools
-            .iter()
-            .map(|t| {
-                let def = t.definition();
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": def.name,
-                        "description": def.description,
-                        "parameters": def.parameters,
-                    }
-                })
-            })
-            .collect();
+        let tool_definitions: Vec<ToolDefinition> = tools.iter().map(|t| t.definition()).collect();
+        let mut serialized_tools: Vec<serde_json::Value> = self
+            .tool_calling_strategy
+            .serialize_tools(&tool_definitions)?
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
 
         let model_name = self.config.model.primary_model.clone();
 
@@ -653,7 +649,24 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
                     last_assistant_content = content.clone();
                 }
 
-                let tool_calls = response.tool_calls.unwrap_or_default();
+                // 通过 ToolCallingStrategy 解析 tool_calls；优先使用 raw_response，回退到已解析字段
+                let raw_response_text = response
+                    .raw_response
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                let tool_calls = if raw_response_text.is_empty() {
+                    response.tool_calls.clone().unwrap_or_default()
+                } else {
+                    self.tool_calling_strategy
+                        .parse_tool_calls(&raw_response_text)
+                        .unwrap_or_else(|e| {
+                            tracing::debug!(
+                                "[ReplyAgent] 策略解析 tool_calls 失败，回退到响应字段: {e}"
+                            );
+                            response.tool_calls.clone().unwrap_or_default()
+                        })
+                };
 
                 if tool_calls.is_empty() {
                     // 没有工具调用，直接返回内容

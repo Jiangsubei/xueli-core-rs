@@ -3,11 +3,15 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::core::platform_types::InboundEvent;
+
 /// 命令执行上下文
 #[derive(Debug, Clone)]
 pub struct CommandContext {
     /// 用户原始输入文本
     pub raw_text: String,
+    /// 触发命令的入站事件
+    pub event: Option<InboundEvent>,
 }
 
 /// 命令执行函数类型
@@ -86,6 +90,11 @@ impl CommandRegistry {
             }
         }
         self.commands.insert(name, spec);
+    }
+
+    /// 判断命令是否为内置命令
+    pub fn is_builtin(&self, name: &str) -> bool {
+        self.builtin_names.contains(name)
     }
 
     /// 取消注册

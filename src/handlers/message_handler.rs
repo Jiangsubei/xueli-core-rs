@@ -10,6 +10,8 @@ use crate::character::card_service::CharacterCardService;
 use crate::character::narrative::NarrativeService;
 use crate::core::config::XueliConfig;
 use crate::core::context_recorder::ContextRecorder;
+use crate::core::drive::engine::DriveEngine;
+use crate::core::drive::store::DriveStore;
 use crate::core::message_trace::{build_trace_id, get_execution_key};
 use crate::core::metrics::RuntimeMetrics;
 use crate::core::mood_engine::MoodEngine;
@@ -42,6 +44,7 @@ use crate::prelude::XueliResult;
 use crate::services::image_client::ImageClient;
 use crate::services::token_counter::TokenCounter;
 use crate::services::vision_client::VisionClient;
+use crate::signals::orchestrator::SignalOrchestrator;
 use crate::traits::ai_client::AIClient;
 use crate::traits::platform_adapter::PlatformAdapter;
 use crate::traits::prompt_template::PromptTemplateLoader;
@@ -50,6 +53,15 @@ use crate::traits::timing_gate::{TimingContext, TimingDecision, TimingGateStrate
 const ACTION_REPLY: &str = "reply";
 const ACTION_IGNORE: &str = "ignore";
 const ACTION_WAIT: &str = "wait";
+
+/// 待处理的 Wait 决策条目
+#[derive(Debug, Clone)]
+struct PendingWait {
+    event: InboundEvent,
+    registered_at: Instant,
+    delay: Duration,
+    new_messages: Vec<String>,
+}
 
 pub struct MessageHandler<
     A: AIClient + 'static,
@@ -65,9 +77,9 @@ pub struct MessageHandler<
     token_counter: Arc<TokenCounter>,
 
     timing_gate: DefaultTimingGate<A, L>,
-    conversation_planner: Arc<ConversationPlanner<A>>,
+    conversation_planner: Arc<ConversationPlanner<A, L>>,
     plan_coordinator: Arc<ConversationPlanCoordinator<A, L>>,
-    context_builder: Arc<ConversationContextBuilder<L>>,
+    context_builder: Arc<ConversationContextBuilder<L, A>>,
     reply_agent: ReplyAgent<A, L>,
     reply_pipeline: Arc<ReplyPipeline<L>>,
 
@@ -97,6 +109,7 @@ pub struct MessageHandler<
     image_pipeline: Arc<ImagePipeline<A, L>>,
 
     last_send_time: DashMap<String, Instant>,
+    pending_waits: DashMap<String, PendingWait>,
     rate_limit_lock: TokioMutex<()>,
 
     platform: Arc<P>,
@@ -138,24 +151,20 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         );
 
         let planner_model = config.model.primary_model.clone();
-        let planner = Arc::new(ConversationPlanner::new(ai_client.clone(), &planner_model));
+        let planner = Arc::new(
+            ConversationPlanner::new(
+                ai_client.clone(),
+                template_loader.clone(),
+                &planner_model,
+                &config.identity.name,
+                &config.identity.alias,
+                "zh-CN",
+            )
+            .with_emoji_enabled(config.emoji.enabled),
+        );
         let session_mgr = Arc::new(ConversationSessionManager::new(Some(
             memory_manager.conversation_store(),
         )));
-
-        let context_builder = ConversationContextBuilder::new(memory_manager.conversation_store())
-            .with_session_manager(session_mgr.clone())
-            .with_memory_manager(memory_manager.clone());
-        let context_builder = Arc::new(context_builder);
-
-        let plan_coord = ConversationPlanCoordinator::new(
-            planner.clone(),
-            session_mgr.clone(),
-            context_builder.clone(),
-            config.identity.name.clone(),
-        )
-        .with_conversation_store(memory_manager.conversation_store());
-        let plan_coord = Arc::new(plan_coord);
 
         let reply_agent = ReplyAgent::new(
             config.clone(),
@@ -203,7 +212,16 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         ));
 
         let reply_effect_tracker = Arc::new(TokioMutex::new(ReplyEffectTracker::new(600.0)));
-        let reply_side_effects = Arc::new(ReplySideEffects::new(reply_effect_tracker.clone()));
+        let signal_orchestrator = Arc::new(SignalOrchestrator::new(
+            memory_manager.signal_store(),
+            ai_client.clone(),
+            template_loader.clone(),
+            &config.model.primary_model,
+            "zh-CN",
+            60.0,
+            "v1",
+            "global",
+        ));
 
         let text_toolkit = Arc::new(MessageTextToolkit::new(
             config.bot_behavior.max_message_length,
@@ -220,6 +238,26 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
             image_client.clone(),
             Some(emoji_manager.clone()),
         ));
+
+        let drive_store = DriveStore::new(&config.memory.data_dir);
+        let drive_engine = Arc::new(DriveEngine::new(drive_store, "global", true));
+
+        let context_builder = ConversationContextBuilder::new(memory_manager.conversation_store())
+            .with_session_manager(session_mgr.clone())
+            .with_memory_manager(memory_manager.clone())
+            .with_retrieval_coordinator(memory_manager.retrieval_coordinator())
+            .with_drive_engine(drive_engine.clone())
+            .with_image_pipeline(image_pipeline.clone());
+        let context_builder = Arc::new(context_builder);
+
+        let plan_coord = ConversationPlanCoordinator::new(
+            planner.clone(),
+            session_mgr.clone(),
+            context_builder.clone(),
+            config.identity.name.clone(),
+        )
+        .with_conversation_store(memory_manager.conversation_store());
+        let plan_coord = Arc::new(plan_coord);
 
         let group_collector = Arc::new(
             GroupMessageCollector::new(50)
@@ -243,7 +281,18 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
             Arc::new(NarrativeService::new(&storage_dir_str))
         };
 
-        let command_handler = Arc::new(CommandHandler::new(config.clone(), None, None));
+        let reply_side_effects = Arc::new(
+            ReplySideEffects::new(reply_effect_tracker.clone())
+                .with_signal_orchestrator(signal_orchestrator)
+                .with_character_card_service(character_card_service.clone()),
+        );
+
+        let command_handler = Arc::new(CommandHandler::new(
+            config.clone(),
+            session_mgr.clone(),
+            None,
+            None,
+        ));
 
         let mood_store = {
             let mood_path = db_dir.join("moods.db");
@@ -284,6 +333,7 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
             identity_provider,
             image_pipeline,
             last_send_time: DashMap::new(),
+            pending_waits: DashMap::new(),
             rate_limit_lock: TokioMutex::new(()),
             platform,
         }
@@ -384,25 +434,43 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
             .map(|m| m.scope.clone())
             .unwrap_or(ChatScope::Private);
 
+        // 先检查是否有待处理的 wait 决策已解决
+        let conversation_key = self.session_manager.get_key_for_event(event);
+        if let Some(decision) = self.take_wait_decision(&conversation_key).await {
+            match decision {
+                TimingDecision::Reply => {
+                    return self._plan_with_coordinator(event, trace_id).await;
+                }
+                TimingDecision::Wait(delay) => {
+                    let mut p = empty_plan();
+                    p.action = ACTION_WAIT.to_string();
+                    p.reason = format!("Wait 重入后仍决定等待 {:.0} 秒", delay);
+                    p.source = "timing_gate".to_string();
+                    return Ok(p);
+                }
+                TimingDecision::Ignore => {
+                    let mut p = empty_plan();
+                    p.action = ACTION_IGNORE.to_string();
+                    p.reason = "Wait 重入后决定忽略".to_string();
+                    p.source = "timing_gate".to_string();
+                    return Ok(p);
+                }
+            }
+        }
+
+        // 新消息到达时通知 TimingGate 的 wait 队列
+        let user_message = self.extract_user_message(event);
+        self.notify_new_message(&conversation_key, &user_message);
+
         if scope.is_private() {
-            let mut p = empty_plan();
-            p.action = ACTION_REPLY.to_string();
-            p.reason = "私聊消息，直接回复".to_string();
-            p.source = "rule".to_string();
-            p.should_reply = true;
-            return Ok(p);
+            return self._plan_with_coordinator(event, trace_id).await;
         }
 
         let only_at_mode = self.app_config.group_reply.only_reply_when_at;
 
         if only_at_mode {
             if self._is_direct_mention(event) {
-                let mut p = empty_plan();
-                p.action = ACTION_REPLY.to_string();
-                p.reason = "群聊仅在被 @ 时回复，当前消息命中 @".to_string();
-                p.source = "rule".to_string();
-                p.should_reply = true;
-                return Ok(p);
+                return self._plan_with_coordinator(event, trace_id).await;
             }
             let mut p = empty_plan();
             p.action = ACTION_IGNORE.to_string();
@@ -412,15 +480,114 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         }
 
         if self._is_direct_mention(event) {
-            let mut p = empty_plan();
-            p.action = ACTION_REPLY.to_string();
-            p.reason = "群聊消息显式 @ 了助手，直接回复".to_string();
-            p.source = "rule".to_string();
-            p.should_reply = true;
-            return Ok(p);
+            return self._plan_with_coordinator(event, trace_id).await;
         }
 
-        self._plan_with_timing_gate(event, trace_id).await
+        let timing_plan = self._plan_with_timing_gate(event, trace_id).await?;
+        if timing_plan.action == ACTION_REPLY {
+            return self._plan_with_coordinator(event, trace_id).await;
+        }
+
+        // Wait 决策：注册到 TimingGate 等待队列
+        if timing_plan.action == ACTION_WAIT {
+            if let Some(delay) = timing_plan
+                .reply_context
+                .get("wait_delay_seconds")
+                .and_then(|v| v.as_f64())
+            {
+                self.register_wait(&conversation_key, event.clone(), delay);
+            }
+        }
+
+        Ok(timing_plan)
+    }
+
+    /// 注册 Wait 决策到待处理队列
+    fn register_wait(&self, conversation_key: &str, event: InboundEvent, delay_seconds: f64) {
+        let delay = Duration::from_secs_f64(delay_seconds.max(0.05));
+        self.pending_waits.insert(
+            conversation_key.to_string(),
+            PendingWait {
+                event,
+                registered_at: Instant::now(),
+                delay,
+                new_messages: Vec::new(),
+            },
+        );
+    }
+
+    /// 新消息到达时通知待处理 Wait 队列
+    fn notify_new_message(&self, conversation_key: &str, user_message: &str) {
+        if let Some(mut wait) = self.pending_waits.get_mut(conversation_key) {
+            wait.new_messages.push(user_message.to_string());
+        }
+    }
+
+    /// 取出并执行 Wait 决策的二次判断
+    ///
+    /// - 若等待未到期，返回剩余等待时间
+    /// - 若等待已到期，移除该等待项并使用 TimingGate 重新评估
+    async fn take_wait_decision(&self, conversation_key: &str) -> Option<TimingDecision> {
+        let (expired, event, new_messages, remaining) = {
+            let wait = self.pending_waits.get(conversation_key)?;
+            let elapsed = wait.registered_at.elapsed();
+            if elapsed < wait.delay {
+                (false, wait.event.clone(), Vec::new(), wait.delay - elapsed)
+            } else {
+                (
+                    true,
+                    wait.event.clone(),
+                    wait.new_messages.clone(),
+                    Duration::ZERO,
+                )
+            }
+        };
+
+        if !expired {
+            return Some(TimingDecision::Wait(remaining.as_secs_f64()));
+        }
+
+        self.pending_waits.remove(conversation_key);
+
+        let mut ctx = self._build_timing_context(&event).await;
+        ctx.new_messages_since_wait = new_messages;
+
+        match self.timing_gate.should_reply(&ctx).await {
+            Ok(decision) => Some(decision),
+            Err(_) => Some(TimingDecision::Ignore),
+        }
+    }
+
+    async fn _plan_with_coordinator(
+        &self,
+        event: &InboundEvent,
+        _trace_id: &str,
+    ) -> XueliResult<MessageHandlingPlan> {
+        match self.plan_coordinator.coordinate(event).await {
+            Ok(plan) => Ok(plan),
+            Err(e) => {
+                tracing::warn!("[MessageHandler] 规划协调失败，使用规则 fallback: {}", e);
+                let mut p = MessageHandlingPlan {
+                    action: String::new(),
+                    reason: String::new(),
+                    source: String::new(),
+                    should_reply: false,
+                    raw_decision: None,
+                    reply_context: HashMap::new(),
+                    prompt_plan: None,
+                    reply_reference: String::new(),
+                    planning_signals: HashMap::new(),
+                    planner_caution_hint: None,
+                    risk_posture: None,
+                    cached_context: None,
+                };
+                p.action = ACTION_REPLY.to_string();
+                p.reason = "规划器失败，规则 fallback 回复".to_string();
+                p.source = "rule_fallback".to_string();
+                p.should_reply = true;
+                Ok(p)
+            }
+        }
     }
 
     async fn _plan_with_timing_gate(
@@ -428,34 +595,32 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         event: &InboundEvent,
         _trace_id: &str,
     ) -> XueliResult<MessageHandlingPlan> {
-        let ctx = TimingContext {
-            event: event.clone(),
-            is_mentioned: self._is_direct_mention(event),
-            conversation_active: true,
-            time_since_last_reply_secs: 10.0,
-            message_count_in_window: 3,
-            recent_history_text: String::new(),
-            new_messages_since_wait: Vec::new(),
-        };
+        let ctx = self._build_timing_context(event).await;
 
         let decision = self.timing_gate.should_reply(&ctx).await;
 
-        let (action, reason) = match decision {
+        let (action, reason, wait_delay) = match decision {
             Ok(d) => {
-                let action = match d {
-                    TimingDecision::Reply => ACTION_REPLY,
-                    TimingDecision::Wait(_) => ACTION_WAIT,
-                    TimingDecision::Ignore => ACTION_IGNORE,
+                let (action, delay) = match d {
+                    TimingDecision::Reply => (ACTION_REPLY, None),
+                    TimingDecision::Wait(secs) => (ACTION_WAIT, Some(secs)),
+                    TimingDecision::Ignore => (ACTION_IGNORE, None),
                 };
-                (action.to_string(), "Time Gate 评估结果".to_string())
+                (action.to_string(), "Time Gate 评估结果".to_string(), delay)
             }
             Err(_) => (
                 ACTION_IGNORE.to_string(),
                 "Time Gate 评估失败，跳过".to_string(),
+                None,
             ),
         };
 
         let should_reply = action == ACTION_REPLY;
+
+        let mut reply_context = HashMap::new();
+        if let Some(delay) = wait_delay {
+            reply_context.insert("wait_delay_seconds".to_string(), serde_json::json!(delay));
+        }
 
         Ok(MessageHandlingPlan {
             action,
@@ -463,7 +628,7 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
             source: "timing_gate".to_string(),
             should_reply,
             raw_decision: None,
-            reply_context: HashMap::new(),
+            reply_context,
             prompt_plan: None,
             reply_reference: String::new(),
             planning_signals: HashMap::new(),
@@ -471,6 +636,55 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
             risk_posture: None,
             cached_context: None,
         })
+    }
+
+    async fn _build_timing_context(&self, event: &InboundEvent) -> TimingContext {
+        let conversation_key = self.session_manager.get_key_for_event(event);
+        let recent_records = self
+            .session_manager
+            .get_recent_messages(&conversation_key, 20)
+            .await;
+
+        let recent_history_text = if recent_records.is_empty() {
+            String::new()
+        } else {
+            let items: Vec<crate::handlers::shared::unified_history_renderer::UnifiedHistoryItem> =
+                recent_records
+                    .iter()
+                    .map(|m| {
+                        crate::handlers::shared::unified_history_renderer::UnifiedHistoryItem {
+                            timestamp: m.timestamp,
+                            role: m.role.clone(),
+                            content: m.content.clone(),
+                        }
+                    })
+                    .collect();
+            crate::handlers::shared::unified_history_renderer::render_unified_history(
+                &items, "", false, 50,
+            )
+        };
+
+        let last_reply_time = recent_records
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .map(|m| m.timestamp);
+        let time_since_last_reply_secs = match last_reply_time {
+            Some(t) => (chrono::Utc::now().timestamp() as f64 - t).max(0.0),
+            None => 3600.0,
+        };
+
+        let message_count_in_window = recent_records.len() as u32;
+
+        TimingContext {
+            event: event.clone(),
+            is_mentioned: self._is_direct_mention(event),
+            conversation_active: message_count_in_window > 0,
+            time_since_last_reply_secs,
+            message_count_in_window,
+            recent_history_text,
+            new_messages_since_wait: Vec::new(),
+        }
     }
 
     pub async fn build_message_context(
@@ -508,7 +722,7 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
     ) -> XueliResult<Option<ReplyAction>> {
         let user_message = self.extract_user_message(event);
 
-        if let Some(cmd_text) = self.command_handler.handle(&user_message) {
+        if let Some(cmd_text) = self.command_handler.handle(&user_message, event) {
             let scope = event
                 .message
                 .as_ref()
@@ -523,18 +737,7 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
             }));
         }
 
-        if self.image_pipeline.is_enabled() {
-            let is_group = event
-                .message
-                .as_ref()
-                .map(|m| m.scope.is_group())
-                .unwrap_or(false);
-            let _ = self
-                .image_pipeline
-                .analyze(event, &user_message, is_group)
-                .await;
-        }
-
+        // 视觉分析现在由 ContextBuilder 在 build() 中统一注入
         let context = match prebuilt_context {
             Some(ctx) => ctx,
             None => {
@@ -869,7 +1072,7 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
     }
 
     /// 获取规划器引用
-    pub fn planner(&self) -> &Arc<ConversationPlanner<A>> {
+    pub fn planner(&self) -> &Arc<ConversationPlanner<A, L>> {
         &self.conversation_planner
     }
 
@@ -1208,8 +1411,9 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
             return None;
         }
         let user_text = self.extract_user_message(event);
+        let message_id = event.message.as_ref().map(|m| m.id.as_str()).unwrap_or("");
         self.reply_side_effects
-            .evaluate_reply_effect(&user_id, &group_id, &user_text, "")
+            .evaluate_reply_effect(&user_id, &group_id, message_id, &user_text, "")
             .await
     }
 
@@ -1227,34 +1431,15 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         if user_id.is_empty() {
             return;
         }
-        // 记录交互信号到角色卡
-        match score.label.as_str() {
-            "negative" => {
-                let _ = self
-                    .character_card_service
-                    .record_interaction_signal(&user_id, "reply_negative");
-            }
-            "positive" => {
-                let _ = self
-                    .character_card_service
-                    .record_interaction_signal(&user_id, "reply_positive");
-            }
-            "repair" => {
-                let _ = self
-                    .character_card_service
-                    .record_interaction_signal(&user_id, "reply_repair");
-            }
-            _ => {}
-        }
-        if !score.reply_intent.is_empty() && !score.feedback_label.is_empty() {
-            let _ = self.character_card_service.record_interaction_signal(
-                &user_id,
-                &format!(
-                    "reply_effect:{}:{}",
-                    score.reply_intent, score.feedback_label
-                ),
-            );
-        }
+        let scope = event
+            .message
+            .as_ref()
+            .map(|m| m.scope.clone())
+            .unwrap_or(ChatScope::Private);
+        let group_id = scope.group_id().unwrap_or("").to_string();
+        self.reply_side_effects
+            .apply_reply_effect(&user_id, &group_id, score)
+            .await;
     }
 
     /// 异步执行协程并设置超时，超时或失败时返回 fallback 值
