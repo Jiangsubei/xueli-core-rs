@@ -189,6 +189,30 @@ impl RelationshipProfileInternal {
     }
 }
 
+/// 在 tokio 多线程运行时将同步文件 I/O 委托到 `spawn_blocking`，
+/// 单线程运行时或直接单元测试中回退为同步执行。
+fn run_blocking_io<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        // `block_in_place` 仅在多线程 runtime 可用；单线程 runtime 中直接执行。
+        let can_block_in_place = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::task::block_in_place(|| {})
+        }))
+        .is_ok();
+        if can_block_in_place {
+            return tokio::task::block_in_place(|| {
+                handle
+                    .block_on(tokio::task::spawn_blocking(f))
+                    .expect("blocking I/O spawn_blocking failed")
+            });
+        }
+    }
+    f()
+}
+
 /// 每用户持久化载荷
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct UserPayload {
@@ -881,17 +905,6 @@ impl CharacterCardService {
                     created_at: now.clone(),
                 });
             }
-            let actual = Self::normalize_expected_effect(
-                if score > 0.0 { "satisfy" } else { "clarify" },
-                true,
-            );
-            if !actual.is_empty() {
-                payload.stable_signals.push(SignalEntry {
-                    signal: format!("expected_actual:{}:{}", normalized_expected, actual),
-                    weight: 1,
-                    created_at: now.clone(),
-                });
-            }
         }
 
         if let Some(met) = prediction_met {
@@ -1026,7 +1039,7 @@ impl CharacterCardService {
         user_id: String,
         signal_name: String,
     ) -> XueliResult<()> {
-        tokio::task::block_in_place(|| self.record_interaction_signal(&user_id, &signal_name))
+        self.record_interaction_signal(&user_id, &signal_name)
     }
 
     pub async fn record_feedback_async(
@@ -1038,79 +1051,92 @@ impl CharacterCardService {
     ) {
         let traits_refs: Vec<&str> = traits.iter().map(|s| s.as_str()).collect();
         let prefs_refs: Vec<&str> = preferences.iter().map(|s| s.as_str()).collect();
-        tokio::task::block_in_place(|| {
-            self.record_feedback(&user_id, sentiment, &traits_refs, &prefs_refs)
-        })
+        self.record_feedback(&user_id, sentiment, &traits_refs, &prefs_refs);
     }
 
     pub async fn refresh_snapshot_async(&self, user_id: String) -> CharacterCardSnapshot {
-        tokio::task::block_in_place(|| self.refresh_snapshot(&user_id))
+        self.refresh_snapshot(&user_id)
     }
 
     // ── 载荷管理 ──
 
     fn load_payload(&self, user_id: &str) -> UserPayload {
-        let path = build_scope_payload_path(&self.storage_dir, user_id, "payload.json");
-        match std::fs::read_to_string(&path) {
-            Ok(data) => match serde_json::from_str(&data) {
-                Ok(p) => return p,
-                Err(_) => {}
-            },
-            Err(_) => {}
-        }
-        let legacy = legacy_payload_path(&self.storage_dir, user_id, "payload.json");
-        match std::fs::read_to_string(&legacy) {
-            Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
-            Err(_) => UserPayload::default(),
-        }
+        let storage_dir = self.storage_dir.clone();
+        let user_id = user_id.to_string();
+        run_blocking_io(move || {
+            let path = build_scope_payload_path(&storage_dir, &user_id, "payload.json");
+            if let Ok(data) = std::fs::read_to_string(&path) {
+                if let Ok(p) = serde_json::from_str(&data) {
+                    return p;
+                }
+            }
+            let legacy = legacy_payload_path(&storage_dir, &user_id, "payload.json");
+            if let Ok(data) = std::fs::read_to_string(&legacy) {
+                serde_json::from_str(&data).unwrap_or_default()
+            } else {
+                UserPayload::default()
+            }
+        })
     }
 
     fn save_payload(&self, user_id: &str, payload: &UserPayload) {
-        let path = build_scope_payload_path(&self.storage_dir, user_id, "payload.json");
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let content = serde_json::to_string_pretty(payload).unwrap_or_default();
-        let tmp = format!("{}.tmp", path);
-        let _ = std::fs::write(&tmp, &content);
-        let _ = std::fs::rename(&tmp, &path);
+        let storage_dir = self.storage_dir.clone();
+        let user_id = user_id.to_string();
+        let payload = payload.clone();
+        run_blocking_io(move || {
+            let path = build_scope_payload_path(&storage_dir, &user_id, "payload.json");
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let content = serde_json::to_string_pretty(&payload).unwrap_or_default();
+            let tmp = format!("{}.tmp", path);
+            let _ = std::fs::write(&tmp, &content);
+            let _ = std::fs::rename(&tmp, &path);
+        });
     }
 
     // ── 快照文件读写 ──
 
     fn save_one(&self, snapshot: &CharacterCardSnapshot) {
-        let path = build_scope_payload_path(&self.storage_dir, &snapshot.user_id, "card.json");
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let tmp = format!("{}.tmp", path);
-        if let Ok(data) = serde_json::to_string_pretty(snapshot) {
-            let _ = std::fs::write(&tmp, data);
-            let _ = std::fs::rename(&tmp, &path);
-        }
+        let storage_dir = self.storage_dir.clone();
+        let snapshot = snapshot.clone();
+        run_blocking_io(move || {
+            let path = build_scope_payload_path(&storage_dir, &snapshot.user_id, "card.json");
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let tmp = format!("{}.tmp", path);
+            if let Ok(data) = serde_json::to_string_pretty(&snapshot) {
+                let _ = std::fs::write(&tmp, data);
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        });
     }
 
     fn load_all(&mut self) {
-        if let Ok(entries) = std::fs::read_dir(&self.storage_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().map_or(false, |e| e == "json")
-                    && path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map_or(false, |n| n.ends_with("_card.json"))
-                {
-                    if let Ok(data) = std::fs::read_to_string(&path) {
-                        if let Ok(snap) = serde_json::from_str::<CharacterCardSnapshot>(&data) {
-                            self.snapshots
-                                .lock()
-                                .unwrap()
-                                .insert(snap.user_id.clone(), snap);
+        let storage_dir = self.storage_dir.clone();
+        let snapshots = run_blocking_io(move || {
+            let mut map = HashMap::new();
+            if let Ok(entries) = std::fs::read_dir(&storage_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |e| e == "json")
+                        && path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map_or(false, |n| n.ends_with("_card.json"))
+                    {
+                        if let Ok(data) = std::fs::read_to_string(&path) {
+                            if let Ok(snap) = serde_json::from_str::<CharacterCardSnapshot>(&data) {
+                                map.insert(snap.user_id.clone(), snap);
+                            }
                         }
                     }
                 }
             }
-        }
+            map
+        });
+        *self.snapshots.lock().unwrap() = snapshots;
     }
 }
 
