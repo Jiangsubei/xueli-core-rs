@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -15,6 +16,7 @@ use crate::signals::cache::SignalCache;
 use crate::signals::engagement::build_message_observations;
 use crate::signals::temporal::TemporalContext;
 use crate::traits::ai_client::{AIClient, ChatCompletionRequest, ChatMessage};
+use crate::traits::feedback_triage::FeedbackTriageProvider;
 use crate::traits::prompt_template::PromptTemplateLoader;
 
 /// L1 缓存元数据（与 L2 同步比较用）
@@ -256,7 +258,7 @@ impl<A: AIClient, L: PromptTemplateLoader> SignalOrchestrator<A, L> {
         expected_effect: &str,
         predicted_response: &str,
         relationship_summary: &str,
-    ) -> Value {
+    ) -> Option<Value> {
         self._maybe_cleanup().await;
         let key = self.build_text_signal_key("feedback_triage_signal", scope_key, message_id);
 
@@ -269,7 +271,7 @@ impl<A: AIClient, L: PromptTemplateLoader> SignalOrchestrator<A, L> {
                     cache.pop(&key);
                     self.l1_meta.lock().await.remove(&key);
                 } else {
-                    return cached;
+                    return Some(cached);
                 }
             }
         }
@@ -284,7 +286,7 @@ impl<A: AIClient, L: PromptTemplateLoader> SignalOrchestrator<A, L> {
                 );
             }
             self._capture_l1_meta_from_l2(&key).await;
-            return stored;
+            return Some(stored);
         }
 
         let computed = match self
@@ -299,14 +301,17 @@ impl<A: AIClient, L: PromptTemplateLoader> SignalOrchestrator<A, L> {
         {
             Ok(v) => v,
             Err(e) => {
-                tracing::debug!("[信号编排] feedback triage 计算失败，降级规则: {:?}", e);
-                Value::Object(serde_json::Map::new())
+                tracing::debug!(
+                    "[信号编排] feedback triage 计算失败，不注入语义信号: {:?}",
+                    e
+                );
+                return None;
             }
         };
 
         self._persist_then_keep_short_ttl(&key, "feedback_triage_signal", &computed)
             .await;
-        computed
+        Some(computed)
     }
 
     // ── 长期叙事记忆更新 ──────────────────────────────────────
@@ -738,6 +743,32 @@ impl<A: AIClient, L: PromptTemplateLoader> SignalOrchestrator<A, L> {
             Value::String(self.prompt_version.clone()),
         );
         Ok(Value::Object(result))
+    }
+}
+
+#[async_trait]
+impl<A: AIClient, L: PromptTemplateLoader> FeedbackTriageProvider for SignalOrchestrator<A, L> {
+    async fn get_or_compute_feedback_triage_signal(
+        &self,
+        scope_key: &str,
+        message_id: &str,
+        reply_text: &str,
+        user_text: &str,
+        expected_effect: &str,
+        predicted_response: &str,
+        relationship_summary: &str,
+    ) -> Option<Value> {
+        SignalOrchestrator::get_or_compute_feedback_triage_signal(
+            self,
+            scope_key,
+            message_id,
+            reply_text,
+            user_text,
+            expected_effect,
+            predicted_response,
+            relationship_summary,
+        )
+        .await
     }
 }
 
