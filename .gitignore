@@ -6,3 +6,6 @@ data/
 # 忽略ai编程工具配置目录
 .trae/
 .claude/
+
+# 代码图谱产物
+graphify-out/
