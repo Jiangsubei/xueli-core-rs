@@ -135,6 +135,12 @@ pub struct InboundEvent {
     /// 回复目标消息 ID
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to_message_id: Option<String>,
+    /// 时间间隔分桶（由调度器/上下文构建阶段填充，用于 Drive 事件模式提取）
+    #[serde(default)]
+    pub temporal_gap_bucket: String,
+    /// 用户反馈标签（由效果追踪器填充，用于 Drive 事件模式提取）
+    #[serde(default)]
+    pub feedback_label: String,
 }
 
 impl InboundEvent {
@@ -184,6 +190,8 @@ impl Default for InboundEvent {
             clean_text: String::new(),
             timestamp: 0.0,
             reply_to_message_id: None,
+            temporal_gap_bucket: String::new(),
+            feedback_label: String::new(),
         }
     }
 }

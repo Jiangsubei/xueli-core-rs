@@ -274,6 +274,34 @@ impl ConversationContextItem {
     }
 }
 
+/// 记忆加载强度配置
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum MemoryProfile {
+    /// 不加载记忆
+    #[default]
+    Off,
+    /// 仅加载人物事实
+    FactsOnly,
+    /// 加载相关记忆
+    Relevant,
+    /// 加载完整记忆
+    Rich,
+}
+
+/// 提示词区段强度
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum SectionIntensity {
+    /// 标准强度
+    #[default]
+    Normal,
+    /// 高强调
+    High,
+    /// 轻量
+    Light,
+    /// 关闭
+    Off,
+}
+
 /// 动作规划后生成的结构化提示词策略
 ///
 /// 对应 Python 版 `src.core.models.PromptPlan`
@@ -286,9 +314,23 @@ pub struct PromptPlan {
     #[serde(default)]
     pub personality_mode: String,
     #[serde(default)]
+    pub timeline_detail: String,
+    #[serde(default)]
+    pub context_profile: String,
+    #[serde(default)]
+    pub memory_profile: MemoryProfile,
+    #[serde(default)]
+    pub tone_profile: String,
+    #[serde(default)]
+    pub initiative: String,
+    #[serde(default)]
+    pub expression_profile: String,
+    #[serde(default)]
     pub emoji_should_send: bool,
     #[serde(default)]
     pub emoji_instruction: String,
+    #[serde(default)]
+    pub emoji_intent_reference: String,
     #[serde(default)]
     pub conversation_style: String,
     #[serde(default)]
@@ -299,6 +341,8 @@ pub struct PromptPlan {
     pub policy: PromptSectionPolicy,
     #[serde(default)]
     pub notes: String,
+    #[serde(default)]
+    pub section_intensity: HashMap<String, SectionIntensity>,
 }
 
 impl Default for PromptPlan {
@@ -307,13 +351,21 @@ impl Default for PromptPlan {
             reply_goal: "continue".to_string(),
             continuity_mode: "direct_continue".to_string(),
             personality_mode: "balanced".to_string(),
+            timeline_detail: "off".to_string(),
+            context_profile: "standard".to_string(),
+            memory_profile: MemoryProfile::default(),
+            tone_profile: "balanced".to_string(),
+            initiative: "reactive".to_string(),
+            expression_profile: "plain".to_string(),
             emoji_should_send: false,
             emoji_instruction: String::new(),
+            emoji_intent_reference: String::new(),
             conversation_style: "standard".to_string(),
             mood_instruction: String::new(),
             planner_reminder: String::new(),
             policy: PromptSectionPolicy::default(),
             notes: String::new(),
+            section_intensity: HashMap::new(),
         }
     }
 }
