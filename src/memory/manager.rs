@@ -119,17 +119,13 @@ impl<L: PromptTemplateLoader + 'static> MemoryManager<L> {
     /// 设置 LLM 客户端（启用记忆提取和消化功能）
     pub fn with_llm_client(
         self: Arc<Self>,
-        _client: Arc<dyn crate::traits::ai_client::AIClient>,
-        _model: String,
+        client: Arc<dyn crate::traits::ai_client::AIClient>,
+        model: String,
     ) -> Arc<Self> {
-        // 由于 background_coordinator 已在 new() 中创建，
-        // 需要通过 Arc 内部可变性来更新 coordinator 的 LLM 客户端
-        // 当前实现中 coordinator 的 llm_client 是 Option，通过 builder 设置
-        // 这里我们重新构建 coordinator
-        if let Some(ref _coord) = self.background_coordinator {
-            // coordinator 的 llm_client 在构建时已设为 None，
-            // 需要在构建时传入。此处通过 rebuild 方式处理。
-            tracing::info!("[MemoryManager] LLM 客户端设置需在构建时完成");
+        if let Some(ref coord) = self.background_coordinator {
+            coord.set_llm_client(client);
+            coord.set_llm_model(model);
+            tracing::info!("[MemoryManager] LLM 客户端与模型已注入后台协调器");
         }
         self
     }
@@ -294,7 +290,8 @@ impl<L: PromptTemplateLoader + 'static> MemoryManager<L> {
         ]
         .into_iter()
         .collect();
-        self.retrieval_coordinator
+        let result = self
+            .retrieval_coordinator
             .build_prompt_context(
                 user_id,
                 query,
@@ -303,7 +300,14 @@ impl<L: PromptTemplateLoader + 'static> MemoryManager<L> {
                 &section_intensity,
                 "",
             )
-            .await
+            .await?;
+
+        // Schedule recall writeback (matching Python behavior)
+        if !result.used_memory_ids.is_empty() {
+            self.schedule_mark_recalled(user_id.to_string(), result.used_memory_ids.clone());
+        }
+
+        Ok(result)
     }
 
     pub async fn quick_check_relevance(
@@ -325,10 +329,11 @@ impl<L: PromptTemplateLoader + 'static> MemoryManager<L> {
         content: &str,
         source: &str,
         priority: i32,
+        metadata_json: Option<&str>,
     ) -> XueliResult<Option<ImportantMemory>> {
         let result = self
             .important_store
-            .add_memory(user_id, content, source, priority, None)
+            .add_memory(user_id, content, source, priority, metadata_json)
             .await?;
         if result.is_some() {
             if let Err(e) = self.person_fact_service.sync_user_facts(user_id).await {
@@ -361,10 +366,19 @@ impl<L: PromptTemplateLoader + 'static> MemoryManager<L> {
         self.important_store.search_memories(user_id, query).await
     }
 
-    pub async fn delete_important_memory(&self, mem_id: &str) -> XueliResult<bool> {
-        let result = self.important_store.delete_memory(mem_id).await?;
+    pub async fn delete_important_memory(
+        &self,
+        user_id: &str,
+        content_substring: &str,
+    ) -> XueliResult<bool> {
+        let result = self
+            .important_store
+            .delete_memory_by_content(user_id, content_substring)
+            .await?;
         if result {
-            // 无法从 mem_id 反推 user_id，跳过人物事实同步
+            if let Err(e) = self.person_fact_service.sync_user_facts(user_id).await {
+                tracing::warn!("[MemoryManager] 同步人物事实失败: {}", e);
+            }
         }
         Ok(result)
     }
@@ -386,9 +400,18 @@ impl<L: PromptTemplateLoader + 'static> MemoryManager<L> {
         Ok(result)
     }
 
-    pub async fn update_important_memory(&self, mem_id: &str, content: &str) -> XueliResult<bool> {
+    pub async fn update_important_memory(
+        &self,
+        user_id: &str,
+        mem_id: &str,
+        content: &str,
+    ) -> XueliResult<bool> {
         let result = self.important_store.update_memory(mem_id, content).await?;
-        // 无法从 mem_id 反推 user_id，跳过人物事实同步
+        if result {
+            if let Err(e) = self.person_fact_service.sync_user_facts(user_id).await {
+                tracing::warn!("[MemoryManager] 同步人物事实失败: {}", e);
+            }
+        }
         Ok(result)
     }
 
@@ -406,10 +429,14 @@ impl<L: PromptTemplateLoader + 'static> MemoryManager<L> {
         Ok(count)
     }
 
-    pub async fn format_important_memories_for_prompt(&self, user_id: &str) -> XueliResult<String> {
+    pub async fn format_important_memories_for_prompt(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> XueliResult<String> {
         let context = MemoryAccessContext::new(user_id, &ChatScope::Private);
         self.retrieval_coordinator
-            .format_important_memories_for_prompt(user_id, &context, 5)
+            .format_important_memories_for_prompt(user_id, &context, limit)
             .await
     }
 
@@ -532,9 +559,13 @@ impl<L: PromptTemplateLoader + 'static> MemoryManager<L> {
         self.person_fact_store.get_by_user(user_id).await
     }
 
-    pub async fn format_person_facts_for_prompt(&self, user_id: &str) -> XueliResult<String> {
+    pub async fn format_person_facts_for_prompt(
+        &self,
+        user_id: &str,
+        limit: Option<usize>,
+    ) -> XueliResult<String> {
         self.person_fact_service
-            .format_facts_for_prompt(user_id, None)
+            .format_facts_for_prompt(user_id, limit)
             .await
     }
 

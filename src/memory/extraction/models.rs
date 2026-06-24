@@ -4,51 +4,71 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct ExtractedMemory {
     pub content: String,
-    pub anchor_start: String, // T1-T3 format
-    pub anchor_end: String,
-    pub category: String,
+    pub source_turn_start: u32,
+    pub source_turn_end: u32,
+    pub is_important: bool,
+    pub importance: u32,
     pub emotional_tone: String,
-    pub importance: f64, // 0.0-1.0
-    pub fact_kind: Option<String>,
-    pub tags: Vec<String>,
-    pub metadata: HashMap<String, String>,
+    pub memory_category: String,
+    pub fact_kind: String,
 }
 
 /// Extraction configuration
 #[derive(Debug, Clone)]
 pub struct ExtractionConfig {
+    pub extract_every_n_turns: usize,
+    pub max_dialogue_length: usize,
+    pub min_memory_quality: f64,
+    pub reflection_enabled: bool,
+    pub reflection_candidate_limit: usize,
+    pub reflection_min_topic_overlap: f64,
+    pub prompt_template_name: String,
+    pub system_prompt: String,
     pub max_retries: u32,
     pub temperature: f64,
-    pub min_memory_quality: f64,
-    pub max_dialogue_length: usize,
 }
 
 impl Default for ExtractionConfig {
     fn default() -> Self {
         Self {
+            extract_every_n_turns: 3,
+            max_dialogue_length: 10,
+            min_memory_quality: 0.7,
+            reflection_enabled: true,
+            reflection_candidate_limit: 3,
+            reflection_min_topic_overlap: 0.45,
+            prompt_template_name: "memory_extraction.prompt".to_string(),
+            system_prompt: String::new(),
             max_retries: 3,
             temperature: 0.3,
-            min_memory_quality: 0.4,
-            max_dialogue_length: 30,
         }
     }
 }
 
 /// Memory reflection result
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MemoryReflectionResult {
-    pub conflicts: Vec<MemoryConflict>,
-    pub patterns: Vec<String>,
-    pub suggestions: Vec<String>,
+    pub has_conflict: bool,
+    pub conflict_type: String,
+    pub action: String,
+    pub summary: String,
+    pub reason: String,
     pub confidence: f64,
+    pub evidence: Vec<HashMap<String, serde_json::Value>>,
+    pub targets: Vec<HashMap<String, serde_json::Value>>,
 }
 
-/// Memory conflict
-#[derive(Debug, Clone)]
-pub struct MemoryConflict {
-    pub old_memory: String,
-    pub new_memory: String,
-    pub conflict_type: String,
-    pub resolution: String,
-    pub reason: String,
+impl Default for MemoryReflectionResult {
+    fn default() -> Self {
+        Self {
+            has_conflict: false,
+            conflict_type: "none".to_string(),
+            action: "keep_both".to_string(),
+            summary: String::new(),
+            reason: String::new(),
+            confidence: 0.0,
+            evidence: Vec::new(),
+            targets: Vec::new(),
+        }
+    }
 }

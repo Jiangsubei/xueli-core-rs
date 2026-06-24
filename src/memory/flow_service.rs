@@ -25,6 +25,7 @@ const MAX_QUEUE_SIZE: usize = 256;
 /// 对应 Python 版 `src.memory.memory_flow_service.MemoryFlowService`
 pub struct MemoryFlowService<L: PromptTemplateLoader + 'static> {
     pub tx: mpsc::Sender<MemoryJob>,
+    rx: Option<mpsc::Receiver<MemoryJob>>,
     pub memory_manager: Arc<MemoryManager<L>>,
     dispute_resolver: MemoryDisputeResolver,
     evidence_store: Option<Arc<SqliteFactEvidenceStore>>,
@@ -79,26 +80,24 @@ impl<L: PromptTemplateLoader + 'static> MemoryFlowService<L> {
         memory_manager: Arc<MemoryManager<L>>,
         dispute_config: Option<MemoryDisputeConfig>,
         evidence_store: Option<Arc<SqliteFactEvidenceStore>>,
-    ) -> (Self, mpsc::Receiver<MemoryJob>) {
+    ) -> Self {
         let (tx, rx) = mpsc::channel(MAX_QUEUE_SIZE);
         let config = dispute_config.unwrap_or_default();
-        (
-            Self {
-                tx,
-                memory_manager,
-                dispute_resolver: MemoryDisputeResolver::new(config),
-                evidence_store,
-                recent_reply_keys: std::sync::Mutex::new(HashMap::new()),
-                running: Arc::new(AtomicBool::new(false)),
-                handle: tokio::sync::Mutex::new(None),
-                extractor: None,
-                background_coordinator: None,
-                memory_reflection: None,
-                character_card_service: None,
-                narrative_service: None,
-            },
-            rx,
-        )
+        Self {
+            tx,
+            rx: Some(rx),
+            memory_manager,
+            dispute_resolver: MemoryDisputeResolver::new(config),
+            evidence_store,
+            recent_reply_keys: std::sync::Mutex::new(HashMap::new()),
+            running: Arc::new(AtomicBool::new(false)),
+            handle: tokio::sync::Mutex::new(None),
+            extractor: None,
+            background_coordinator: None,
+            memory_reflection: None,
+            character_card_service: None,
+            narrative_service: None,
+        }
     }
 
     /// 设置记忆提取器
@@ -264,7 +263,8 @@ impl<L: PromptTemplateLoader + 'static> MemoryFlowService<L> {
     }
 
     /// 启动后台处理循环（实例方法版本，支持 LLM 服务注入）
-    pub async fn run(&self, rx: &mut mpsc::Receiver<MemoryJob>) {
+    pub async fn run(&mut self) {
+        let mut rx = self.rx.take().expect("MemoryFlowService::run 只能调用一次");
         while let Some(job) = rx.recv().await {
             match job {
                 MemoryJob::ApplyPatch(patch) => {
@@ -310,12 +310,28 @@ impl<L: PromptTemplateLoader + 'static> MemoryFlowService<L> {
                     }
                 }
                 MemoryJob::DigestInsight { user_id } => {
-                    if self.background_coordinator.is_some() {
-                        // 后台协调器有自己的消化循环，此处标记 receipt
-                        debug!(
-                            user_id = %user_id,
-                            "[MemoryFlow] 离线消化作业已接收（由 BackgroundCoordinator 消化循环处理）"
-                        );
+                    if let Some(ref coordinator) = self.background_coordinator {
+                        match coordinator.digest_user(&user_id).await {
+                            Ok(Some(insight)) => {
+                                debug!(
+                                    user_id = %user_id,
+                                    insight = %insight,
+                                    "[MemoryFlow] 离线消化生成 insight"
+                                );
+                            }
+                            Ok(None) => {
+                                debug!(
+                                    user_id = %user_id,
+                                    "[MemoryFlow] 离线消化未生成 insight"
+                                );
+                            }
+                            Err(e) => {
+                                debug!(
+                                    user_id = %user_id,
+                                    "[MemoryFlow] 离线消化失败: {e}"
+                                );
+                            }
+                        }
                     } else {
                         debug!(
                             user_id = %user_id,
@@ -516,7 +532,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let (service, mut rx) = MemoryFlowService::new(mgr.clone(), None, None);
+        let mut service = MemoryFlowService::new(mgr.clone(), None, None);
 
         let patch = MemoryPatch {
             add: vec![make_item("f1", "内容1"), make_item("f2", "内容2")],
@@ -527,7 +543,7 @@ mod tests {
 
         // 运行一轮处理
         tokio::select! {
-            _ = service.run(&mut rx) => {},
+            _ = service.run() => {},
             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
         }
 
@@ -548,10 +564,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let (service, _rx): (
-            MemoryFlowService<crate::services::prompt_loader::NoopPromptTemplateLoader>,
-            _,
-        ) = MemoryFlowService::new(mgr, None, None);
+        let service: MemoryFlowService<crate::services::prompt_loader::NoopPromptTemplateLoader> =
+            MemoryFlowService::new(mgr, None, None);
 
         let key = "test_key";
         assert!(!service.should_dedupe(key));

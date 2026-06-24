@@ -10,6 +10,7 @@ use crate::traits::ai_client::{
 use crate::traits::prompt_template::PromptTemplateLoader;
 
 use super::buffer::{BufferTurn, ExtractionBuffer};
+use super::models::ExtractionConfig;
 
 /// LLM 记忆提取器 — 从对话中提取结构化记忆
 ///
@@ -20,8 +21,7 @@ pub struct MemoryExtractor<A: AIClient + ?Sized, L: PromptTemplateLoader> {
     max_retries: usize,
     prompt_loader: Arc<L>,
     buffer: Arc<std::sync::Mutex<ExtractionBuffer>>,
-    extract_every_n_turns: usize,
-    max_dialogue_length: usize,
+    config: ExtractionConfig,
 }
 
 impl<A: AIClient + ?Sized, L: PromptTemplateLoader> MemoryExtractor<A, L> {
@@ -32,18 +32,22 @@ impl<A: AIClient + ?Sized, L: PromptTemplateLoader> MemoryExtractor<A, L> {
             max_retries: 3,
             prompt_loader,
             buffer: Arc::new(std::sync::Mutex::new(ExtractionBuffer::new())),
-            extract_every_n_turns: 5,
-            max_dialogue_length: 30,
+            config: ExtractionConfig::default(),
         }
     }
 
+    pub fn with_config(mut self, config: ExtractionConfig) -> Self {
+        self.config = config;
+        self
+    }
+
     pub fn with_extract_every_n_turns(mut self, n: usize) -> Self {
-        self.extract_every_n_turns = n.max(1);
+        self.config.extract_every_n_turns = n.max(1);
         self
     }
 
     pub fn with_max_dialogue_length(mut self, len: usize) -> Self {
-        self.max_dialogue_length = len.max(1);
+        self.config.max_dialogue_length = len.max(1);
         self
     }
 
@@ -82,7 +86,7 @@ impl<A: AIClient + ?Sized, L: PromptTemplateLoader> MemoryExtractor<A, L> {
     /// 检查是否应触发记忆提取
     pub fn should_extract(&self, session_id: &str) -> bool {
         let buf = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
-        buf.should_extract(session_id, self.extract_every_n_turns)
+        buf.should_extract(session_id, self.config.extract_every_n_turns)
     }
 
     /// 获取指定会话的待提取轮次数量
@@ -129,7 +133,7 @@ impl<A: AIClient + ?Sized, L: PromptTemplateLoader> MemoryExtractor<A, L> {
         let visible_turns: Vec<BufferTurn> = pending_turns
             .iter()
             .rev()
-            .take(self.max_dialogue_length)
+            .take(self.config.max_dialogue_length)
             .cloned()
             .collect::<Vec<_>>()
             .into_iter()
@@ -185,16 +189,16 @@ impl<A: AIClient + ?Sized, L: PromptTemplateLoader> MemoryExtractor<A, L> {
 
                         let mut items_with_metadata = Vec::new();
                         for item in patch.add {
-                            let metadata = self.build_memory_metadata(
+                            let _metadata = self.build_memory_metadata(
                                 user_id,
                                 session_id,
                                 &dialogue_key,
                                 &visible_turns,
                                 &related_dialogue,
+                                "",
+                                "",
+                                "",
                             );
-                            // 将元数据信息编码到 content 中（MemoryItem 没有 metadata 字段）
-                            // 存储层会在 add_memory_dedup 时处理
-                            let _ = &metadata;
                             items_with_metadata.push(item);
                         }
 
@@ -370,6 +374,9 @@ impl<A: AIClient + ?Sized, L: PromptTemplateLoader> MemoryExtractor<A, L> {
         dialogue_key: &str,
         anchor_turns: &[BufferTurn],
         related_dialogue: &[serde_json::Value],
+        emotional_tone: &str,
+        memory_category: &str,
+        fact_kind: &str,
     ) -> serde_json::Value {
         let first_turn = match anchor_turns.first() {
             Some(t) => t,
@@ -393,7 +400,7 @@ impl<A: AIClient + ?Sized, L: PromptTemplateLoader> MemoryExtractor<A, L> {
 
         let now_hour = chrono::Utc::now().format("%H").to_string();
 
-        serde_json::json!({
+        let mut metadata = serde_json::json!({
             "owner_user_id": owner_user_id,
             "dialogue_key": dialogue_key,
             "source_session_id": session_id,
@@ -411,7 +418,19 @@ impl<A: AIClient + ?Sized, L: PromptTemplateLoader> MemoryExtractor<A, L> {
                 "emotional_tone": "",
                 "message_type": last_turn.source_message_type,
             },
-        })
+        });
+
+        if !emotional_tone.is_empty() {
+            metadata["emotional_tone"] = serde_json::Value::String(emotional_tone.to_string());
+        }
+        if !memory_category.is_empty() {
+            metadata["memory_category"] = serde_json::Value::String(memory_category.to_string());
+        }
+        if !fact_kind.is_empty() {
+            metadata["fact_kind"] = serde_json::Value::String(fact_kind.to_string());
+        }
+
+        metadata
     }
 
     /// 构建关联对话快照 — 对应 Python 版 _build_related_dialogue_snapshot
@@ -481,7 +500,6 @@ impl<A: AIClient + ?Sized, L: PromptTemplateLoader> MemoryExtractor<A, L> {
                 let importance = m.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.5);
                 let confidence = m.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.5);
 
-                // 低置信度记忆过滤
                 if confidence < 0.3 {
                     return None;
                 }
@@ -497,6 +515,24 @@ impl<A: AIClient + ?Sized, L: PromptTemplateLoader> MemoryExtractor<A, L> {
                         _ => MemoryType::Fact,
                     })
                     .unwrap_or(MemoryType::Fact);
+
+                let _emotional_tone = m
+                    .get("emotional_tone")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let _memory_category = m
+                    .get("memory_category")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let _fact_kind = m
+                    .get("fact_kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
 
                 Some(MemoryItem {
                     id: format!("mem_{}_{}", user_id, uuid::Uuid::new_v4().as_simple()),
@@ -678,8 +714,16 @@ mod tests {
             narrative_summary: String::new(),
         }];
 
-        let metadata =
-            extractor.build_memory_metadata("u1", "session_1", "qq:private:u1", &turns, &[]);
+        let metadata = extractor.build_memory_metadata(
+            "u1",
+            "session_1",
+            "qq:private:u1",
+            &turns,
+            &[],
+            "",
+            "",
+            "",
+        );
 
         assert_eq!(metadata["owner_user_id"], "u1");
         assert_eq!(metadata["source_turn_start"], 1);

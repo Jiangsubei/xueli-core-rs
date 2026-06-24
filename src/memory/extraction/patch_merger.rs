@@ -1,4 +1,4 @@
-use crate::core::types::{MemoryItem, MemoryPatch, MemoryType};
+use crate::core::types::{MemoryItem, MemoryPatch};
 use crate::memory::memory_dispute_resolver::ReflectionPayload;
 use crate::memory::stores::memory_item::SqliteMemoryItemStore;
 use crate::prelude::XueliResult;
@@ -120,16 +120,28 @@ impl PatchMerger {
     }
 
     /// Check if ordinary memory should be promoted to important
-    pub fn should_promote_to_important(item: &MemoryItem) -> bool {
-        matches!(
-            item.memory_type,
-            MemoryType::Fact
-                | MemoryType::Preference
-                | MemoryType::Event
-                | MemoryType::Opinion
-                | MemoryType::Relationship
-        ) && item.importance >= 5.0
-            && item.access_count >= 2
+    /// Aligned with Python: checks metadata dict for memory_type, importance, mention_count
+    pub fn should_promote_to_important(metadata: &serde_json::Value) -> bool {
+        let memory_type = metadata
+            .get("memory_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if memory_type != "ordinary" {
+            return false;
+        }
+        let importance = metadata
+            .get("importance")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        if importance < 5.0 {
+            return false;
+        }
+        let mention_count = metadata
+            .get("mention_count")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0) as u32;
+        mention_count >= 2
     }
 
     /// 基于反射结果更新记忆上的 patch 元数据
@@ -407,46 +419,41 @@ mod tests {
 
     #[test]
     fn test_should_promote_to_important_eligible() {
-        let item = MemoryItem {
-            id: "id1".to_string(),
-            user_id: "u1".to_string(),
-            content: "test".to_string(),
-            memory_type: MemoryType::Fact,
-            importance: 6.0,
-            created_at: chrono::Utc::now(),
-            last_accessed_at: chrono::Utc::now(),
-            access_count: 3,
-        };
-        assert!(PatchMerger::should_promote_to_important(&item));
+        let metadata = serde_json::json!({
+            "memory_type": "ordinary",
+            "importance": 5,
+            "mention_count": 3
+        });
+        assert!(PatchMerger::should_promote_to_important(&metadata));
     }
 
     #[test]
     fn test_should_promote_to_important_not_eligible_low_importance() {
-        let item = MemoryItem {
-            id: "id2".to_string(),
-            user_id: "u1".to_string(),
-            content: "test".to_string(),
-            memory_type: MemoryType::Fact,
-            importance: 4.0,
-            created_at: chrono::Utc::now(),
-            last_accessed_at: chrono::Utc::now(),
-            access_count: 3,
-        };
-        assert!(!PatchMerger::should_promote_to_important(&item));
+        let metadata = serde_json::json!({
+            "memory_type": "ordinary",
+            "importance": 4,
+            "mention_count": 3
+        });
+        assert!(!PatchMerger::should_promote_to_important(&metadata));
     }
 
     #[test]
     fn test_should_promote_to_important_not_eligible_low_access() {
-        let item = MemoryItem {
-            id: "id3".to_string(),
-            user_id: "u1".to_string(),
-            content: "test".to_string(),
-            memory_type: MemoryType::Fact,
-            importance: 6.0,
-            created_at: chrono::Utc::now(),
-            last_accessed_at: chrono::Utc::now(),
-            access_count: 1,
-        };
-        assert!(!PatchMerger::should_promote_to_important(&item));
+        let metadata = serde_json::json!({
+            "memory_type": "ordinary",
+            "importance": 5,
+            "mention_count": 1
+        });
+        assert!(!PatchMerger::should_promote_to_important(&metadata));
+    }
+
+    #[test]
+    fn test_should_promote_to_important_not_ordinary() {
+        let metadata = serde_json::json!({
+            "memory_type": "important",
+            "importance": 5,
+            "mention_count": 3
+        });
+        assert!(!PatchMerger::should_promote_to_important(&metadata));
     }
 }

@@ -39,12 +39,12 @@ pub struct MemoryBackgroundCoordinator<L: PromptTemplateLoader + 'static> {
     important_store: Option<Arc<ImportantMemoryStore>>,
     person_fact_service: Option<Arc<PersonFactService>>,
     summary_service: Option<Arc<ChatSummaryService>>,
-    llm_client: Option<Arc<dyn AIClient>>,
+    llm_client: std::sync::Mutex<Option<Arc<dyn AIClient>>>,
     prompt_loader: Arc<L>,
 
     on_digest_tick: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>>,
     on_memory_changed: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>>,
-    on_insight_generated: Arc<Mutex<Option<Box<dyn Fn(String) + Send + Sync>>>>,
+    on_insight_generated: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
 
     running: Arc<AtomicBool>,
     digest_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -56,7 +56,7 @@ pub struct MemoryBackgroundCoordinator<L: PromptTemplateLoader + 'static> {
     merge_max_batch: usize,
     consolidation_batch_size: usize,
     consolidation_hours: f64,
-    llm_model: String,
+    llm_model: std::sync::Mutex<String>,
 
     self_weak: Weak<Self>,
 }
@@ -77,7 +77,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
             important_store: None,
             person_fact_service: None,
             summary_service: None,
-            llm_client: None,
+            llm_client: std::sync::Mutex::new(None),
             prompt_loader,
             on_digest_tick: Arc::new(Mutex::new(None)),
             on_memory_changed: Arc::new(Mutex::new(None)),
@@ -90,7 +90,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
             merge_max_batch: 5,
             consolidation_batch_size: 20,
             consolidation_hours: 48.0,
-            llm_model: "gpt-4o-mini".to_string(),
+            llm_model: std::sync::Mutex::new("gpt-4o-mini".to_string()),
             self_weak: Weak::new(),
         }
     }
@@ -128,13 +128,41 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
     }
 
     pub fn with_llm_client(mut self, client: Arc<dyn AIClient>) -> Self {
-        self.llm_client = Some(client);
+        self.llm_client = std::sync::Mutex::new(Some(client));
         self
     }
 
     pub fn with_llm_model(mut self, model: String) -> Self {
-        self.llm_model = model;
+        self.llm_model = std::sync::Mutex::new(model);
         self
+    }
+
+    /// 在 Arc 创建后设置 LLM 客户端（用于依赖注入）
+    pub fn set_llm_client(&self, client: Arc<dyn AIClient>) {
+        if let Ok(mut guard) = self.llm_client.lock() {
+            *guard = Some(client);
+        }
+    }
+
+    /// 在 Arc 创建后设置 LLM 模型（用于依赖注入）
+    pub fn set_llm_model(&self, model: String) {
+        if let Ok(mut guard) = self.llm_model.lock() {
+            *guard = model;
+        }
+    }
+
+    fn get_llm_client(&self) -> Option<Arc<dyn AIClient>> {
+        self.llm_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn get_llm_model(&self) -> String {
+        self.llm_model
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn with_auto_extract(mut self, enabled: bool) -> Self {
@@ -192,7 +220,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
 
     pub fn set_insight_callback<F>(&self, callback: F)
     where
-        F: Fn(String) + Send + Sync + 'static,
+        F: Fn(String, String) + Send + Sync + 'static,
     {
         if let Ok(mut cb) = self.on_insight_generated.lock() {
             *cb = Some(Box::new(callback));
@@ -211,10 +239,10 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
         }
     }
 
-    fn fire_insight(&self, insight: String) {
+    fn fire_insight(&self, user_id: String, insight: String) {
         if let Ok(cb) = self.on_insight_generated.lock() {
             if let Some(ref f) = *cb {
-                f(insight);
+                f(user_id, insight);
             }
         }
     }
@@ -402,7 +430,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
             tracing::debug!("[后台协调] 自动记忆提取未启用");
             return vec![];
         }
-        if self.llm_client.is_none() || self.memory_store.is_none() {
+        if self.get_llm_client().is_none() || self.memory_store.is_none() {
             tracing::debug!("[后台协调] 记忆提取缺少必要组件");
             return vec![];
         }
@@ -455,7 +483,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
     }
 
     pub fn force_extraction(&self, user_id: String, session_id: String) {
-        if self.llm_client.is_none() || self.memory_store.is_none() {
+        if self.get_llm_client().is_none() || self.memory_store.is_none() {
             tracing::debug!("[后台协调] 强制提取缺少必要组件");
             return;
         }
@@ -486,8 +514,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
         force: bool,
     ) -> XueliResult<Vec<MemoryItem>> {
         let llm_client = self
-            .llm_client
-            .as_ref()
+            .get_llm_client()
             .ok_or_else(|| crate::prelude::XueliError::Internal("llm_client 不可用".into()))?;
         let memory_store = self
             .memory_store
@@ -532,7 +559,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
         ];
 
         let request = ChatCompletionRequest {
-            model: self.llm_model.clone(),
+            model: self.get_llm_model(),
             messages: chat_messages,
             temperature: Some(0.3),
             max_tokens: Some(1024),
@@ -720,7 +747,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
                 Ok(Some(insight)) => {
                     tracing::info!("[后台协调] 记忆消化发现 insight for {}", user_id);
                     self.fire_memory_changed();
-                    self.fire_insight(insight);
+                    self.fire_insight(user_id.clone(), insight);
                     insight_count += 1;
                 }
                 Ok(None) => {}
@@ -765,7 +792,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
             Some(s) => s,
             None => return Ok(None),
         };
-        let llm_client = match &self.llm_client {
+        let llm_client = match self.get_llm_client() {
             Some(c) => c,
             None => return Ok(None),
         };
@@ -805,7 +832,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
         ];
 
         let request = ChatCompletionRequest {
-            model: self.llm_model.clone(),
+            model: self.get_llm_model(),
             messages: chat_messages,
             temperature: Some(0.3),
             max_tokens: Some(512),
@@ -857,12 +884,24 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
         Ok(Some(insight_text))
     }
 
+    /// 为指定用户执行一次记忆消化（生成 insight 并写入重要记忆）
+    pub async fn digest_user(&self, user_id: &str) -> XueliResult<Option<String>> {
+        let important_store = match &self.important_store {
+            Some(s) => s,
+            None => {
+                tracing::debug!("[后台协调] 缺少 important_store，跳过用户 {} 消化", user_id);
+                return Ok(None);
+            }
+        };
+        self.generate_insight(user_id, important_store).await
+    }
+
     async fn run_consolidation(&self, user_id: &str) -> XueliResult<()> {
         let memory_store = match &self.memory_store {
             Some(s) => s,
             None => return Ok(()),
         };
-        if self.llm_client.is_none() {
+        if self.get_llm_client().is_none() {
             return Ok(());
         }
 
@@ -946,7 +985,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
         &self,
         candidates: &[ConsolidationInput],
     ) -> Vec<serde_json::Value> {
-        let llm_client = match &self.llm_client {
+        let llm_client = match self.get_llm_client() {
             Some(c) => c,
             None => {
                 return candidates
@@ -998,7 +1037,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
             ];
 
             let request = ChatCompletionRequest {
-                model: self.llm_model.clone(),
+                model: self.get_llm_model(),
                 messages: chat_messages,
                 temperature: Some(0.3),
                 max_tokens: Some(512),
@@ -1091,7 +1130,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
     }
 
     async fn llm_merge_memories(&self, cluster: &[&MemoryItem]) -> Option<String> {
-        let llm_client = self.llm_client.as_ref()?;
+        let llm_client = self.get_llm_client()?;
         let lines: Vec<String> = cluster.iter().map(|m| format!("- {}", m.content)).collect();
         let user_prompt = format!("合并以下相似记忆，生成一条综合摘要：\n{}", lines.join("\n"));
         let system_prompt = "你是一个记忆合并助手。将多条相似记忆合并为一条综合摘要。只输出合并后的文本，不要JSON。";
@@ -1102,7 +1141,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryBackgroundCoordinator<L> {
         ];
 
         let request = ChatCompletionRequest {
-            model: self.llm_model.clone(),
+            model: self.get_llm_model(),
             messages: chat_messages,
             temperature: Some(0.3),
             max_tokens: Some(512),
@@ -1522,7 +1561,7 @@ mod tests {
         assert_eq!(coordinator.consolidation_enabled, true);
         assert_eq!(coordinator.merge_enabled, true);
         assert_eq!(coordinator.merge_min_cluster_size, 3);
-        assert_eq!(coordinator.llm_model, "gpt-4o");
+        assert_eq!(coordinator.llm_model.lock().unwrap().as_str(), "gpt-4o");
     }
 
     #[test]

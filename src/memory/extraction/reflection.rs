@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use super::models::ExtractionConfig;
 use crate::core::types::MemoryItem;
 use crate::prelude::XueliResult;
 use crate::traits::ai_client::{
@@ -334,9 +335,10 @@ pub fn estimate_conflict_score(left: &str, right: &str, min_topic_overlap: f64) 
 pub fn find_conflict_candidates(
     content: &str,
     existing_records: &[std::collections::HashMap<String, serde_json::Value>],
-    min_topic_overlap: f64,
-    candidate_limit: usize,
+    config: &ExtractionConfig,
 ) -> Vec<std::collections::HashMap<String, serde_json::Value>> {
+    let min_topic_overlap = config.reflection_min_topic_overlap;
+    let candidate_limit = config.reflection_candidate_limit.max(1);
     let mut scored: Vec<(f64, std::collections::HashMap<String, serde_json::Value>)> = Vec::new();
     for record in existing_records {
         let existing_content = record
@@ -356,24 +358,35 @@ pub fn find_conflict_candidates(
         scored.push((score, entry));
     }
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    let limit = candidate_limit.max(1);
     scored
         .into_iter()
-        .take(limit)
+        .take(candidate_limit)
         .map(|(_, entry)| entry)
         .collect()
 }
 
 pub fn build_reflection_evidence(
-    anchor_turns: &[(String, String)],
+    anchor_turns: &[std::collections::HashMap<String, serde_json::Value>],
     candidates: &[std::collections::HashMap<String, serde_json::Value>],
 ) -> Vec<std::collections::HashMap<String, serde_json::Value>> {
     use std::collections::HashMap;
     let mut evidence: Vec<HashMap<String, serde_json::Value>> = Vec::new();
 
+    let turn_start = anchor_turns
+        .first()
+        .and_then(|t| t.get("turn_id"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let turn_end = anchor_turns
+        .last()
+        .and_then(|t| t.get("turn_id"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
     let user_quotes: Vec<String> = anchor_turns
         .iter()
-        .filter_map(|(user, _)| {
+        .filter_map(|turn| {
+            let user = turn.get("user").and_then(|v| v.as_str()).unwrap_or("");
             let t = user.trim();
             if t.is_empty() {
                 None
@@ -381,24 +394,45 @@ pub fn build_reflection_evidence(
                 Some(t.to_string())
             }
         })
-        .take(3)
         .collect();
-    let turn_label = if anchor_turns.len() == 1 {
-        "T0"
+
+    let turn_range = if turn_start == turn_end {
+        format!("T{}", turn_start)
     } else {
-        "T0-T0"
+        format!("T{}-T{}", turn_start, turn_end)
     };
 
-    let mut new_evidence = HashMap::new();
-    new_evidence.insert("kind".to_string(), serde_json::json!("new_memory"));
-    new_evidence.insert("turn_range".to_string(), serde_json::json!(turn_label));
-    new_evidence.insert(
-        "quote".to_string(),
-        serde_json::json!(user_quotes.join(" / ")),
+    let last_turn = anchor_turns.last();
+
+    let mut new_entry = HashMap::new();
+    new_entry.insert("kind".to_string(), serde_json::json!("new_memory"));
+    new_entry.insert("turn_range".to_string(), serde_json::json!(turn_range));
+    new_entry.insert(
+        "source_session_id".to_string(),
+        serde_json::json!(last_turn
+            .and_then(|t| t.get("session_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")),
     );
-    evidence.push(new_evidence);
+    new_entry.insert(
+        "source_group_id".to_string(),
+        serde_json::json!(last_turn
+            .and_then(|t| t.get("source_group_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")),
+    );
+    new_entry.insert(
+        "quote".to_string(),
+        serde_json::json!(user_quotes[..user_quotes.len().min(3)].join(" / ")),
+    );
+    evidence.push(new_entry);
 
     for candidate in candidates {
+        let metadata = candidate
+            .get("metadata")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
         let mut entry = HashMap::new();
         entry.insert("kind".to_string(), serde_json::json!("existing_memory"));
         entry.insert(
@@ -419,6 +453,35 @@ pub fn build_reflection_evidence(
             "content".to_string(),
             candidate
                 .get("content")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        );
+        entry.insert(
+            "source_session_id".to_string(),
+            metadata
+                .get("source_session_id")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        );
+        entry.insert(
+            "source_turn_start".to_string(),
+            serde_json::json!(metadata
+                .get("source_turn_start")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)),
+        );
+        entry.insert(
+            "source_turn_end".to_string(),
+            serde_json::json!(metadata
+                .get("source_turn_end")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)),
+        );
+        entry.insert(
+            "source_group_id".to_string(),
+            metadata
+                .get("source_group_id")
+                .or_else(|| metadata.get("group_id"))
                 .cloned()
                 .unwrap_or(serde_json::Value::Null),
         );
@@ -555,15 +618,25 @@ mod tests {
         r1.insert("content".to_string(), serde_json::json!("讨厌喝咖啡"));
         r1.insert("kind".to_string(), serde_json::json!("ordinary"));
 
+        let config = ExtractionConfig {
+            reflection_min_topic_overlap: 0.1,
+            reflection_candidate_limit: 3,
+            ..Default::default()
+        };
+
         let records = vec![r1];
-        let candidates = find_conflict_candidates("喜欢喝咖啡", &records, 0.1, 3);
+        let candidates = find_conflict_candidates("喜欢喝咖啡", &records, &config);
         assert!(!candidates.is_empty());
         assert!(candidates[0].contains_key("score"));
     }
 
     #[test]
     fn test_build_reflection_evidence() {
-        let turns = vec![("用户说喜欢咖啡".to_string(), "好的".to_string())];
+        let mut turn = std::collections::HashMap::new();
+        turn.insert("turn_id".to_string(), serde_json::json!(1));
+        turn.insert("user".to_string(), serde_json::json!("用户说喜欢咖啡"));
+        turn.insert("session_id".to_string(), serde_json::json!("s1"));
+        let turns = vec![turn];
         let candidates: Vec<std::collections::HashMap<String, serde_json::Value>> = vec![];
         let evidence = build_reflection_evidence(&turns, &candidates);
         assert_eq!(evidence.len(), 1);

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 use regex::Regex;
@@ -121,8 +122,16 @@ impl ChatSummaryService {
             return Ok(None);
         }
 
-        // 注意：当前 SqliteConversationStore 没有 update_session_metadata 方法
-        // 这里返回摘要供调用方处理存储
+        let turn_count = records.len();
+        let mut metadata = HashMap::new();
+        metadata.insert("session_summary".to_string(), summary.clone());
+        metadata.insert(
+            "session_summary_turn_count".to_string(),
+            turn_count.to_string(),
+        );
+
+        store.update_session_metadata(session_id, &metadata).await?;
+
         Ok(Some(summary))
     }
 

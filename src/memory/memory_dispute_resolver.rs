@@ -85,17 +85,20 @@ impl MemoryDisputeResolver {
             "ignore"
         };
 
+        let conflict_type = reflection.conflict_type.trim().to_string();
+        let conflict_type = if conflict_type.is_empty() {
+            "none".to_string()
+        } else {
+            conflict_type
+        };
+
         MemoryDisputeDecision {
             level: level.to_string(),
             confidence,
             action,
-            conflict_type: if reflection.conflict_type.is_empty() {
-                "none".to_string()
-            } else {
-                reflection.conflict_type.clone()
-            },
-            summary: reflection.summary.clone(),
-            reason: reflection.reason.clone(),
+            conflict_type,
+            summary: reflection.summary.trim().to_string(),
+            reason: reflection.reason.trim().to_string(),
             targets: reflection.targets.clone(),
             evidence: reflection.evidence.clone(),
         }
