@@ -3444,6 +3444,7 @@ dependencies = [
  "chrono",
  "config",
  "dashmap",
+ "futures-util",
  "hex",
  "image",
  "itertools 0.13.0",

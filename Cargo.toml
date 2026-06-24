@@ -59,6 +59,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 并发数据结构
 dashmap = "5"
 parking_lot = "0.12"
+futures-util = "0.3"
 
 # 迭代器扩展
 itertools = "0.13"
