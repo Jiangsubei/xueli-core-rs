@@ -80,6 +80,9 @@ impl ProactiveShareScheduler {
 
     /// 启动定时调度循环
     pub async fn start(&self) {
+        if !self.config.enabled {
+            return;
+        }
         {
             let mut running = self.running.write().await;
             if *running {
@@ -221,8 +224,7 @@ mod tests {
 
     fn make_store() -> Arc<ProactiveShareStore> {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("shares.json");
-        Arc::new(ProactiveShareStore::new(path.to_str().unwrap()))
+        Arc::new(ProactiveShareStore::new(dir.path().to_str().unwrap()))
     }
 
     #[tokio::test]

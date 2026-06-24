@@ -12,7 +12,6 @@ pub struct ShareRecord {
     pub content: String,
     pub share_type: ShareType,
     pub source: String,
-    pub sent: bool,
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub expires_at: Option<DateTime<Utc>>,
@@ -43,15 +42,22 @@ struct SharePayload {
 
 /// 主动分享存储 — 内存优先，JSON 持久化。
 pub struct ProactiveShareStore {
-    db_path: String,
+    base_path: String,
+    file_path: String,
     payload: Mutex<SharePayload>,
     max_records: usize,
 }
 
 impl ProactiveShareStore {
-    pub fn new(db_path: &str) -> Self {
+    pub fn new(base_path: &str) -> Self {
+        let base = base_path.to_string();
+        let file_path = std::path::Path::new(base_path)
+            .join("proactive_shares.json")
+            .to_string_lossy()
+            .to_string();
         let store = Self {
-            db_path: db_path.to_string(),
+            base_path: base,
+            file_path,
             payload: Mutex::new(SharePayload::default()),
             max_records: 500,
         };
@@ -60,8 +66,8 @@ impl ProactiveShareStore {
     }
 
     fn load_from_disk(&self) {
-        if std::path::Path::new(&self.db_path).exists() {
-            if let Ok(data) = std::fs::read_to_string(&self.db_path) {
+        if std::path::Path::new(&self.file_path).exists() {
+            if let Ok(data) = std::fs::read_to_string(&self.file_path) {
                 if let Ok(payload) = serde_json::from_str::<SharePayload>(&data) {
                     if let Ok(mut inner) = self.payload.lock() {
                         *inner = payload;
@@ -76,9 +82,12 @@ impl ProactiveShareStore {
             let inner = self.payload.lock().unwrap();
             serde_json::to_string_pretty(&*inner).unwrap_or_default()
         };
-        let tmp = format!("{}.tmp", self.db_path);
+        if let Some(parent) = std::path::Path::new(&self.file_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = format!("{}.tmp", self.file_path);
         let _ = std::fs::write(&tmp, &data_str);
-        let _ = std::fs::rename(&tmp, &self.db_path);
+        let _ = std::fs::rename(&tmp, &self.file_path);
     }
 
     /// 添加分享记录
@@ -98,7 +107,6 @@ impl ProactiveShareStore {
             content: content.to_string(),
             share_type: ShareType::Insight,
             source: source.to_string(),
-            sent: false,
             created_at: now,
             expires_at: Some(expires_at),
             last_sent_at: None,
@@ -154,7 +162,6 @@ impl ProactiveShareStore {
             let mut inner = self.payload.lock().map_err(|e| e.to_string())?;
             for record in inner.items.iter_mut() {
                 if record.id == share_id {
-                    record.sent = true;
                     record.last_sent_at = Some(Utc::now());
                     break;
                 }
@@ -190,8 +197,7 @@ impl ProactiveShareStore {
         Ok(inner
             .items
             .iter()
-            .rev()
-            .filter(|r| !r.sent && r.expires_at.as_ref().map(|exp| *exp > now).unwrap_or(true))
+            .filter(|r| r.expires_at.as_ref().map(|exp| *exp > now).unwrap_or(true))
             .take(limit)
             .cloned()
             .collect())
@@ -315,7 +321,6 @@ mod tests {
             content: "测试分享".into(),
             share_type: ShareType::Insight,
             source: "insight".into(),
-            sent: false,
             created_at: Utc::now(),
             expires_at: None,
             last_sent_at: None,
@@ -327,8 +332,7 @@ mod tests {
     #[test]
     fn test_save_and_get_recent() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("shares.json");
-        let store = ProactiveShareStore::new(path.to_str().unwrap());
+        let store = ProactiveShareStore::new(dir.path().to_str().unwrap());
 
         store.save(make_record("s1", "u1")).unwrap();
         store.save(make_record("s2", "u2")).unwrap();
@@ -341,21 +345,25 @@ mod tests {
     #[test]
     fn test_mark_sent() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("shares.json");
-        let store = ProactiveShareStore::new(path.to_str().unwrap());
+        let store = ProactiveShareStore::new(dir.path().to_str().unwrap());
 
         store.save(make_record("s1", "u1")).unwrap();
-        store.mark_sent("s1").unwrap();
+        assert_eq!(store.count_sent_today(), 0);
 
-        let pending = store.pending_shares(10).unwrap();
+        store.mark_sent("s1").unwrap();
+        assert_eq!(store.count_sent_today(), 1);
+
+        // 冷却期内 pending_shares_with_cooldown 不应再返回
+        let pending = store
+            .pending_shares_with_cooldown(10, 6.0, "00:00", "23:59")
+            .unwrap();
         assert!(pending.is_empty());
     }
 
     #[test]
     fn test_add_share() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("shares.json");
-        let store = ProactiveShareStore::new(path.to_str().unwrap());
+        let store = ProactiveShareStore::new(dir.path().to_str().unwrap());
 
         let record = store
             .add_share("测试内容", "insight", 168.0, "user1", "group1")
@@ -369,8 +377,7 @@ mod tests {
     #[test]
     fn test_global_cooldown() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("shares.json");
-        let store = ProactiveShareStore::new(path.to_str().unwrap());
+        let store = ProactiveShareStore::new(dir.path().to_str().unwrap());
 
         assert!(!store.is_global_cooldown_active());
         store.set_global_cooldown(6.0);
@@ -380,8 +387,7 @@ mod tests {
     #[test]
     fn test_count_sent_today() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("shares.json");
-        let store = ProactiveShareStore::new(path.to_str().unwrap());
+        let store = ProactiveShareStore::new(dir.path().to_str().unwrap());
 
         store.save(make_record("s1", "u1")).unwrap();
         assert_eq!(store.count_sent_today(), 0);
