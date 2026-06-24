@@ -10,9 +10,17 @@ use crate::traits::ai_client::{
 };
 use crate::traits::prompt_template::PromptTemplateLoader;
 
-/// 记忆冲突反思 — 检测新旧记忆矛盾并给出解决方案
+/// 记忆冲突反思 — 检测新旧记忆是否真正冲突
 ///
 /// 对应 Python 版 `xueli/src/memory/extraction/reflection.py`
+///
+/// 输出格式 (Python compatible):
+/// ```json
+/// {"has_conflict":false,"conflict_type":"none","action":"keep_both","summary":"","reason":"","confidence":0.0}
+/// ```
+///
+/// conflict_type: none / preference_change / temporary_state / scope_specific / factual_correction / ambiguous
+/// action: keep_both / keep_both_prefer_recent / prefer_new / prefer_existing / merge_context
 pub struct MemoryReflection<A: AIClient + ?Sized, L: PromptTemplateLoader> {
     ai_client: Arc<A>,
     model: String,
@@ -66,7 +74,8 @@ impl<A: AIClient + ?Sized, L: PromptTemplateLoader> MemoryReflection<A, L> {
                 Ok(response) => match self.parse_response(&response) {
                     Ok(result) => {
                         tracing::debug!(
-                            conflict_count = result.conflicts.len(),
+                            has_conflict = result.has_conflict,
+                            conflict_type = result.conflict_type.as_str(),
                             elapsed_ms = start.elapsed().as_millis(),
                             "[MemoryReflection] 反思完成"
                         );
@@ -134,76 +143,35 @@ impl<A: AIClient + ?Sized, L: PromptTemplateLoader> MemoryReflection<A, L> {
         let parsed: serde_json::Value =
             serde_json::from_str(json_str).map_err(|e| format!("JSON 解析失败: {e}"))?;
 
-        let conflicts: Vec<String> = parsed
-            .get("conflicts")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .map(|c| {
-                        let reason = c.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-                        let resolution = c
-                            .get("resolution")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("keep_both");
-                        format!("[{}] {}", resolution, reason)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let resolutions: Vec<String> = conflicts.clone();
-        let has_conflict = !conflicts.is_empty();
-
-        let (conflict_type, action, summary, reason, confidence) = if let Some(first) = parsed
-            .get("conflicts")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| arr.first())
-        {
-            (
-                first
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                first
-                    .get("resolution")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("keep_both")
-                    .to_string(),
-                parsed
-                    .get("summary")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                first
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                parsed
-                    .get("confidence")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.5),
-            )
-        } else {
-            (
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                0.5,
-            )
-        };
-
         Ok(ReflectionResult {
-            conflicts,
-            resolutions,
-            has_conflict,
-            conflict_type,
-            action,
-            summary,
-            reason,
-            confidence,
+            has_conflict: parsed
+                .get("has_conflict")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            conflict_type: parsed
+                .get("conflict_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("none")
+                .to_string(),
+            action: parsed
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("keep_both")
+                .to_string(),
+            summary: parsed
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            reason: parsed
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            confidence: parsed
+                .get("confidence")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
             evidence: Vec::new(),
             targets: Vec::new(),
         })
@@ -212,8 +180,6 @@ impl<A: AIClient + ?Sized, L: PromptTemplateLoader> MemoryReflection<A, L> {
 
 #[derive(Debug, Clone, Default)]
 pub struct ReflectionResult {
-    pub conflicts: Vec<String>,
-    pub resolutions: Vec<String>,
     pub has_conflict: bool,
     pub conflict_type: String,
     pub action: String,
@@ -521,18 +487,15 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_response_with_conflicts() {
+    fn test_parse_response_with_conflict() {
         let reflection = make_reflection();
         let json = r#"{
-          "conflicts": [
-            {
-              "old_memory": "用户住在上海",
-              "new_memory": "用户搬家到北京",
-              "type": "update",
-              "resolution": "update_old",
-              "reason": "位置信息已更新"
-            }
-          ]
+          "has_conflict": true,
+          "conflict_type": "factual_correction",
+          "action": "prefer_new",
+          "summary": "用户位置更新",
+          "reason": "用户已搬家到北京",
+          "confidence": 0.85
         }"#;
         let response = ChatCompletionResponse {
             content: json.to_string(),
@@ -546,14 +509,16 @@ mod tests {
             raw_response: None,
         };
         let result = reflection.parse_response(&response).unwrap();
-        assert_eq!(result.conflicts.len(), 1);
-        assert!(result.conflicts[0].contains("update_old"));
+        assert!(result.has_conflict);
+        assert_eq!(result.conflict_type, "factual_correction");
+        assert_eq!(result.action, "prefer_new");
+        assert_eq!(result.confidence, 0.85);
     }
 
     #[test]
     fn test_parse_response_no_conflicts() {
         let reflection = make_reflection();
-        let json = r#"{"conflicts": []}"#;
+        let json = r#"{"has_conflict":false,"conflict_type":"none","action":"keep_both","summary":"","reason":"无冲突","confidence":0.0}"#;
         let response = ChatCompletionResponse {
             content: json.to_string(),
             reasoning_content: "".to_string(),
@@ -566,7 +531,8 @@ mod tests {
             raw_response: None,
         };
         let result = reflection.parse_response(&response).unwrap();
-        assert!(result.conflicts.is_empty());
+        assert!(!result.has_conflict);
+        assert_eq!(result.conflict_type, "none");
     }
 
     #[test]

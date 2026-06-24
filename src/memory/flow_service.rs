@@ -358,7 +358,7 @@ impl<L: PromptTemplateLoader + 'static> MemoryFlowService<L> {
                                     if result.has_conflict {
                                         debug!(
                                             user_id = %user_id,
-                                            conflict_count = result.conflicts.len(),
+                                            conflict_type = result.conflict_type.as_str(),
                                             "[MemoryFlow] 记忆反思发现冲突"
                                         );
                                     }

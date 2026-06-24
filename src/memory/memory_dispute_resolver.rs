@@ -268,9 +268,9 @@ mod tests {
         let metadata = serde_json::json!({
             "reflection": {
                 "has_conflict": true,
-                "action": "update",
+                "action": "prefer_new",
                 "confidence": 0.8,
-                "conflict_type": "contradiction",
+                "conflict_type": "factual_correction",
                 "summary": "旧信息与新信息冲突",
                 "reason": "新来源更可靠",
                 "targets": ["mem_1", "mem_2"],
@@ -280,8 +280,8 @@ mod tests {
 
         let decision = resolver.resolve_from_memory_metadata(&metadata);
         assert_eq!(decision.level, "high_confidence");
-        assert_eq!(decision.action, "update");
-        assert_eq!(decision.conflict_type, "contradiction");
+        assert_eq!(decision.action, "prefer_new");
+        assert_eq!(decision.conflict_type, "factual_correction");
         assert_eq!(decision.targets, vec!["mem_1", "mem_2"]);
     }
 
