@@ -36,6 +36,7 @@ max_reply_chars = 500
 [bot_behavior]
 context_token_budget_ratio = 0.7
 token_encoding = "cl100k_base"
+max_context_length = 0             # 兼容性兜底：最大历史消息条数，0 表示由 token 预算管理
 max_message_length = 4000
 response_timeout = 60
 rate_limit_interval = 1.0
@@ -203,8 +204,29 @@ debounce_seconds = 1.0
 debounce_max_resets = 5
 base_frequency = 1.0
 saturation_log_factor = 1.2
-# time_rules = { "00:00-06:00" = 0.3 }
-# group_overrides = { "123456789" = 0.8 }
+
+# 按时间段调整频率
+[group_reply.time_rules]
+# "00:00-08:59" = 0.5
+# "09:00-18:59" = 1.0
+# "19:00-23:59" = 0.8
+
+# 按群聊覆盖频率
+[group_reply.group_overrides]
+# "123456789" = 0.3
+
+# =============================================================================
+# 提示词内容配置
+# =============================================================================
+
+[personality]
+content = ""                       # 性格设定，如"你是一只猫娘..."
+
+[dialogue_style]
+content = ""                       # 对话风格，如"说话结尾带喵~，像真人聊天..."
+
+[behavior]
+content = ""                       # 行为规范，如"拒绝建立不健康身份关系..."
 
 [adapter_connection]
 adapter = "napcat"

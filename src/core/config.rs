@@ -278,6 +278,9 @@ pub struct BotBehaviorConfig {
     /// Token 编码名
     #[serde(default = "default_token_encoding")]
     pub token_encoding: String,
+    /// 最大上下文消息条数（兼容性兜底，0 表示由 token 预算管理）
+    #[serde(default = "default_max_context_length")]
+    pub max_context_length: usize,
     /// 单条消息最大字符数
     #[serde(default = "default_max_message_length")]
     pub max_message_length: usize,
@@ -325,6 +328,9 @@ fn default_token_budget_ratio() -> f64 {
 fn default_token_encoding() -> String {
     "cl100k_base".to_string()
 }
+fn default_max_context_length() -> usize {
+    0
+}
 fn default_max_message_length() -> usize {
     4000
 }
@@ -355,6 +361,7 @@ impl Default for BotBehaviorConfig {
         Self {
             context_token_budget_ratio: default_token_budget_ratio(),
             token_encoding: default_token_encoding(),
+            max_context_length: default_max_context_length(),
             max_message_length: default_max_message_length(),
             response_timeout: default_response_timeout(),
             rate_limit_interval: default_rate_limit_interval(),
@@ -955,6 +962,9 @@ pub struct TimingGateConfig {
     pub default_proactive_probability: f64,
     /// 被 @ 时回复概率
     pub mention_reply_probability: f64,
+    /// LLM 判定 reply 后实际回复的概率门（0.0~1.0），1.0 表示总是回复
+    #[serde(default = "default_reply_probability")]
+    pub reply_probability: f64,
 }
 
 // ── PlanningWindowConfig ─────────────────────────────────
@@ -1048,7 +1058,7 @@ pub struct EmojiConfig {
     #[serde(default = "default_emoji_classification_interval")]
     pub classification_interval_seconds: f64,
     /// 回复是否启用表情
-    #[serde(default)]
+    #[serde(default = "default_emoji_reply_enabled")]
     pub reply_enabled: bool,
     /// 表情回复冷却秒数
     #[serde(default = "default_emoji_reply_cooldown")]
@@ -1072,6 +1082,9 @@ fn default_emoji_capture_enabled() -> bool {
     true
 }
 fn default_emoji_classification_enabled() -> bool {
+    false
+}
+fn default_emoji_reply_enabled() -> bool {
     true
 }
 fn default_emoji_idle_seconds() -> f64 {
@@ -1105,7 +1118,7 @@ impl Default for EmojiConfig {
             emotion_labels: Vec::new(),
             idle_seconds_before_classify: default_emoji_idle_seconds(),
             classification_interval_seconds: default_emoji_classification_interval(),
-            reply_enabled: false,
+            reply_enabled: default_emoji_reply_enabled(),
             reply_cooldown_seconds: default_emoji_reply_cooldown(),
             overflow_policy: default_emoji_overflow_policy(),
         }
@@ -1676,6 +1689,7 @@ impl Default for XueliConfig {
             timing_gate: TimingGateConfig {
                 default_proactive_probability: 0.3,
                 mention_reply_probability: 0.95,
+                reply_probability: 1.0,
             },
             planning_window: PlanningWindowConfig::default(),
             session: SessionConfig {
