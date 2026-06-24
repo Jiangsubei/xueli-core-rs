@@ -27,16 +27,14 @@ impl SessionResolver {
         if target.scope == ChatScope::Private {
             return target.clone();
         }
-        let user_id = target.user_id.clone().unwrap_or_default();
-        SessionRef {
-            session_id: format!("{}:private:{}", self.platform, user_id),
-            scope: ChatScope::Private,
-            user_id: if user_id.is_empty() {
-                None
-            } else {
-                Some(user_id)
-            },
-        }
+        let mut session = target.clone();
+        session.scope = ChatScope::Private;
+        session.session_id = format!(
+            "{}:private:{}",
+            self.platform,
+            target.user_id.as_deref().unwrap_or("")
+        );
+        session
     }
 
     /// 将目标会话解析为群聊回复目标
