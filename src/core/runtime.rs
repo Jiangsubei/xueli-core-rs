@@ -14,9 +14,10 @@ use crate::core::metrics::RuntimeMetrics;
 use crate::core::platform_types::{GroupState, InboundEvent, ReplyAction};
 use crate::core::scope::ChatScope;
 use crate::handlers::message_handler::MessageHandler;
+use crate::memory::manager::MemoryManager;
 use crate::prelude::XueliResult;
 use crate::proactive_share::scheduler::ProactiveShareScheduler;
-use crate::proactive_share::store::ProactiveShareStore;
+use crate::proactive_share::store::{ProactiveShareStore, ShareRecord, ShareType};
 use crate::services::ai_client::DefaultAIClient;
 use crate::services::prompt_loader::NoopPromptTemplateLoader;
 use crate::traits::platform_adapter::PlatformAdapter;
@@ -83,6 +84,8 @@ pub struct BotRuntime<P: PlatformAdapter + 'static> {
     proactive_share_store: Option<Arc<ProactiveShareStore>>,
     /// 主动分享调度器
     proactive_scheduler: Option<Arc<ProactiveShareScheduler>>,
+    /// 记忆管理器（用于注册后台 insight 回调）
+    memory_manager: Option<Arc<MemoryManager<NoopPromptTemplateLoader>>>,
     /// 平台适配器
     adapter: Option<Arc<P>>,
     /// 内驱力引擎（可选注入）
@@ -143,6 +146,7 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
             message_handler: None,
             proactive_share_store: None,
             proactive_scheduler: None,
+            memory_manager: None,
             adapter: None,
             drive_engine: None,
             group_interrupt_flags: Arc::new(Mutex::new(HashMap::new())),
@@ -176,7 +180,18 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
         self.drive_engine = Some(engine);
     }
 
+    /// 设置记忆管理器
+    pub fn set_memory_manager(
+        &mut self,
+        memory_manager: Arc<MemoryManager<NoopPromptTemplateLoader>>,
+    ) {
+        self.memory_manager = Some(memory_manager);
+    }
+
     /// 设置主动分享组件
+    ///
+    /// 同时注册后台记忆消化的 insight 回调，将消化产生的洞察写入主动分享存储。
+    /// 对应 Python 版 `_setup_proactive_share`。
     pub fn setup_proactive_share(
         &mut self,
         config: &ProactiveShareConfig,
@@ -184,8 +199,22 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
     ) -> XueliResult<()> {
         let arc_config = Arc::new(config.clone());
         let scheduler = ProactiveShareScheduler::new(arc_config, store.clone());
-        self.proactive_share_store = Some(store);
+        self.proactive_share_store = Some(store.clone());
         self.proactive_scheduler = Some(Arc::new(scheduler));
+
+        if let Some(ref mm) = self.memory_manager {
+            if let Some(ref coord) = mm.background_coordinator() {
+                coord.set_insight_callback(move |user_id, insight| {
+                    let store = store.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let record = build_insight_share_record(user_id, insight);
+                        if let Err(e) = store.save(record) {
+                            tracing::debug!("[主动分享] 写入 insight 分享失败: {}", e);
+                        }
+                    });
+                });
+            }
+        }
         Ok(())
     }
 
@@ -227,6 +256,23 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
                 tracing::error!("[主动分享] 发送失败: {}", e);
                 Ok(false)
             }
+        }
+    }
+
+    /// 从后台消化产生的 insight 构建主动分享记录
+    fn build_insight_share_record(user_id: String, insight: String) -> ShareRecord {
+        let now = Utc::now();
+        ShareRecord {
+            id: String::new(),
+            user_id: user_id.clone(),
+            content: insight,
+            share_type: ShareType::Insight,
+            source: "insight".to_string(),
+            created_at: now,
+            expires_at: Some(now + chrono::Duration::hours(168)),
+            last_sent_at: None,
+            target_user_id: user_id,
+            target_group_id: String::new(),
         }
     }
 
@@ -1465,22 +1511,8 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
             Some(s) => s.clone(),
             None => return,
         };
-        let content = insight.to_string();
-        let uid = user_id.to_string();
+        let record = build_insight_share_record(user_id.to_string(), insight.to_string());
         tokio::task::spawn_blocking(move || {
-            let record = crate::proactive_share::store::ShareRecord {
-                id: uuid::Uuid::new_v4().to_string(),
-                user_id: uid,
-                content,
-                share_type: crate::proactive_share::store::ShareType::Insight,
-                source: "digestion".to_string(),
-                sent: false,
-                created_at: chrono::Utc::now(),
-                expires_at: None,
-                last_sent_at: None,
-                target_user_id: String::new(),
-                target_group_id: String::new(),
-            };
             if let Err(e) = store.save(record) {
                 tracing::debug!("[主动分享] 写入 insight 分享失败: {}", e);
             }
@@ -1576,6 +1608,25 @@ fn now_secs() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+/// 构造后台消化产生的 insight 分享记录
+fn build_insight_share_record(
+    user_id: String,
+    content: String,
+) -> crate::proactive_share::store::ShareRecord {
+    crate::proactive_share::store::ShareRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        user_id,
+        content,
+        share_type: crate::proactive_share::store::ShareType::Insight,
+        source: "digestion".to_string(),
+        created_at: chrono::Utc::now(),
+        expires_at: None,
+        last_sent_at: None,
+        target_user_id: String::new(),
+        target_group_id: String::new(),
+    }
 }
 
 #[cfg(test)]

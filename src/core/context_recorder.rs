@@ -194,6 +194,8 @@ impl ContextRecorder {
         display_name: &str,
         event_text: &str,
     ) -> XueliResult<()> {
+        self.get_or_create_log(group_id).await;
+
         let message = ImmutableMessage {
             message_id: message_id.to_string(),
             user_id: user_id.to_string(),
