@@ -11,6 +11,7 @@ pub mod models;
 pub mod reflection;
 pub mod scheduler;
 pub mod store;
+pub mod style_selector;
 
 pub use engine::{DriveEngine, DriveEvent};
 pub use event_rules::{build_default_rule_set, DriveEventRuleEngine, WeightAdjustment};
@@ -22,3 +23,4 @@ pub use models::{
 pub use reflection::{DriveReflection, DynTemplateLoader};
 pub use scheduler::DriveScheduler;
 pub use store::DriveStore;
+pub use style_selector::StyleSelector;
