@@ -12,6 +12,7 @@ use crate::core::log_labels::{LOG_RETRY, LOG_STARTUP_INFO};
 use crate::core::log_text::preview_text_for_log;
 use crate::core::metrics::RuntimeMetrics;
 use crate::core::platform_types::{GroupState, InboundEvent, ReplyAction};
+use crate::core::runtime_supervisor::RuntimeSupervisor;
 use crate::core::scope::ChatScope;
 use crate::handlers::message_handler::MessageHandler;
 use crate::memory::manager::MemoryManager;
@@ -76,6 +77,8 @@ pub struct BotRuntime<P: PlatformAdapter + 'static> {
     max_dedup_size: usize,
     /// 延迟触发通知通道（当 deferred_trigger / stopped_cooldown 到期时发送 group_key）
     trigger_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// 运行时监督器
+    pub supervisor: RuntimeSupervisor,
     /// 外部挂钩
     pub hooks: RuntimeHooks,
     /// 消息处理器
@@ -142,6 +145,7 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
             processed_message_ids: Arc::new(Mutex::new(VecDeque::new())),
             max_dedup_size: 500,
             trigger_tx: None,
+            supervisor: RuntimeSupervisor::new(3, 60),
             hooks: RuntimeHooks::default(),
             message_handler: None,
             proactive_share_store: None,
@@ -296,6 +300,7 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
         *s = RuntimeState::Initializing;
         tracing::info!(target: LOG_STARTUP_INFO, "运行时初始化完成");
         *s = RuntimeState::Running;
+        self.supervisor.start()?;
         Ok(())
     }
 
@@ -313,6 +318,7 @@ impl<P: PlatformAdapter + 'static> BotRuntime<P> {
         self.group_reply_timestamps.lock().await.clear();
         tracing::info!("运行时已关闭");
         *s = RuntimeState::Stopped;
+        self.supervisor.stop()?;
         Ok(())
     }
 

@@ -14,6 +14,8 @@ pub mod mood_engine;
 pub mod platform_types;
 pub mod reply_sender;
 pub mod runtime;
+pub mod runtime_supervisor;
+pub use runtime_supervisor::RuntimeSupervisor;
 pub mod scope;
 pub mod session_pipeline;
 pub mod session_resolver;
