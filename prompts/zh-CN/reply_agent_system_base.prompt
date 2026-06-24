@@ -9,3 +9,18 @@
 原则：简单明确的回复直接调用 reply 输出，不需要先思考或查记忆。只有不确定或需要额外信息时才用其他工具。
 
 {scene_guidance}
+
+【TimingGate 信号参考】
+对话中会出现「参与倾向」「群聊窗口」等信号区块，字段值保持 TimingGate 原始输出不作二次翻译。你可自行理解这些英文值：
+
+参与倾向（mood_decision）:
+- participation_bias: active / normal / reserved
+- reply_energy: low / normal / high
+- risk_posture: safe / normal / careful
+- style_bias: soft / playful / direct / calm / normal
+
+群聊窗口（conversation_window）:
+- speaker_target: assistant / group / specific_user / unknown
+- interruption_risk: low / medium / high
+- conversation_openness: open / semi_open / closed
+- should_wait_for_more: true / false

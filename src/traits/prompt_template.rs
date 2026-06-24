@@ -21,12 +21,21 @@ pub trait PromptTemplateLoader: Send + Sync {
         name: &str,
     ) -> impl Future<Output = XueliResult<String>> + Send;
 
-    /// 渲染模板（支持变量替换）
+    /// 渲染模板（支持变量替换，兼容 Python `str.format()` 的 `{{` / `}}` 转义）
     fn render(&self, template: &str, variables: &HashMap<&str, &str>) -> String {
-        let mut result = template.to_string();
+        // 占位符，避免与变量替换混淆
+        const LBRACE: &str = "\x00LBRACE\x00";
+        const RBRACE: &str = "\x00RBRACE\x00";
+
+        // 1. 先保护字面量花括号转义
+        let mut result = template.replace("{{", LBRACE).replace("}}", RBRACE);
+
+        // 2. 替换变量
         for (key, value) in variables {
             result = result.replace(&format!("{{{}}}", key), value);
         }
-        result
+
+        // 3. 恢复字面量花括号
+        result.replace(LBRACE, "{").replace(RBRACE, "}")
     }
 }

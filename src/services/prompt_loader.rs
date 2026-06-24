@@ -176,11 +176,15 @@ impl PromptTemplateLoader for FilePromptTemplateLoader {
     }
 
     fn render(&self, template: &str, variables: &HashMap<&str, &str>) -> String {
-        let mut result = template.to_string();
+        // 与 trait 默认实现保持一致：支持 `{{` / `}}` 字面量转义
+        const LBRACE: &str = "\x00LBRACE\x00";
+        const RBRACE: &str = "\x00RBRACE\x00";
+
+        let mut result = template.replace("{{", LBRACE).replace("}}", RBRACE);
         for (key, value) in variables {
             result = result.replace(&format!("{{{}}}", key), value);
         }
-        result
+        result.replace(LBRACE, "{").replace(RBRACE, "}")
     }
 }
 
