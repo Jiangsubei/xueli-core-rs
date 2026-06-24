@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use toml::Value as TomlValue;
 
 use crate::prelude::XueliResult;
 
@@ -350,10 +351,10 @@ fn default_max_segments() -> usize {
     3
 }
 fn default_followup_delay_min() -> f64 {
-    2.0
+    3.0
 }
 fn default_followup_delay_max() -> f64 {
-    5.0
+    10.0
 }
 
 impl Default for BotBehaviorConfig {
@@ -371,7 +372,7 @@ impl Default for BotBehaviorConfig {
             segmented_reply_enabled: default_segmented_reply_enabled(),
             max_segments: default_max_segments(),
             first_segment_delay_min_ms: 0,
-            first_segment_delay_max_ms: 0,
+            first_segment_delay_max_ms: 600,
             followup_delay_min_seconds: default_followup_delay_min(),
             followup_delay_max_seconds: default_followup_delay_max(),
             purpose_timeouts: HashMap::new(),
@@ -919,6 +920,12 @@ pub struct MemoryRerankConfig {
     /// 额外请求参数
     #[serde(default)]
     pub extra_params: HashMap<String, serde_json::Value>,
+    /// 额外 HTTP 请求头
+    #[serde(default)]
+    pub extra_headers: HashMap<String, String>,
+    /// 响应内容路径
+    #[serde(default)]
+    pub response_path: Option<String>,
 }
 
 fn default_rerank_temperature() -> f64 {
@@ -950,6 +957,8 @@ impl Default for MemoryRerankConfig {
             rerank_top_k: default_rerank_top_k_field(),
             rerank_min_score: default_rerank_min_score(),
             extra_params: HashMap::new(),
+            extra_headers: HashMap::new(),
+            response_path: None,
         }
     }
 }
@@ -1275,6 +1284,12 @@ pub struct CharacterGrowthConfig {
     /// 负面互动亲密度损失
     #[serde(default = "default_loss_per_negative")]
     pub loss_per_negative: f64,
+    /// 摩擦后亲密度减幅
+    #[serde(default = "default_intimacy_loss_per_friction")]
+    pub intimacy_loss_per_friction: f64,
+    /// 每周亲密度自然衰减
+    #[serde(default = "default_intimacy_decay_per_week")]
+    pub intimacy_decay_per_week: f64,
     /// 情绪历史记录大小
     #[serde(default = "default_emotional_history_size")]
     pub emotional_history_size: usize,
@@ -1285,6 +1300,12 @@ fn default_gain_per_positive() -> f64 {
 }
 fn default_loss_per_negative() -> f64 {
     0.03
+}
+fn default_intimacy_loss_per_friction() -> f64 {
+    0.02
+}
+fn default_intimacy_decay_per_week() -> f64 {
+    0.01
 }
 fn default_emotional_history_size() -> usize {
     50
@@ -1341,6 +1362,8 @@ impl Default for CharacterGrowthConfig {
             intimacy_thresholds: IntimacyThresholdConfig::default(),
             gain_per_positive: default_gain_per_positive(),
             loss_per_negative: default_loss_per_negative(),
+            intimacy_loss_per_friction: default_intimacy_loss_per_friction(),
+            intimacy_decay_per_week: default_intimacy_decay_per_week(),
             emotional_history_size: default_emotional_history_size(),
         }
     }
@@ -1716,15 +1739,141 @@ impl Default for XueliConfig {
     }
 }
 
+/// 环境变量覆盖映射：(env_var_suffix, config_dot_path)
+///
+/// 环境变量格式：`XUELI_{SECTION}_{FIELD}`，全大写，点号用下划线代替。
+/// 例如 `XUELI_MODEL_API_BASE` 对应 `model.api_base`。
+const ENV_MAPPING: &[(&str, &str)] = &[
+    ("MODEL_API_BASE", "model.api_base"),
+    ("MODEL_API_KEY", "model.api_key"),
+    ("MODEL_PRIMARY_MODEL", "model.primary_model"),
+    ("MODEL_LIGHT_MODEL", "model.light_model"),
+    ("MODEL_CONTEXT_WINDOW", "model.context_window"),
+    ("MODEL_TEMPERATURE", "model.temperature"),
+    ("MODEL_MAX_TOKENS", "model.max_tokens"),
+    ("MODEL_TIMEOUT", "model.timeout"),
+    ("MODEL_MAX_RETRIES", "model.max_retries"),
+    ("MODEL_MAX_CONCURRENCY", "model.max_concurrency"),
+    ("MODEL_RESPONSE_PATH", "model.response_path"),
+    ("VISION_ENABLED", "vision.enabled"),
+    ("VISION_API_BASE", "vision.api_base"),
+    ("VISION_API_KEY", "vision.api_key"),
+    ("VISION_MODEL", "vision.model"),
+    ("VISION_CONTEXT_WINDOW", "vision.context_window"),
+    ("EMOJI_ENABLED", "emoji.enabled"),
+    ("EMOJI_CAPTURE_ENABLED", "emoji.capture_enabled"),
+    ("EMOJI_CLASSIFICATION_ENABLED", "emoji.classification_enabled"),
+    ("EMOJI_REPLY_ENABLED", "emoji.reply_enabled"),
+    ("MEMORY_DATA_DIR", "memory.data_dir"),
+    ("MEMORY_EXTRACT_EVERY_N_TURNS", "memory.extract_every_n_turns"),
+    ("MEMORY_DISPUTE_ENABLED", "memory_dispute.enabled"),
+    ("GROUP_REPLY_ONLY_REPLY_WHEN_AT", "group_reply.only_reply_when_at"),
+    ("GROUP_REPLY_BASE_FREQUENCY", "group_reply.base_frequency"),
+    ("GROUP_REPLY_DEBOUNCE_SECONDS", "group_reply.debounce_seconds"),
+    ("BOT_BEHAVIOR_CONTEXT_TOKEN_BUDGET_RATIO", "bot_behavior.context_token_budget_ratio"),
+    ("BOT_BEHAVIOR_TOKEN_ENCODING", "bot_behavior.token_encoding"),
+    ("BOT_BEHAVIOR_MAX_MESSAGE_LENGTH", "bot_behavior.max_message_length"),
+    ("BOT_BEHAVIOR_RESPONSE_TIMEOUT", "bot_behavior.response_timeout"),
+    ("BOT_BEHAVIOR_RATE_LIMIT_INTERVAL", "bot_behavior.rate_limit_interval"),
+    ("BOT_BEHAVIOR_LOG_FULL_PROMPT", "bot_behavior.log_full_prompt"),
+    ("BOT_BEHAVIOR_FIRST_SEGMENT_DELAY_MIN_MS", "bot_behavior.first_segment_delay_min_ms"),
+    ("BOT_BEHAVIOR_FIRST_SEGMENT_DELAY_MAX_MS", "bot_behavior.first_segment_delay_max_ms"),
+    ("BOT_BEHAVIOR_FOLLOWUP_DELAY_MIN_SECONDS", "bot_behavior.followup_delay_min_seconds"),
+    ("BOT_BEHAVIOR_FOLLOWUP_DELAY_MAX_SECONDS", "bot_behavior.followup_delay_max_seconds"),
+    ("PROACTIVE_SHARE_ENABLED", "proactive_share.enabled"),
+    ("PLUGIN_DIRECTORY", "plugin.directory"),
+    ("ADAPTER_CONNECTION_WS_URL", "adapter_connection.ws_url"),
+    ("ADAPTER_CONNECTION_HTTP_URL", "adapter_connection.http_url"),
+    ("ADAPTER_CONNECTION_ADAPTER", "adapter_connection.adapter"),
+    ("ADAPTER_CONNECTION_PLATFORM", "adapter_connection.platform"),
+    ("DRIVE_ENABLED", "drive.enabled"),
+];
+
+/// 递归设置 `toml::Value` 中由点号分隔路径对应的值
+fn set_toml_value_by_path(root: &mut TomlValue, path: &str, value: TomlValue) {
+    let parts: Vec<&str> = path.split('.').collect();
+    if parts.is_empty() {
+        return;
+    }
+    let mut current = root;
+    for (i, part) in parts.iter().enumerate() {
+        if i == parts.len() - 1 {
+            // 最后一个部分：设值
+            if let TomlValue::Table(ref mut table) = current {
+                table.insert(part.to_string(), value.clone());
+            }
+        } else {
+            // 中间部分：确保是 Table 并进入
+            let needs_insert = match current {
+                TomlValue::Table(ref table) => !table.contains_key(*part),
+                _ => true,
+            };
+            if needs_insert {
+                if let TomlValue::Table(ref mut table) = current {
+                    table.insert(part.to_string(), TomlValue::Table(Default::default()));
+                }
+            }
+            let next = match current {
+                TomlValue::Table(ref mut table) => table.get_mut(*part),
+                _ => None,
+            };
+            match next {
+                Some(v @ TomlValue::Table(_)) => {
+                    current = v;
+                }
+                _ => return, // 路径冲突，跳过
+            }
+        }
+    }
+}
+
 impl XueliConfig {
-    /// 从 TOML 文件加载配置
+    /// 从 TOML 文件加载配置，支持 `XUELI_*` 环境变量覆盖
     pub fn from_file(path: &str) -> XueliResult<Self> {
         let content = std::fs::read_to_string(path).map_err(|e| {
             crate::core::errors::XueliError::Config(format!("读取配置文件失败: {}", e))
         })?;
-        toml::from_str(&content).map_err(|e| {
-            crate::core::errors::XueliError::Config(format!("解析 TOML 配置失败: {}", e)).into()
+
+        // 先解析为 toml::Value 以便路径级覆盖
+        let mut toml_value: TomlValue = content.parse::<TomlValue>().map_err(|e| {
+            crate::core::errors::XueliError::Config(format!("解析 TOML 配置失败: {}", e))
+        })?;
+
+        // 应用环境变量覆盖
+        Self::apply_env_overrides(&mut toml_value);
+
+        // 反序列化为 XueliConfig
+        toml_value.try_into().map_err(|e| {
+            crate::core::errors::XueliError::Config(format!("配置结构映射失败: {}", e)).into()
         })
+    }
+
+    /// 从环境变量读取值并覆盖 TOML 解析结果
+    fn apply_env_overrides(toml_value: &mut TomlValue) {
+        for (env_suffix, config_path) in ENV_MAPPING {
+            let env_var = format!("XUELI_{}", env_suffix);
+            match std::env::var(&env_var) {
+                Ok(val) => {
+                    let toml_val = if let Ok(n) = val.parse::<i64>() {
+                        TomlValue::Integer(n)
+                    } else if let Ok(f) = val.parse::<f64>() {
+                        TomlValue::Float(f)
+                    } else if val.eq_ignore_ascii_case("true") {
+                        TomlValue::Boolean(true)
+                    } else if val.eq_ignore_ascii_case("false") {
+                        TomlValue::Boolean(false)
+                    } else {
+                        TomlValue::String(val)
+                    };
+                    set_toml_value_by_path(toml_value, config_path, toml_val);
+                    tracing::debug!("[Config] 环境变量 {} 覆盖配置路径 {}", env_var, config_path);
+                }
+                Err(std::env::VarError::NotPresent) => {}
+                Err(e) => {
+                    tracing::warn!("[Config] 读取环境变量 {} 失败: {:?}", env_var, e);
+                }
+            }
+        }
     }
 
     /// 使用 config-rs 从多源加载配置（环境变量 + 文件）
