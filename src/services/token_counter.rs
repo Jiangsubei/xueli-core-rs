@@ -7,16 +7,23 @@ use crate::traits::tool_calling::ToolDefinition;
 /// 预算超限时只截断历史消息，不截断 system prompt 和当前用户输入。
 pub struct TokenCounter {
     bpe: Option<tiktoken_rs::CoreBPE>,
+    encoding_name: String,
 }
 
 impl TokenCounter {
     /// 使用 cl100k_base 编码创建计数器
     pub fn new_cl100k() -> XueliResult<Self> {
         match tiktoken_rs::cl100k_base() {
-            Ok(bpe) => Ok(Self { bpe: Some(bpe) }),
+            Ok(bpe) => Ok(Self {
+                bpe: Some(bpe),
+                encoding_name: "cl100k_base".to_string(),
+            }),
             Err(e) => {
                 tracing::warn!("tiktoken cl100k_base 加载失败: {}，使用零计数回退", e);
-                Ok(Self { bpe: None })
+                Ok(Self {
+                    bpe: None,
+                    encoding_name: "cl100k_base".to_string(),
+                })
             }
         }
     }
@@ -24,10 +31,33 @@ impl TokenCounter {
     /// 使用 o200k_base 编码创建计数器
     pub fn new_o200k() -> XueliResult<Self> {
         match tiktoken_rs::o200k_base() {
-            Ok(bpe) => Ok(Self { bpe: Some(bpe) }),
+            Ok(bpe) => Ok(Self {
+                bpe: Some(bpe),
+                encoding_name: "o200k_base".to_string(),
+            }),
             Err(e) => {
                 tracing::warn!("tiktoken o200k_base 加载失败: {}，使用零计数回退", e);
-                Ok(Self { bpe: None })
+                Ok(Self {
+                    bpe: None,
+                    encoding_name: "o200k_base".to_string(),
+                })
+            }
+        }
+    }
+
+    /// 根据编码名创建计数器
+    ///
+    /// 支持 `cl100k_base` 与 `o200k_base`，未知编码回退到 `cl100k_base`。
+    pub fn new(encoding_name: &str) -> XueliResult<Self> {
+        match encoding_name {
+            "cl100k_base" => Self::new_cl100k(),
+            "o200k_base" => Self::new_o200k(),
+            _ => {
+                tracing::warn!(
+                    "[TOKEN] 未知 tiktoken 编码 {}，回退到 cl100k_base",
+                    encoding_name
+                );
+                Self::new_cl100k()
             }
         }
     }
@@ -35,6 +65,11 @@ impl TokenCounter {
     /// 计数器是否可用
     pub fn available(&self) -> bool {
         self.bpe.is_some()
+    }
+
+    /// 当前 tiktoken 编码名
+    pub fn encoding_name(&self) -> &str {
+        &self.encoding_name
     }
 
     /// 单文本 token 计数
@@ -123,8 +158,9 @@ impl TokenCounter {
     /// 裁剪策略：
     /// 1. system 消息和当前用户消息是硬性消耗，不截断
     /// 2. tools 定义占用的 token 同样不可截断
-    /// 3. 历史消息按时间升序，从最新端向最旧端贪心填充
-    /// 4. 若 budget 不足以容纳硬性消耗，返回 0 条历史
+    /// 3. 优先保护最近 `min_recent_messages` 条历史消息原文
+    /// 4. 剩余预算从更早消息中按时间倒序贪心填充
+    /// 5. 若 budget 不足以容纳硬性消耗，返回 0 条历史
     ///
     /// 返回：裁剪后的完整消息列表 + 被丢弃的历史消息数
     pub fn trim_messages_to_budget(
@@ -136,6 +172,7 @@ impl TokenCounter {
         tool_reserve: usize,
         tools: Option<&[ToolDefinition]>,
         tag: &str,
+        min_recent_messages: usize,
     ) -> (Vec<ChatMessage>, usize) {
         let tool_def_cost = tools.map(|t| self.count_tool_definitions(t)).unwrap_or(0);
 
@@ -159,16 +196,31 @@ impl TokenCounter {
             );
         }
 
-        let mut accumulated = 0;
-        let mut selected: Vec<ChatMessage> = Vec::new();
+        // 保护最近 N 条历史消息原文，避免在预算紧张时丢失即时上下文
+        let protected_count = min_recent_messages.min(history_messages.len());
+        let (protected, remaining) = if protected_count > 0 {
+            let split = history_messages.len() - protected_count;
+            (
+                history_messages[split..].to_vec(),
+                history_messages[..split].to_vec(),
+            )
+        } else {
+            (Vec::new(), history_messages.to_vec())
+        };
 
-        for hist_msg in history_messages.iter().rev() {
-            let msg_tokens = self.count_messages(&[hist_msg.clone()]);
-            if accumulated + msg_tokens <= history_budget {
-                accumulated += msg_tokens;
-                selected.insert(0, hist_msg.clone());
-            } else {
-                break;
+        let protected_cost = self.count_messages(&protected);
+        let mut selected = protected.clone();
+        let mut accumulated = protected_cost;
+
+        if protected_cost <= history_budget {
+            for hist_msg in remaining.iter().rev() {
+                let msg_tokens = self.count_messages(&[hist_msg.clone()]);
+                if accumulated + msg_tokens <= history_budget {
+                    accumulated += msg_tokens;
+                    selected.insert(0, hist_msg.clone());
+                } else {
+                    break;
+                }
             }
         }
 
@@ -180,7 +232,7 @@ impl TokenCounter {
         result.push(current_message.clone());
 
         tracing::info!(
-            "[CTX BUDGET {}] budget={} hard={} history_used={} kept={}/{} skipped={}",
+            "[CTX BUDGET {}] budget={} hard={} history_used={} kept={}/{} skipped={} protected={}",
             tag,
             budget,
             hard_cost,
@@ -188,6 +240,7 @@ impl TokenCounter {
             kept_count,
             history_messages.len(),
             skipped,
+            protected_count,
         );
 
         (result, skipped)
@@ -269,7 +322,7 @@ mod tests {
         ];
 
         let (result, skipped) =
-            counter.trim_messages_to_budget(&sys, &cur, &hist, 1000, 0, None, "test");
+            counter.trim_messages_to_budget(&sys, &cur, &hist, 1000, 0, None, "test", 0);
         assert_eq!(skipped, 0);
         assert!(result.len() >= 3);
     }
@@ -286,7 +339,7 @@ mod tests {
         let total = hist.len();
 
         let (result, skipped) =
-            counter.trim_messages_to_budget(&sys, &cur, &hist, 100, 0, None, "test");
+            counter.trim_messages_to_budget(&sys, &cur, &hist, 100, 0, None, "test", 1);
         assert!(skipped > 0);
         assert!(result.len() < total + 2);
     }

@@ -134,27 +134,22 @@ impl<P: PlatformAdapter> BotBootstrapper<P> {
     /// 初始化 TokenCounter
     fn initialize_token_counter(&self) -> TokenCounter {
         let encoding = &self.config.bot_behavior.token_encoding;
-        let counter = match encoding.as_str() {
-            "o200k_base" => TokenCounter::new_o200k(),
-            _ => TokenCounter::new_cl100k(),
-        };
-        match counter {
-            Ok(c) => {
-                if c.available() {
-                    info!(target: LOG_STARTUP_INFO, "[启动] TokenCounter 初始化完成，编码={}", encoding);
-                } else {
-                    warn!("[启动] TokenCounter 初始化失败，token 感知上下文管理将回退");
-                }
-                c
-            }
-            Err(e) => {
-                warn!("[启动] TokenCounter 初始化失败: {}，使用 cl100k 回退", e);
-                TokenCounter::new_cl100k().unwrap_or_else(|e2| {
-                    warn!("[启动] TokenCounter cl100k 回退也失败: {}", e2);
-                    panic!("TokenCounter 初始化完全失败，无法继续");
-                })
-            }
+        let counter = TokenCounter::new(encoding).unwrap_or_else(|e| {
+            warn!(
+                "[启动] TokenCounter 初始化失败 (encoding={}): {}，使用 cl100k 回退",
+                encoding, e
+            );
+            TokenCounter::new_cl100k().unwrap_or_else(|e2| {
+                warn!("[启动] TokenCounter cl100k 回退也失败: {}", e2);
+                panic!("TokenCounter 初始化完全失败，无法继续");
+            })
+        });
+        if counter.available() {
+            info!(target: LOG_STARTUP_INFO, "[启动] TokenCounter 初始化完成，编码={}", encoding);
+        } else {
+            warn!("[启动] TokenCounter 初始化失败，token 感知上下文管理将回退");
         }
+        counter
     }
 
     /// 初始化记忆管理器
