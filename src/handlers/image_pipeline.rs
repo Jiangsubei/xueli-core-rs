@@ -44,9 +44,9 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> ImagePipeline<A, 
     pub async fn download_split(
         &self,
         event: &InboundEvent,
-    ) -> XueliResult<(Vec<String>, Vec<(Vec<u8>, String)>)> {
+    ) -> XueliResult<(Vec<String>, Vec<(Vec<u8>, String, i32)>)> {
         let mut normal_images: Vec<String> = Vec::new();
-        let mut sticker_bytes: Vec<(Vec<u8>, String)> = Vec::new();
+        let mut sticker_bytes: Vec<(Vec<u8>, String, i32)> = Vec::new();
 
         let image_urls = Self::extract_image_urls(event);
         if image_urls.is_empty() {
@@ -60,9 +60,9 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> ImagePipeline<A, 
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            if sticker_urls.contains(url) {
+            if let Some((_, sub_type)) = sticker_urls.iter().find(|(u, _)| u == url) {
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&base64) {
-                    sticker_bytes.push((bytes, url.clone()));
+                    sticker_bytes.push((bytes, url.clone(), *sub_type));
                 }
             } else {
                 normal_images.push(base64);
@@ -115,7 +115,7 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> ImagePipeline<A, 
         };
 
         if !sticker_data.is_empty() {
-            for (data, _file_id) in &sticker_data {
+            for (data, _file_id, _sub_type) in &sticker_data {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(data);
                 let emotion_labels: Vec<String> = Vec::new();
                 let reply_tones: Vec<String> = Vec::new();
@@ -161,7 +161,7 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> ImagePipeline<A, 
                     let session = event.get_session();
                     let group_id = session.scope.group_id().unwrap_or("");
                     let _ = em
-                        .capture_sticker(data, message_id, user_id, group_id)
+                        .capture_sticker(data, message_id, user_id, group_id, *_sub_type)
                         .await;
                 }
             }
@@ -172,7 +172,7 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> ImagePipeline<A, 
 
     pub async fn process_detection_result(
         &self,
-        sticker_data: &[(Vec<u8>, String)],
+        sticker_data: &[(Vec<u8>, String, i32)],
         emotion_results: &[StickerEmotionResult],
     ) -> XueliResult<()> {
         let em = match &self.emoji_manager {
@@ -180,8 +180,8 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> ImagePipeline<A, 
             None => return Ok(()),
         };
 
-        for ((data, _file_id), _emotion) in sticker_data.iter().zip(emotion_results.iter()) {
-            let _ = em.capture_sticker(data, "", "", "").await;
+        for ((data, _file_id, sub_type), _emotion) in sticker_data.iter().zip(emotion_results.iter()) {
+            let _ = em.capture_sticker(data, "", "", "", *sub_type).await;
         }
 
         Ok(())
@@ -198,21 +198,50 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> ImagePipeline<A, 
         })
     }
 
-    fn extract_sticker_urls(event: &InboundEvent) -> Vec<String> {
-        Self::extract_urls_by_segment_type(event, |seg| {
-            let is_image = seg
-                .get("type")
-                .and_then(|v| v.as_str())
-                .map(|t| t.eq_ignore_ascii_case("image"))
-                .unwrap_or(false);
-            let is_sticker = seg
-                .get("data")
-                .and_then(|d| d.get("classified_kind"))
-                .and_then(|c| c.as_str())
-                .map(|c| c == "sticker")
-                .unwrap_or(false);
-            is_image && is_sticker
-        })
+    fn extract_sticker_urls(event: &InboundEvent) -> Vec<(String, i32)> {
+        let raw = match &event.raw_payload {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(raw) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        let segments = match parsed.get("segments").and_then(|v| v.as_array()) {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        segments
+            .iter()
+            .filter(|seg| {
+                let is_image = seg
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .map(|t| t.eq_ignore_ascii_case("image"))
+                    .unwrap_or(false);
+                let is_sticker = seg
+                    .get("data")
+                    .and_then(|d| d.get("classified_kind"))
+                    .and_then(|c| c.as_str())
+                    .map(|c| c == "sticker")
+                    .unwrap_or(false);
+                is_image && is_sticker
+            })
+            .filter_map(|seg| {
+                let url = seg
+                    .get("data")
+                    .and_then(|d| d.get("url"))
+                    .and_then(|u| u.as_str())
+                    .map(|u| u.to_string());
+                let sub_type = seg
+                    .get("data")
+                    .and_then(|d| d.get("sub_type"))
+                    .and_then(|s| s.as_i64())
+                    .map(|s| s as i32)
+                    .unwrap_or(1);
+                url.map(|u| (u, sub_type))
+            })
+            .collect()
     }
 
     fn extract_urls_by_segment_type(

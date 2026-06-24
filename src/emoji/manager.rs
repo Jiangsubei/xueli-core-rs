@@ -126,6 +126,21 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> EmojiManager<A, L
         // This method exists for API compatibility with Python version
     }
 
+    /// 是否可以发送表情
+    pub fn can_send_emoji(&self) -> bool {
+        self.enabled
+    }
+
+    /// 是否可以捕获贴纸（sub_type ≠ 0, 4, 9）
+    pub fn can_capture(&self, sub_type: i32) -> bool {
+        self.enabled && self.capture_enabled && sub_type != 0 && sub_type != 4 && sub_type != 9
+    }
+
+    /// 是否可以分类（已启用 + 已配置 VisionClient）
+    pub fn can_classify(&self) -> bool {
+        self.classification_enabled && self.vision_client.is_some()
+    }
+
     pub fn with_vision_client(mut self, vc: Arc<VisionClient<A, L>>) -> Self {
         self.vision_client = Some(vc);
         self
@@ -157,8 +172,9 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> EmojiManager<A, L
         message_id: &str,
         user_id: &str,
         group_id: &str,
+        sub_type: i32,
     ) -> XueliResult<Option<StickerRecord>> {
-        if !self.enabled || !self.capture_enabled {
+        if !self.can_capture(sub_type) {
             return Ok(None);
         }
         if file_bytes.is_empty() {
@@ -546,7 +562,7 @@ mod tests {
         let (mgr, _dir) = make_mgr();
         let data = b"test_sticker_data_capture_12345";
         let result = mgr
-            .capture_sticker(data, "msg_1", "user_1", "group_1")
+            .capture_sticker(data, "msg_1", "user_1", "group_1", 1)
             .await
             .unwrap();
         assert!(result.is_some());
@@ -561,7 +577,7 @@ mod tests {
     async fn test_capture_sticker_empty_data() {
         let (mgr, _dir) = make_mgr();
         let result = mgr
-            .capture_sticker(&[], "msg", "user", "group")
+            .capture_sticker(&[], "msg", "user", "group", 1)
             .await
             .unwrap();
         assert!(result.is_none());
@@ -571,9 +587,9 @@ mod tests {
     async fn test_capture_duplicate() {
         let (mgr, _dir) = make_mgr();
         let data = b"same_data_for_dup";
-        let r1 = mgr.capture_sticker(data, "msg1", "u1", "g1").await.unwrap();
+        let r1 = mgr.capture_sticker(data, "msg1", "u1", "g1", 1).await.unwrap();
         assert!(r1.is_some());
-        let r2 = mgr.capture_sticker(data, "msg2", "u2", "g2").await.unwrap();
+        let r2 = mgr.capture_sticker(data, "msg2", "u2", "g2", 1).await.unwrap();
         assert!(r2.is_some());
     }
 
@@ -591,7 +607,7 @@ mod tests {
         let data = b"test_recommend";
         let rt = tokio::runtime::Runtime::new().unwrap();
         let rec = rt
-            .block_on(mgr.capture_sticker(data, "m", "u", "g"))
+            .block_on(mgr.capture_sticker(data, "m", "u", "g", 1))
             .unwrap()
             .unwrap();
 
