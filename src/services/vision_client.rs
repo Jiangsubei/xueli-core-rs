@@ -11,7 +11,7 @@ use crate::traits::prompt_template::PromptTemplateLoader;
 
 const DEFAULT_EMOTION_LABELS: &[&str] = &[
     "开心", "喜欢", "惊讶", "无语", "委屈", "生气", "伤心", "嘲讽", "害怕", "困惑", "焦虑", "疲惫",
-    "温暖", "内疚", "感动",
+    "温暖", "内疚", "感动", "期待",
 ];
 
 const DEFAULT_REPLY_TONES: &[&str] = &[

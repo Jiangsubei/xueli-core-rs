@@ -153,3 +153,66 @@ impl Default for ImageClient {
         Self::new().expect("ImageClient 初始化失败")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_amp() {
+        assert_eq!(decode_html_entities("&amp;"), "&");
+    }
+
+    #[test]
+    fn test_decode_lt_gt() {
+        assert_eq!(decode_html_entities("&lt;hello&gt;"), "<hello>");
+    }
+
+    #[test]
+    fn test_decode_quot_apos() {
+        assert_eq!(decode_html_entities("&quot;x&quot; &apos;y&apos;"), "\"x\" 'y'");
+    }
+
+    #[test]
+    fn test_decode_nbsp() {
+        assert_eq!(decode_html_entities("a&nbsp;b"), "a b");
+    }
+
+    #[test]
+    fn test_decode_decimal() {
+        assert_eq!(decode_html_entities("&#65;"), "A");
+        assert_eq!(decode_html_entities("&#x41;"), "A");
+    }
+
+    #[test]
+    fn test_decode_mixed() {
+        assert_eq!(
+            decode_html_entities("&lt;tag&gt; &#65; &amp; &#x42;"),
+            "<tag> A & B"
+        );
+    }
+
+    #[test]
+    fn test_decode_unknown_entity_preserved() {
+        assert_eq!(decode_html_entities("&unknown;"), "&unknown;");
+        assert_eq!(decode_html_entities("&copy;"), "&copy;");
+    }
+
+    #[test]
+    fn test_decode_empty_string() {
+        assert_eq!(decode_html_entities(""), "");
+    }
+
+    #[test]
+    fn test_decode_no_entities() {
+        assert_eq!(decode_html_entities("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_fix_url_with_entities() {
+        assert_eq!(
+            ImageClient::fix_url("https://example.com?a=1&amp;b=2"),
+            "https://example.com?a=1&b=2"
+        );
+    }
+}

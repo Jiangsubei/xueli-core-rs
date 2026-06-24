@@ -675,6 +675,28 @@ impl ImportantMemoryStore {
         Ok(matched)
     }
 
+    /// 更新指定重要记忆的 metadata_json 字段
+    pub async fn update_metadata_json(&self, mem_id: &str, metadata_json: &str) -> XueliResult<bool> {
+        let mem_id = mem_id.to_string();
+        let metadata_json = metadata_json.to_string();
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || -> XueliResult<bool> {
+            let conn = conn
+                .lock()
+                .map_err(|e| XueliError::Database(format!("锁错误: {e}")))?;
+            let now = Utc::now().to_rfc3339();
+            let affected = conn
+                .execute(
+                    "UPDATE important_memories SET metadata_json = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![metadata_json, now, mem_id],
+                )
+                .map_err(|e| XueliError::Database(format!("更新 metadata_json 失败: {e}")))?;
+            Ok(affected > 0)
+        })
+        .await
+        .map_err(|e| XueliError::Database(format!("spawn_blocking 失败: {e}")))?
+    }
+
     /// 批量标记重要记忆被召回（对应 Python 版 mark_recalled with user_id）
     pub async fn mark_recalled_batch(
         &self,

@@ -1,5 +1,6 @@
 use crate::core::types::{MemoryItem, MemoryPatch};
 use crate::memory::memory_dispute_resolver::ReflectionPayload;
+use crate::memory::stores::important::ImportantMemoryStore;
 use crate::memory::stores::memory_item::SqliteMemoryItemStore;
 use crate::prelude::XueliResult;
 use serde_json::Value as JsonValue;
@@ -229,6 +230,22 @@ impl PatchMerger {
         }
         store
             .update_metadata_full(&memory.user_id, &memory.id, &meta)
+            .await?;
+        Ok(())
+    }
+
+    /// 将 patch 状态写入重要记忆存储
+    pub async fn apply_to_important(
+        store: &ImportantMemoryStore,
+        memory: &MemoryItem,
+        patch_status: &str,
+    ) -> XueliResult<()> {
+        let meta_json = serde_json::json!({
+            "patch_status": patch_status,
+            "patch_resolved_at": chrono::Utc::now().to_rfc3339(),
+        });
+        store
+            .update_metadata_json(&memory.id, &serde_json::to_string(&meta_json).unwrap_or_default())
             .await?;
         Ok(())
     }
