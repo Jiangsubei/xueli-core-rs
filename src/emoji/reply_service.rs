@@ -65,21 +65,30 @@ impl<L: PromptTemplateLoader> EmojiReplyService<L> {
     ) -> Self {
         let default_emotion_labels = vec![
             "开心".to_string(),
-            "难过".to_string(),
-            "生气".to_string(),
-            "惊讶".to_string(),
             "喜欢".to_string(),
-            "再见".to_string(),
-            "鼓励".to_string(),
+            "惊讶".to_string(),
+            "无语".to_string(),
+            "委屈".to_string(),
+            "生气".to_string(),
+            "伤心".to_string(),
+            "嘲讽".to_string(),
+            "害怕".to_string(),
+            "困惑".to_string(),
+            "焦虑".to_string(),
+            "疲惫".to_string(),
+            "温暖".to_string(),
+            "内疚".to_string(),
+            "感动".to_string(),
         ];
         let default_reply_tones = vec![
-            "温暖".to_string(),
-            "俏皮".to_string(),
             "安慰".to_string(),
-            "共鸣".to_string(),
+            "附和".to_string(),
+            "吐槽".to_string(),
             "庆祝".to_string(),
-            "告别".to_string(),
-            "敷衍".to_string(),
+            "调侃".to_string(),
+            "拒绝".to_string(),
+            "提醒".to_string(),
+            "收尾".to_string(),
         ];
         Self {
             config,
@@ -450,6 +459,7 @@ impl<L: PromptTemplateLoader> EmojiReplyService<L> {
             0,
             None,
             "emoji_reply",
+            1,
         );
 
         let model_name = router

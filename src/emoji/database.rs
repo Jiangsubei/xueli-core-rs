@@ -106,6 +106,10 @@ impl EmojiDatabase {
         Self::with_config(db_path, 100, "replace_oldest")
     }
 
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
     pub fn with_config(
         db_path: impl AsRef<Path>,
         max_stored: usize,

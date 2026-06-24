@@ -15,6 +15,15 @@ use crate::prelude::{AIClient, PromptTemplateLoader, XueliResult};
 use crate::services::vision_client::VisionClient;
 use crate::util::crypto;
 
+const DEFAULT_EMOTION_LABELS: &[&str] = &[
+    "开心", "喜欢", "惊讶", "无语", "委屈", "生气", "伤心", "嘲讽", "害怕", "困惑", "焦虑", "疲惫",
+    "温暖", "内疚", "感动",
+];
+
+const DEFAULT_REPLY_TONES: &[&str] = &[
+    "安慰", "附和", "吐槽", "庆祝", "调侃", "拒绝", "提醒", "收尾",
+];
+
 /// 表情任务管理器 — 管理异步任务的生命周期
 pub struct EmojiTaskManager {
     tasks: Arc<AsyncMutex<Vec<JoinHandle<()>>>>,
@@ -68,6 +77,7 @@ pub struct EmojiManager<A: AIClient, L: PromptTemplateLoader> {
     classification_interval_seconds: f64,
     classification_windows: Vec<String>,
     emotion_labels: Vec<String>,
+    reply_tones: Vec<String>,
     enabled: bool,
     capture_enabled: bool,
     initialized: AtomicBool,
@@ -88,6 +98,7 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> EmojiManager<A, L
             classification_interval_seconds: 30.0,
             classification_windows: Vec::new(),
             emotion_labels: Vec::new(),
+            reply_tones: DEFAULT_REPLY_TONES.iter().map(|s| s.to_string()).collect(),
             enabled: true,
             capture_enabled: true,
             initialized: AtomicBool::new(false),
@@ -160,7 +171,14 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> EmojiManager<A, L
         }
 
         let file_format = Self::detect_format(file_bytes);
-        let file_path = format!("data/emojis/{}.{}", sha256, file_format);
+        let data_dir = self
+            .db
+            .database()
+            .db_path()
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "data/emojis".to_string());
+        let file_path = format!("{}/{}.{}", data_dir, sha256, file_format);
 
         if !tokio::fs::try_exists(&file_path).await.unwrap_or(false) {
             let tmp_path = format!("{}.tmp", file_path);
@@ -251,9 +269,16 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> EmojiManager<A, L
         use base64::{engine::general_purpose::STANDARD, Engine};
         let image_b64 = STANDARD.encode(file_data);
 
-        let empty_tones: Vec<String> = Vec::new();
+        let emotion_labels = if self.emotion_labels.is_empty() {
+            DEFAULT_EMOTION_LABELS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            self.emotion_labels.clone()
+        };
         let emotion_result = vc
-            .classify_sticker_emotion(&image_b64, &self.emotion_labels, &empty_tones, "", "", "")
+            .classify_sticker_emotion(&image_b64, &emotion_labels, &self.reply_tones, "", "", "")
             .await?;
         let trimmed = emotion_result.primary_emotion.trim().to_string();
 
