@@ -53,8 +53,12 @@ impl BM25Index {
     }
 
     /// 搜索
-    pub fn search(&self, query: &str, top_k: usize) -> Vec<(String, f64)> {
+    pub fn search(&self, query: &str, top_k: usize, min_score: f64) -> Vec<(String, f64)> {
         let query_tokens = self.tokenizer.tokenize_for_search(query);
+
+        if query_tokens.is_empty() {
+            return Vec::new();
+        }
 
         let mut scores: Vec<(String, f64)> = self
             .documents
@@ -66,6 +70,16 @@ impl BM25Index {
             .collect();
 
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 零分回退：所有 BM25 分数为 0 时，尝试字符重叠检索
+        if scores.first().map(|(_, s)| *s <= 0.0).unwrap_or(false) {
+            let fallback = self.fallback_search(query, top_k, min_score);
+            if !fallback.is_empty() {
+                return fallback;
+            }
+        }
+
+        scores.retain(|(_, s)| *s >= min_score);
         scores.truncate(top_k);
         scores
     }
@@ -169,8 +183,8 @@ impl BM25Index {
         result
     }
 
-    /// 回退搜索：索引为空时使用 substring 匹配
-    pub fn fallback_search(&self, query: &str, top_k: usize) -> Vec<(String, f64)> {
+    /// 回退搜索：BM25 零分或索引为空时使用字符重叠/子串匹配
+    pub fn fallback_search(&self, query: &str, top_k: usize, min_score: f64) -> Vec<(String, f64)> {
         let normalized = query.to_lowercase();
         let mut results: Vec<(String, f64)> = self
             .documents
@@ -199,6 +213,7 @@ impl BM25Index {
             .collect();
 
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.retain(|(_, s)| *s >= min_score);
         results.truncate(top_k);
         results
     }

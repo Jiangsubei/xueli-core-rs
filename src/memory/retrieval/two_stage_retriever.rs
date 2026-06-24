@@ -34,6 +34,12 @@ pub struct RetrievalConfig {
     pub rerank_candidate_max_chars: usize,
     /// 重排序提示词总字符预算
     pub rerank_total_prompt_budget: usize,
+    /// 动态记忆检索数量上限
+    pub dynamic_memory_limit: usize,
+    /// 是否启用动态记忆去重
+    pub dynamic_dedup_enabled: bool,
+    /// 动态记忆去重相似度阈值
+    pub dynamic_dedup_similarity_threshold: f64,
     /// 重排序器类型：`api` 或 `local`
     pub reranker_type: String,
     /// 本地 Cross-Encoder 模型名（占位）
@@ -60,6 +66,9 @@ impl Default for RetrievalConfig {
             pre_rerank_top_k: 12,
             rerank_candidate_max_chars: 160,
             rerank_total_prompt_budget: 2400,
+            dynamic_memory_limit: 8,
+            dynamic_dedup_enabled: true,
+            dynamic_dedup_similarity_threshold: 0.72,
             reranker_type: "api".to_string(),
             local_model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2".to_string(),
         }
@@ -87,6 +96,9 @@ impl RetrievalConfig {
             pre_rerank_top_k: config.memory.pre_rerank_top_k,
             rerank_candidate_max_chars: config.memory.rerank_candidate_max_chars,
             rerank_total_prompt_budget: config.memory.rerank_total_prompt_budget,
+            dynamic_memory_limit: 8,
+            dynamic_dedup_enabled: true,
+            dynamic_dedup_similarity_threshold: 0.72,
             reranker_type: "api".to_string(),
             local_model_name: config.memory_rerank.model.clone(),
         }
@@ -96,16 +108,22 @@ impl RetrievalConfig {
 /// 检索请求上下文
 #[derive(Debug, Clone)]
 pub struct RetrievalContext {
+    pub requester_user_id: String,
     pub user_id: String,
     pub group_id: String,
+    pub message_type: String,
+    pub read_scope: String,
     pub hour_of_day: i32,
 }
 
 impl Default for RetrievalContext {
     fn default() -> Self {
         Self {
+            requester_user_id: String::new(),
             user_id: String::new(),
             group_id: String::new(),
+            message_type: "private".to_string(),
+            read_scope: "user".to_string(),
             hour_of_day: -1,
         }
     }
@@ -220,7 +238,7 @@ impl TwoStageRetriever {
 
         let bm25_results = {
             let bm25 = self.bm25_index.lock().expect("bm25 lock");
-            bm25.search(query, recall_k)
+            bm25.search(query, recall_k, self.config.bm25_min_score)
         };
 
         let vector_scores: HashMap<String, f64> = if let Some(ref vi) = self.vector_index {
@@ -338,7 +356,7 @@ impl TwoStageRetriever {
     /// 用于判断是否有相关记忆（如 quick recall 场景）
     pub fn quick_check(&self, user_id: &str, query: &str, threshold: f64) -> Option<MemoryItem> {
         let bm25 = self.bm25_index.lock().expect("bm25 lock");
-        let results = bm25.search(query, 1);
+        let results = bm25.search(query, 1, threshold);
 
         if let Some((doc_id, score)) = results.first() {
             if *score < threshold || *score <= 0.0 {
@@ -448,14 +466,19 @@ impl TwoStageRetriever {
             None => return 0.0,
         };
 
-        if ctx.user_id.is_empty() && ctx.group_id.is_empty() {
+        if ctx.requester_user_id.is_empty() && ctx.group_id.is_empty() {
             return 0.0;
         }
 
         let mut score = 0.0;
 
-        if !ctx.user_id.is_empty() && memory.user_id == ctx.user_id {
+        if !ctx.requester_user_id.is_empty() && memory.user_id == ctx.requester_user_id {
             score += self.config.scene_same_user_weight;
+        }
+
+        if !ctx.message_type.is_empty() && !ctx.group_id.is_empty() {
+            // group context implies same message type scoring
+            score += self.config.scene_same_type_weight;
         }
 
         score
@@ -550,10 +573,10 @@ impl SuppressionRegistry {
 
         let current = entries.entry(key).or_insert(0);
         if *current >= 3 {
-            return false;
+            return true;
         }
         *current += 1;
-        true
+        false
     }
 
     pub fn reset(&self) {
@@ -693,8 +716,11 @@ mod tests {
         retriever.add_memory(&make_memory("m1", "u1", "用户喜欢咖啡", 0.5));
 
         let ctx = RetrievalContext {
+            requester_user_id: "u1".to_string(),
             user_id: "u1".to_string(),
             group_id: String::new(),
+            message_type: "private".to_string(),
+            read_scope: "user".to_string(),
             hour_of_day: -1,
         };
 
@@ -757,26 +783,26 @@ mod tests {
     #[test]
     fn test_suppression_basic_within_limit() {
         let registry = SuppressionRegistry::new(100);
-        assert!(registry.should_suppress("m1", "q1"));
-        assert!(registry.should_suppress("m1", "q1"));
-        assert!(registry.should_suppress("m1", "q1"));
         assert!(!registry.should_suppress("m1", "q1"));
+        assert!(!registry.should_suppress("m1", "q1"));
+        assert!(!registry.should_suppress("m1", "q1"));
+        assert!(registry.should_suppress("m1", "q1"));
     }
 
     #[test]
     fn test_suppression_cooldown_reset() {
         let registry = SuppressionRegistry::new(3);
-        assert!(registry.should_suppress("m1", "q1"));
-        assert!(registry.should_suppress("m1", "q1"));
-        registry.should_suppress("m2", "q2"); // 3rd call triggers cooldown clear
-        assert!(registry.should_suppress("m1", "q1"));
+        assert!(!registry.should_suppress("m1", "q1"));
+        assert!(!registry.should_suppress("m1", "q1"));
+        registry.should_suppress("m2", "q2"); // 3rd call (count=2) triggers cooldown clear of entries
+        assert!(!registry.should_suppress("m1", "q1")); // fresh start after clear
     }
 
     #[test]
     fn test_suppression_independent_keys() {
         let registry = SuppressionRegistry::new(100);
-        assert!(registry.should_suppress("m1", "q1"));
-        assert!(registry.should_suppress("m2", "q2"));
-        assert!(registry.should_suppress("m1", "q2"));
+        assert!(!registry.should_suppress("m1", "q1"));
+        assert!(!registry.should_suppress("m2", "q2"));
+        assert!(!registry.should_suppress("m1", "q2"));
     }
 }

@@ -33,6 +33,16 @@ impl VectorIndex {
 
     /// cosine 相似度搜索
     pub fn search(&self, query: &str, top_k: usize) -> Vec<(String, f64)> {
+        self.search_with_min_score(query, top_k, 0.0)
+    }
+
+    /// cosine 相似度搜索（带最低分数过滤）
+    pub fn search_with_min_score(
+        &self,
+        query: &str,
+        top_k: usize,
+        min_score: f64,
+    ) -> Vec<(String, f64)> {
         let query_vec = self.text_to_vector(query);
         let mut scores: Vec<(String, f64)> = self
             .documents
@@ -41,6 +51,7 @@ impl VectorIndex {
                 let score = cosine_similarity(&query_vec, doc_vec);
                 (id.clone(), score)
             })
+            .filter(|(_, score)| *score >= min_score)
             .collect();
 
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -68,15 +79,52 @@ impl VectorIndex {
 
         vec
     }
+
+    /// 获取索引中的文档数
+    pub fn doc_count(&self) -> usize {
+        self.documents.len()
+    }
 }
 
 fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
     let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    dot
+    let norm_a: f64 = a.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let norm_b: f64 = b.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let denom = norm_a * norm_b;
+    if denom > 0.0 {
+        dot / denom
+    } else {
+        0.0
+    }
 }
 
 impl Default for VectorIndex {
     fn default() -> Self {
-        Self::new(3, 1024)
+        Self::new(2, 1024)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cosine_similarity() {
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![1.0, 0.0, 0.0];
+        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 1e-10);
+
+        let c = vec![0.0, 1.0, 0.0];
+        assert!((cosine_similarity(&a, &c) - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_search_with_min_score() {
+        let mut index = VectorIndex::default();
+        index.add("d1".to_string(), "abc xyz");
+        index.add("d2".to_string(), "完全不同的文本");
+        let results = index.search_with_min_score("abc", 5, 0.5);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "d1");
     }
 }

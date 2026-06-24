@@ -8,6 +8,7 @@ use crate::memory::extraction::chat_summary::ChatSummaryService;
 use crate::memory::internal::access_policy::{MemoryAccessPolicy, PromptEntry};
 use crate::memory::recall_service::ConversationRecallService;
 use crate::memory::retrieval::bm25_index::BM25Index;
+use crate::memory::retrieval::recall_renderer::RecallRenderer;
 use crate::memory::retrieval::vector_index::VectorIndex;
 use crate::memory::stores::conversation::{ConversationRecord, SqliteConversationStore};
 use crate::memory::stores::important::ImportantMemoryStore;
@@ -72,6 +73,10 @@ pub struct RetrievalCoordinator {
     conversation_store: Option<Arc<SqliteConversationStore>>,
     /// 对话回忆服务（用于 precise recall）
     recall_service: Option<Arc<ConversationRecallService>>,
+    /// 模糊回忆渲染器
+    recall_renderer: Option<RecallRenderer>,
+    /// 是否启用动态记忆去重
+    dynamic_dedup_enabled: bool,
 }
 
 /// 检索结果
@@ -93,6 +98,8 @@ impl RetrievalCoordinator {
             prompt_budgets: PromptBudgets::default(),
             conversation_store: None,
             recall_service: None,
+            recall_renderer: None,
+            dynamic_dedup_enabled: true,
         }
     }
 
@@ -123,6 +130,18 @@ impl RetrievalCoordinator {
     /// 设置回忆服务（用于 precise recall）
     pub fn with_recall_service(mut self, service: Arc<ConversationRecallService>) -> Self {
         self.recall_service = Some(service);
+        self
+    }
+
+    /// 设置模糊回忆渲染器
+    pub fn with_recall_renderer(mut self, renderer: RecallRenderer) -> Self {
+        self.recall_renderer = Some(renderer);
+        self
+    }
+
+    /// 设置动态记忆去重开关
+    pub fn with_dynamic_dedup(mut self, enabled: bool) -> Self {
+        self.dynamic_dedup_enabled = enabled;
         self
     }
 
@@ -166,7 +185,7 @@ impl RetrievalCoordinator {
         let vector = self.vector.read().await;
         let doc_map = self.doc_to_memory.read().await;
 
-        let bm25_results = bm25.search(query, bm25_top_k);
+        let bm25_results = bm25.search(query, bm25_top_k, 0.0);
         let vector_results = vector.search(query, vector_top_k);
 
         // 合并 BM25 + 向量分数（取两者中较高值）
@@ -1074,6 +1093,13 @@ impl RetrievalCoordinator {
         context: &MemoryAccessContext,
         limit: usize,
     ) -> Vec<PromptEntry> {
+        if !self.dynamic_dedup_enabled {
+            return scored
+                .iter()
+                .take(limit)
+                .map(|(_, entry)| entry.clone())
+                .collect();
+        }
         let threshold = 0.72;
         let mut accepted: Vec<PromptEntry> = Vec::new();
 
@@ -1282,6 +1308,18 @@ impl RetrievalCoordinator {
             parts.push(title.to_string());
             for (idx, entry) in entries.iter().enumerate() {
                 if let Some(content) = entry.get("content").and_then(|v| v.as_str()) {
+                    let content = if *key == "precise_recall" {
+                        let metadata = entry.get("metadata").and_then(|v| v.as_object());
+                        let confidence = metadata
+                            .and_then(|m| m.get("recall_confidence"))
+                            .and_then(|v| v.as_f64());
+                        self.recall_renderer
+                            .as_ref()
+                            .map(|r| r.render_entry(content, confidence))
+                            .unwrap_or_else(|| content.to_string())
+                    } else {
+                        content.to_string()
+                    };
                     parts.push(format!("{}. {}", idx + 1, content));
                 }
             }
@@ -1302,7 +1340,30 @@ impl RetrievalCoordinator {
             }
         }
 
-        parts.join("\n").trim().to_string()
+        let text = parts.join("\n").trim().to_string();
+
+        // 对精准回忆 section 应用模糊回忆渲染（若启用）
+        self.apply_recall_renderer_to_text(&text)
+    }
+
+    /// 在精准回忆 section 前插入模糊回忆指导
+    fn apply_recall_renderer_to_text(&self, prompt_text: &str) -> String {
+        let renderer = match &self.recall_renderer {
+            Some(r) if r.enabled => r,
+            _ => return prompt_text.to_string(),
+        };
+        let precise_marker = "=== 相关旧对话精准定位 ===";
+        if !prompt_text.contains(precise_marker) {
+            return prompt_text.to_string();
+        }
+        let instruction = renderer.render_fuzzy_instruction();
+        if instruction.is_empty() {
+            return prompt_text.to_string();
+        }
+        prompt_text.replace(
+            precise_marker,
+            &format!("{}\n\n{}", instruction, precise_marker),
+        )
     }
 }
 

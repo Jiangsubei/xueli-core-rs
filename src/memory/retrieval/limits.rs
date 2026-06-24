@@ -21,3 +21,9 @@ impl Default for RetrievalLimits {
         }
     }
 }
+
+/// 重排序候选文本最小长度限制（与 Python limits.py 一致）
+pub const MIN_RERANK_CANDIDATE_MAX_CHARS: usize = 20;
+
+/// 重排序提示词最小总预算（与 Python limits.py 一致）
+pub const MIN_RERANK_TOTAL_PROMPT_BUDGET: usize = 200;

@@ -2,7 +2,6 @@
 ///
 /// 对应 Python 版 `xueli/src/memory/retrieval/recall_renderer.py`
 use chrono::{DateTime, Utc};
-use rand::Rng;
 
 /// 模糊回忆渲染器：控制回忆的表达方式。
 pub struct RecallRenderer {
@@ -37,16 +36,12 @@ impl RecallRenderer {
         confidence.max(self.confidence_minimum)
     }
 
-    /// 判断是否应模糊化表达
+    /// 判断是否应模糊化表达（确定性判断，移除随机性，匹配 Python P2-7 修复）
     pub fn should_fuzzify(&self, confidence: f64) -> bool {
         if !self.enabled {
             return false;
         }
-        if confidence >= self.confidence_threshold {
-            return false;
-        }
-        let mut rng = rand::thread_rng();
-        rng.gen::<f64>() < self.fuzzy_probability
+        confidence < self.confidence_threshold
     }
 
     /// 返回通用模糊回忆指导文本
@@ -83,6 +78,18 @@ impl RecallRenderer {
             return text.to_string();
         }
         self.wrap_recall_context(text)
+    }
+
+    /// 对单条记忆内容应用模糊化标记（匹配 Python render_entry）
+    pub fn render_entry(&self, content: &str, confidence: Option<f64>) -> String {
+        let text = content.trim();
+        if text.is_empty() || !self.enabled {
+            return text.to_string();
+        }
+        match confidence {
+            Some(c) if self.should_fuzzify(c) => format!("[模糊回忆] {}", text),
+            _ => text.to_string(),
+        }
     }
 }
 

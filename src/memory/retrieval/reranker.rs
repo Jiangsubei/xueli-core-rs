@@ -7,12 +7,8 @@ use regex::Regex;
 use crate::core::types::MemoryItem;
 use crate::traits::ai_client::{AIClient, ChatCompletionRequest, ChatMessage};
 
+use super::limits::{MIN_RERANK_CANDIDATE_MAX_CHARS, MIN_RERANK_TOTAL_PROMPT_BUDGET};
 use super::two_stage_retriever::RetrievalContext;
-
-/// 重排序候选文本最小长度限制
-const MIN_RERANK_CANDIDATE_MAX_CHARS: usize = 32;
-/// 重排序提示词最小总预算
-const MIN_RERANK_TOTAL_PROMPT_BUDGET: usize = 512;
 
 /// 重排序后的带分记忆
 #[derive(Debug, Clone)]
@@ -111,8 +107,10 @@ impl APIReranker {
             format!("query: {}", query),
             format!("top_k: {}", top_k),
             "request_context:".to_string(),
-            format!("- requester_user_id={}", ctx.user_id),
+            format!("- requester_user_id={}", ctx.requester_user_id),
+            format!("- message_type={}", ctx.message_type),
             format!("- group_id={}", ctx.group_id),
+            format!("- read_scope={}", ctx.read_scope),
             format!("- hour_of_day={}", ctx.hour_of_day),
             "candidates:".to_string(),
         ];
@@ -137,7 +135,8 @@ impl APIReranker {
             self.truncate_candidate_content(&mem.content, self.config.candidate_max_chars);
         format!(
             "- id={id}; local_score={local:.4}; type={memory_type}; importance={importance}; \
-             mention_count={mention_count}; owner_user_id={owner_user_id}; updated_at={updated_at}; content={content}",
+             mention_count={mention_count}; source_message_type=; source_group_id=; \
+             owner_user_id={owner_user_id}; updated_at={updated_at}; content={content}",
             id = mem.id,
             local = local_score,
             memory_type = memory_type_name(&mem.memory_type),
