@@ -596,6 +596,9 @@ mod tests {
             soft_uncertainty_signals: None,
             drive_context: None,
             caution_events: None,
+            user_profile_signal: None,
+            style_adaptation_signal: None,
+            relationship_state_signal: None,
         }
     }
 

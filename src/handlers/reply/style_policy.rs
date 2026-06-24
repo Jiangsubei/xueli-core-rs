@@ -39,11 +39,10 @@ pub struct SoftUncertaintySignal {
 /// 回复风格策略 — 从 PromptPlan 和运行时上下文构建最终回复风格指引
 ///
 /// 对应 Python 版 `ReplyStylePolicy`
+#[derive(Clone)]
 pub struct ReplyStylePolicy<L: PromptTemplateLoader> {
     template_loader: Arc<L>,
     locale: String,
-    /// 缓存的风格指南字典 (key -> value lines)
-    guidance_dict: Option<HashMap<String, String>>,
 }
 
 impl<L: PromptTemplateLoader> ReplyStylePolicy<L> {
@@ -51,15 +50,11 @@ impl<L: PromptTemplateLoader> ReplyStylePolicy<L> {
         Self {
             template_loader,
             locale: locale.into(),
-            guidance_dict: None,
         }
     }
 
     /// 确保风格指南字典已加载
-    async fn ensure_guidance(&mut self) -> &HashMap<String, String> {
-        if self.guidance_dict.is_some() {
-            return self.guidance_dict.as_ref().unwrap();
-        }
+    async fn ensure_guidance(&self) -> HashMap<String, String> {
         let raw = self
             .template_loader
             .get_template(&self.locale, "reply_style_guidance.prompt")
@@ -75,13 +70,12 @@ impl<L: PromptTemplateLoader> ReplyStylePolicy<L> {
                 dict.insert(key.trim().to_string(), value.trim().to_string());
             }
         }
-        self.guidance_dict = Some(dict);
-        self.guidance_dict.as_ref().unwrap()
+        dict
     }
 
     /// 构建最终风格指引
     pub async fn build(
-        &mut self,
+        &self,
         chat_mode: &str,
         planner_reason: &str,
         tone_profile: &str,
@@ -433,7 +427,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_basic() {
-        let mut policy = make_policy();
+        let policy = make_policy();
         let guide = policy
             .build(
                 "private",
@@ -460,7 +454,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_group() {
-        let mut policy = make_policy();
+        let policy = make_policy();
         let guide = policy
             .build(
                 "group",
@@ -478,7 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_comfort() {
-        let mut policy = make_policy();
+        let policy = make_policy();
         let guide = policy
             .build(
                 "private",

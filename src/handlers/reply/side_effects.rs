@@ -187,6 +187,12 @@ impl ReplySideEffects {
             .trim()
             .to_string();
         let prediction_met = signal.get("prediction_met").and_then(|v| v.as_bool());
+        let actual_effect = signal
+            .get("actual_effect")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
 
         // 尝试调用 apply_reply_effect_bundle
         let applied = ccs.apply_reply_effect_bundle(
@@ -197,6 +203,7 @@ impl ReplySideEffects {
             &style_label,
             &emotion_label,
             &score.expected_effect,
+            &actual_effect,
             prediction_met,
         );
 
@@ -227,7 +234,7 @@ impl ReplySideEffects {
             }
 
             if !style_label.is_empty() {
-                let _ = ccs.record_explicit_feedback_category(user_id, &style_label);
+                let _ = ccs.record_explicit_feedback_category(user_id, &style_label, "");
             }
 
             if !emotion_label.is_empty() {

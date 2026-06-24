@@ -77,6 +77,12 @@ pub struct ConversationContext {
     pub drive_context: Option<DriveContext>,
     /// 谨慎事件检测结果（{event_type: description}）
     pub caution_events: Option<Vec<(String, String)>>,
+    /// 用户画像信号（来自 reply_adaptation_signal）
+    pub user_profile_signal: Option<HashMap<String, serde_json::Value>>,
+    /// 风格适配信号（从 user_profile_signal 解析）
+    pub style_adaptation_signal: Option<HashMap<String, serde_json::Value>>,
+    /// 关系状态信号（从 user_profile_signal 解析）
+    pub relationship_state_signal: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// 会话上下文构建器 — 从存储和会话管理器加载历史，构建完整上下文。
@@ -95,6 +101,7 @@ pub struct ConversationContextBuilder<
     narrative_service: Option<Arc<NarrativeService>>,
     drive_engine: Option<Arc<DriveEngine>>,
     image_pipeline: Option<Arc<ImagePipeline<A, L>>>,
+    style_policy: Option<crate::handlers::reply::style_policy::ReplyStylePolicy<L>>,
 }
 
 impl<L: PromptTemplateLoader + 'static, A: AIClient + 'static> ConversationContextBuilder<L, A> {
@@ -108,6 +115,7 @@ impl<L: PromptTemplateLoader + 'static, A: AIClient + 'static> ConversationConte
             narrative_service: None,
             drive_engine: None,
             image_pipeline: None,
+            style_policy: None,
         }
     }
 
@@ -153,11 +161,30 @@ impl<L: PromptTemplateLoader + 'static, A: AIClient + 'static> ConversationConte
         self
     }
 
+    /// 设置回复风格策略（用于构建最终风格指引）
+    pub fn with_style_policy(
+        mut self,
+        policy: crate::handlers::reply::style_policy::ReplyStylePolicy<L>,
+    ) -> Self {
+        self.style_policy = Some(policy);
+        self
+    }
+
     /// 从事件和回复计划构建上下文
     pub async fn build(
         &self,
         event: &InboundEvent,
         _plan: &ReplyPlan,
+    ) -> XueliResult<ConversationContext> {
+        self.build_with_signals(event, _plan, None).await
+    }
+
+    /// 从事件、回复计划及上游规划信号构建上下文
+    pub async fn build_with_signals(
+        &self,
+        event: &InboundEvent,
+        _plan: &ReplyPlan,
+        external_planning_signals: Option<&HashMap<String, serde_json::Value>>,
     ) -> XueliResult<ConversationContext> {
         let user_message = event
             .message
@@ -218,7 +245,20 @@ impl<L: PromptTemplateLoader + 'static, A: AIClient + 'static> ConversationConte
             };
 
         // 构建用户情绪标签（提前计算，供记忆检索使用）
-        let user_emotion_label = self.build_user_emotion_label(&user_id);
+        let mut user_emotion_label = self.build_user_emotion_label(&user_id);
+
+        // 若上游 TimingGate/Planner 提供了情绪标签，优先使用
+        if let Some(signals) = external_planning_signals {
+            if let Some(label) = signals
+                .get("user_emotion_label")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+            {
+                if !label.is_empty() {
+                    user_emotion_label = Some(label);
+                }
+            }
+        }
 
         // 加载记忆上下文（通过 RetrievalCoordinator 统一检索）
         let (person_facts, persistent_memory, precise_recall, dynamic_memory) = self
@@ -250,8 +290,96 @@ impl<L: PromptTemplateLoader + 'static, A: AIClient + 'static> ConversationConte
         let character_card_snapshot = self.load_character_card_snapshot(&user_id);
 
         // 加载叙事线（使用 get_thread_summary 统一入口）
-        let (narrative_thread_summary, narrative_thread_label, narrative_self) =
+        let (mut narrative_thread_summary, mut narrative_thread_label, narrative_self) =
             self.load_narrative_thread(&user_id);
+
+        // 解析上游叙事信号，覆盖叙事线摘要/标签
+        let narrative_signal = external_planning_signals
+            .and_then(|s| s.get("narrative_signal"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(label) = narrative_signal
+            .get("narrative_label")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+        {
+            if !label.is_empty() {
+                narrative_thread_label = Some(label);
+            }
+        }
+        if let Some(summary) = narrative_signal
+            .get("narrative_summary")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+        {
+            if !summary.is_empty() {
+                narrative_thread_summary = Some(summary);
+            }
+        }
+
+        // 解析上游回复适配信号
+        let reply_adaptation_signal = external_planning_signals
+            .and_then(|s| {
+                s.get("reply_adaptation_signal")
+                    .or_else(|| s.get("user_profile_signal"))
+            })
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let user_profile_signal = if reply_adaptation_signal.is_object() {
+            Some(
+                reply_adaptation_signal
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect::<HashMap<String, serde_json::Value>>(),
+            )
+        } else {
+            None
+        };
+        let style_adaptation_signal = user_profile_signal.as_ref().and_then(|up| {
+            let mut map = HashMap::new();
+            for key in &[
+                "style_summary",
+                "preferred_response_shape",
+                "followup_preference",
+                "directness",
+                "humor_tolerance",
+                "confidence",
+                "reason",
+            ] {
+                if let Some(v) = up.get(*key) {
+                    map.insert(key.to_string(), v.clone());
+                }
+            }
+            if map.is_empty() {
+                None
+            } else {
+                Some(map)
+            }
+        });
+        let relationship_state_signal = user_profile_signal.as_ref().and_then(|up| {
+            let mut map = HashMap::new();
+            for key in &[
+                "relationship_read",
+                "trust_level",
+                "formality_distance",
+                "emotional_safety",
+                "tone_guidance",
+                "last_emotional_tone",
+                "confidence",
+                "reason",
+            ] {
+                if let Some(v) = up.get(*key) {
+                    map.insert(key.to_string(), v.clone());
+                }
+            }
+            if map.is_empty() {
+                None
+            } else {
+                Some(map)
+            }
+        });
 
         // 加载内驱力上下文
         let drive_context = self.load_drive_context(&user_id);
@@ -273,6 +401,11 @@ impl<L: PromptTemplateLoader + 'static, A: AIClient + 'static> ConversationConte
 
         // 规划信号归一化
         let planning_signals = self.normalize_planning_signals(_plan);
+
+        // 构建最终风格指引
+        let style_guide = self
+            .build_style_guide(scope_type, _plan, soft_uncertainty_signals.as_deref())
+            .await;
 
         Ok(ConversationContext {
             user_message,
@@ -298,11 +431,49 @@ impl<L: PromptTemplateLoader + 'static, A: AIClient + 'static> ConversationConte
             caution_signal,
             planning_signals,
             user_emotion_label,
-            style_guide: None,
+            style_guide,
             soft_uncertainty_signals,
             drive_context,
             caution_events,
+            user_profile_signal,
+            style_adaptation_signal,
+            relationship_state_signal,
         })
+    }
+
+    /// 构建最终风格指引
+    async fn build_style_guide(
+        &self,
+        scope_type: &str,
+        plan: &ReplyPlan,
+        uncertainty_signals: Option<&[SoftUncertaintySignal]>,
+    ) -> Option<FinalStyleGuide> {
+        let policy = self.style_policy.as_ref()?;
+
+        let chat_mode = if scope_type == "group" {
+            "group"
+        } else {
+            "private"
+        };
+        let tone_profile = plan.style.as_deref().unwrap_or("balanced");
+        let initiative = "gentle_follow";
+        let expression_profile = "plain";
+        let reply_goal = "continue";
+
+        Some(
+            policy
+                .build(
+                    chat_mode,
+                    "",
+                    tone_profile,
+                    initiative,
+                    expression_profile,
+                    reply_goal,
+                    None,
+                    uncertainty_signals,
+                )
+                .await,
+        )
     }
 
     /// 通过 RetrievalCoordinator 统一检索加载多记忆层上下文

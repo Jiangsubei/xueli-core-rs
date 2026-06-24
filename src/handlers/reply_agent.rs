@@ -7,6 +7,7 @@ use parking_lot::Mutex as PlMutex;
 use tokio::sync::Notify;
 
 use crate::core::config::XueliConfig;
+use crate::core::errors::XueliError;
 use crate::core::log_labels::{LOG_PROMPT_DIGEST, LOG_RETRY};
 use crate::core::platform_types::InboundEvent;
 use crate::core::scope::ChatScope;
@@ -20,6 +21,7 @@ use crate::services::tool_calling_strategy::OpenAIToolCallingStrategy;
 use crate::traits::ai_client::{AIClient, ChatCompletionRequest, ChatMessage};
 use crate::traits::prompt_template::PromptTemplateLoader;
 use crate::traits::tool_calling::{ToolCallingStrategy, ToolDefinition};
+use futures_util::future::FutureExt;
 
 /// 可执行工具 trait
 #[async_trait]
@@ -332,18 +334,20 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
     ) -> Self {
         let mut end_tool_names = HashSet::new();
         end_tool_names.insert("reply".to_string());
-        let token_counter = TokenCounter::new_cl100k().unwrap_or_else(|_| {
-            TokenCounter::new_o200k().unwrap_or_else(|_| {
-                tracing::warn!("[ReplyAgent] TokenCounter 初始化失败，使用零计数回退");
+        let token_counter =
+            TokenCounter::new(&config.bot_behavior.token_encoding).unwrap_or_else(|_| {
+                tracing::warn!(
+                    "[ReplyAgent] TokenCounter 初始化失败 (encoding={})，使用 cl100k 回退",
+                    config.bot_behavior.token_encoding
+                );
                 TokenCounter::new_cl100k().unwrap_or_else(|_| {
-                    // 双重失败时创建 bpe=None 的实例
+                    tracing::warn!("[ReplyAgent] TokenCounter cl100k 回退也失败，使用零计数回退");
                     TokenCounter::new_cl100k().unwrap_or_else(|_| {
                         // 最终回退：这不应该发生，但保证编译通过
                         panic!("TokenCounter 初始化失败")
                     })
                 })
-            })
-        });
+            });
         Self {
             config,
             ai_client,
@@ -418,8 +422,9 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
 
     /// 检查是否被中断
     fn check_interrupt(&self) -> XueliResult<()> {
-        // 非阻塞检查：如果 notify 已被触发则返回 Err
-        // 实际中断在 tokio::select! 中处理
+        if self.interrupt_notify.notified().now_or_never().is_some() {
+            return Err(XueliError::ReqAbort);
+        }
         Ok(())
     }
 
@@ -841,15 +846,22 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
         let current_msg = ChatMessage::text("user", &user_content);
 
         // 将 recent_messages 转为历史 ChatMessage
-        let history: Vec<ChatMessage> = recent_messages
+        let mut history: Vec<ChatMessage> = recent_messages
             .iter()
             .take(10)
             .map(|m| ChatMessage::text("user", m))
             .collect();
 
+        // 兼容性兜底：若配置 max_context_length > 0，先按条数限制历史消息
+        let max_context_length = self.config.bot_behavior.max_context_length;
+        if max_context_length > 0 && history.len() > max_context_length {
+            history = history.split_off(history.len() - max_context_length);
+        }
+
         // 使用 TokenCounter 裁剪到预算
         let budget = self.config.model.context_window as usize;
-        let effective_budget = (budget as f64 * 0.7) as usize;
+        let effective_budget =
+            (budget as f64 * self.config.bot_behavior.context_token_budget_ratio) as usize;
 
         let (trimmed, _skipped) = self.token_counter.trim_messages_to_budget(
             &system_msg,
@@ -859,6 +871,7 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
             1500,
             None,
             "AGENT",
+            3,
         );
 
         trimmed

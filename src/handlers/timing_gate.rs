@@ -102,6 +102,8 @@ pub struct DefaultTimingGate<A: AIClient, L: PromptTemplateLoader> {
     token_counter: Option<Arc<TokenCounter>>,
     /// 群聊回复决策配置（可选）
     decision_config: Option<GroupReplyDecisionConfig>,
+    /// LLM 判定 reply 后实际回复的概率门（0.0~1.0）
+    reply_probability: f64,
 }
 
 impl<A: AIClient, L: PromptTemplateLoader> DefaultTimingGate<A, L> {
@@ -125,6 +127,7 @@ impl<A: AIClient, L: PromptTemplateLoader> DefaultTimingGate<A, L> {
             character_card_service: None,
             token_counter: None,
             decision_config: None,
+            reply_probability: 1.0,
         }
     }
 
@@ -157,6 +160,12 @@ impl<A: AIClient, L: PromptTemplateLoader> DefaultTimingGate<A, L> {
     /// 注入群聊回复决策配置
     pub fn with_decision_config(mut self, config: GroupReplyDecisionConfig) -> Self {
         self.decision_config = Some(config);
+        self
+    }
+
+    /// 设置 reply 概率门
+    pub fn with_reply_probability(mut self, probability: f64) -> Self {
+        self.reply_probability = probability.clamp(0.0, 1.0);
         self
     }
 
@@ -545,6 +554,7 @@ impl<A: AIClient, L: PromptTemplateLoader> TimingGateStrategy for DefaultTimingG
                 512, // TimingGate 响应预算
                 None,
                 "timing_gate",
+                1,
             );
             messages = trimmed;
         }
@@ -590,6 +600,19 @@ impl<A: AIClient, L: PromptTemplateLoader> TimingGateStrategy for DefaultTimingG
                                 reason,
                                 signals.user_emotion_label
                             );
+
+                            // 概率门：reply 降级为 wait
+                            let decision = if decision == TimingDecision::Reply
+                                && rand::random::<f64>() >= self.reply_probability
+                            {
+                                tracing::debug!(
+                                    "Reply downgraded to Wait by probability gate (p={})",
+                                    self.reply_probability
+                                );
+                                TimingDecision::Wait(15.0)
+                            } else {
+                                decision
+                            };
 
                             // 写入缓存（仅在无 wait 新消息时缓存）
                             if ctx.new_messages_since_wait.is_empty() {

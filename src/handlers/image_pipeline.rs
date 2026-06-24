@@ -152,7 +152,17 @@ impl<A: AIClient + 'static, L: PromptTemplateLoader + 'static> ImagePipeline<A, 
                 }
 
                 if let Some(ref em) = self.emoji_manager {
-                    let _ = em.capture_sticker(data, "", "", "").await;
+                    let message_id = event.id.as_str();
+                    let user_id = event
+                        .sender
+                        .as_ref()
+                        .map(|s| s.user_id.as_str())
+                        .unwrap_or("");
+                    let session = event.get_session();
+                    let group_id = session.scope.group_id().unwrap_or("");
+                    let _ = em
+                        .capture_sticker(data, message_id, user_id, group_id)
+                        .await;
                 }
             }
         }

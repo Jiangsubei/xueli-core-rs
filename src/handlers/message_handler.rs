@@ -36,6 +36,8 @@ use crate::handlers::reply_agent::{ReplyAgent, ReplyAgentResult};
 use crate::handlers::session_manager::ConversationSessionManager;
 use crate::handlers::shared::identity_provider::IdentityProvider;
 use crate::handlers::timing_gate::DefaultTimingGate;
+use crate::memory::extraction::extractor::MemoryExtractor;
+use crate::memory::extraction::reflection::MemoryReflection;
 use crate::memory::flow_service::{MemoryFlowService, MemoryJob};
 use crate::memory::manager::MemoryManager;
 use crate::memory::stores::mood_store::MoodStore;
@@ -128,8 +130,8 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         prompt_builder: ReplyPromptBuilder<L>,
     ) -> Self {
         let token_counter = Arc::new(
-            TokenCounter::new_cl100k()
-                .unwrap_or_else(|_| TokenCounter::new_o200k().expect("TokenCounter 创建失败")),
+            TokenCounter::new(&config.bot_behavior.token_encoding)
+                .unwrap_or_else(|_| TokenCounter::new_cl100k().expect("TokenCounter 创建失败")),
         );
         let image_client = match ImageClient::new() {
             Ok(c) => Arc::new(c),
@@ -148,7 +150,9 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
             config.identity.name.clone(),
             config.identity.alias.clone(),
             "zh-CN",
-        );
+        )
+        .with_token_counter(token_counter.clone())
+        .with_reply_probability(config.timing_gate.reply_probability);
 
         let planner_model = config.model.primary_model.clone();
         let planner = Arc::new(
@@ -180,36 +184,90 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
             Some(memory_manager.conversation_store()),
         ));
 
-        let (flow_service, mut memory_flow_rx) =
-            MemoryFlowService::new(memory_manager.clone(), None, None);
+        // 装配 MemoryFlowService：注入提取器、后台协调器、反思与角色/叙事服务
+        let memory_extraction_model = config
+            .memory
+            .extraction_model
+            .as_deref()
+            .unwrap_or(&config.model.primary_model)
+            .to_string();
+        let db_dir = std::path::Path::new(&config.memory.data_dir);
+        let character_card_service = {
+            let storage_dir = db_dir.join("_character_cards");
+            let storage_dir_str = storage_dir.to_string_lossy().to_string();
+            let card = CharacterCardService::default_card();
+            Arc::new(CharacterCardService::new(card, &storage_dir_str))
+        };
+        let narrative_service = {
+            let storage_dir = db_dir.join("_narrative_threads");
+            let storage_dir_str = storage_dir.to_string_lossy().to_string();
+            Arc::new(NarrativeService::new(&storage_dir_str))
+        };
+        let ai_dyn: Arc<dyn AIClient> = ai_client.clone();
+        let extractor: Arc<MemoryExtractor<dyn AIClient, L>> = Arc::new(
+            MemoryExtractor::new(
+                ai_dyn.clone(),
+                &memory_extraction_model,
+                template_loader.clone(),
+            )
+            .with_extract_every_n_turns(config.memory.extract_every_n_turns),
+        );
+        let reflection: Arc<MemoryReflection<dyn AIClient, L>> = Arc::new(MemoryReflection::new(
+            ai_dyn.clone(),
+            &config.model.primary_model,
+            template_loader.clone(),
+        ));
+        let mut flow_service = MemoryFlowService::new(
+            memory_manager.clone(),
+            Some(config.memory.dispute.clone()),
+            None,
+        )
+        .with_extractor(extractor)
+        .with_memory_reflection(reflection)
+        .with_character_card_service(character_card_service.clone())
+        .with_narrative_service(narrative_service.clone());
+        if let Some(bg) = memory_manager.background_coordinator() {
+            flow_service = flow_service.with_background_coordinator(bg);
+        }
         let memory_flow_tx = flow_service.tx.clone();
         {
             tokio::spawn(async move {
-                flow_service.run(&mut memory_flow_rx).await;
+                flow_service.run().await;
             });
         }
 
-        let db_dir = std::path::Path::new(&config.memory.data_dir);
-        let emoji_db = EmojiDB::new(&db_dir.to_string_lossy());
-        let emoji_manager =
-            Arc::new(EmojiManager::new(emoji_db).with_vision_client(vision_client.clone()));
+        let emoji_data_dir = std::path::Path::new(&config.emoji.data_dir);
+        let emoji_db = EmojiDB::new(&emoji_data_dir.to_string_lossy());
+        let emoji_manager = Arc::new(
+            EmojiManager::new(emoji_db)
+                .with_vision_client(vision_client.clone())
+                .with_classification_config(
+                    config.emoji.classification_enabled,
+                    config.emoji.idle_seconds_before_classify,
+                    config.emoji.classification_interval_seconds,
+                    config.emoji.classification_windows.clone(),
+                    config.emoji.emotion_labels.clone(),
+                ),
+        );
 
         let emoji_database = Arc::new(
-            crate::emoji::database::EmojiDatabase::new(db_dir.join("emojis.db")).unwrap_or_else(
-                |_| {
+            crate::emoji::database::EmojiDatabase::new(emoji_data_dir.join("emojis.db"))
+                .unwrap_or_else(|_| {
                     let tmp = std::env::temp_dir().join("xueli_emoji.db");
                     crate::emoji::database::EmojiDatabase::new(&tmp)
                         .expect("EmojiDatabase 创建失败")
-                },
-            ),
+                }),
         );
-        let emoji_reply_service = Arc::new(EmojiReplyService::new(
-            config.emoji.clone(),
-            ai_client.clone(),
-            emoji_database,
-            template_loader.clone(),
-            config.model.primary_model.clone(),
-        ));
+        let emoji_reply_service = Arc::new(
+            EmojiReplyService::new(
+                config.emoji.clone(),
+                ai_client.clone(),
+                emoji_database,
+                template_loader.clone(),
+                config.model.primary_model.clone(),
+            )
+            .with_token_counter(token_counter.clone()),
+        );
 
         let reply_effect_tracker = Arc::new(TokioMutex::new(ReplyEffectTracker::new(600.0)));
         let signal_orchestrator = Arc::new(SignalOrchestrator::new(
@@ -242,12 +300,17 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         let drive_store = DriveStore::new(&config.memory.data_dir);
         let drive_engine = Arc::new(DriveEngine::new(drive_store, "global", true));
 
+        let style_policy = crate::handlers::reply::style_policy::ReplyStylePolicy::new(
+            template_loader.clone(),
+            "zh-CN",
+        );
         let context_builder = ConversationContextBuilder::new(memory_manager.conversation_store())
             .with_session_manager(session_mgr.clone())
             .with_memory_manager(memory_manager.clone())
             .with_retrieval_coordinator(memory_manager.retrieval_coordinator())
             .with_drive_engine(drive_engine.clone())
-            .with_image_pipeline(image_pipeline.clone());
+            .with_image_pipeline(image_pipeline.clone())
+            .with_style_policy(style_policy);
         let context_builder = Arc::new(context_builder);
 
         let plan_coord = ConversationPlanCoordinator::new(
@@ -268,18 +331,6 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         let context_recorder = Arc::new(ContextRecorder::new(Some(
             db_dir.join("xueli_memory.db").to_string_lossy().to_string(),
         )));
-
-        let character_card_service = {
-            let storage_dir = db_dir.join("_character_cards");
-            let storage_dir_str = storage_dir.to_string_lossy().to_string();
-            let card = CharacterCardService::default_card();
-            Arc::new(CharacterCardService::new(card, &storage_dir_str))
-        };
-        let narrative_service = {
-            let storage_dir = db_dir.join("_narrative_threads");
-            let storage_dir_str = storage_dir.to_string_lossy().to_string();
-            Arc::new(NarrativeService::new(&storage_dir_str))
-        };
 
         let reply_side_effects = Arc::new(
             ReplySideEffects::new(reply_effect_tracker.clone())
@@ -710,7 +761,10 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
                 priority: 0,
             });
 
-        self.context_builder.build(event, &reply_plan).await
+        let planning_signals = plan.map(|p| &p.planning_signals);
+        self.context_builder
+            .build_with_signals(event, &reply_plan, planning_signals)
+            .await
     }
 
     pub async fn get_ai_response(
@@ -872,8 +926,9 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         if let Some(last) = last_time {
             let elapsed = last.elapsed();
             if elapsed.as_secs_f64() < interval {
-                tracing::debug!("[RATE LIMIT] {} 被限流，跳过回复", target_id);
-                return false;
+                let wait = Duration::from_secs_f64(interval - elapsed.as_secs_f64());
+                tracing::debug!("[RATE LIMIT] {} 等待 {:.1}s", target_id, wait.as_secs_f64());
+                tokio::time::sleep(wait).await;
             }
         }
         self.last_send_time
