@@ -19,6 +19,7 @@ pub struct FinalStyleGuide {
     pub allowed_colloquialism: String,
     pub relationship_guidance: String,
     pub anti_patterns: Vec<String>,
+    pub mood_tags: Vec<String>,
 }
 
 /// 角色卡快照（用于风格策略）
@@ -84,6 +85,7 @@ impl<L: PromptTemplateLoader> ReplyStylePolicy<L> {
         reply_goal: &str,
         character_snapshot: Option<&CharacterCardSnapshot>,
         uncertainty_signals: Option<&[SoftUncertaintySignal]>,
+        mood_tags: &[String],
     ) -> FinalStyleGuide {
         let guidance = self.ensure_guidance().await;
         let g = |key: &str| guidance.get(key).cloned().unwrap_or_default();
@@ -317,6 +319,7 @@ impl<L: PromptTemplateLoader> ReplyStylePolicy<L> {
             allowed_colloquialism: colloquial,
             relationship_guidance: relationship,
             anti_patterns: anti,
+            mood_tags: mood_tags.to_vec(),
         }
     }
 
@@ -389,6 +392,10 @@ impl<L: PromptTemplateLoader> ReplyStylePolicy<L> {
             }
         }
 
+        if !guide.mood_tags.is_empty() {
+            parts.push(format!("语气标签: {}", guide.mood_tags.join(", ")));
+        }
+
         parts.join("\n")
     }
 }
@@ -438,6 +445,7 @@ mod tests {
                 "continue",
                 None,
                 None,
+                &[],
             )
             .await;
 
@@ -465,6 +473,7 @@ mod tests {
                 "continue",
                 None,
                 None,
+                &[],
             )
             .await;
         assert!(!guide.anti_patterns.is_empty());
@@ -483,6 +492,7 @@ mod tests {
                 "comfort",
                 None,
                 None,
+                &[],
             )
             .await;
         // comfort 应包含 anti comfort rule

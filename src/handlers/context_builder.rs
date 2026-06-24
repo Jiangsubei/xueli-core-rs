@@ -99,7 +99,7 @@ pub struct ConversationContextBuilder<
     retrieval_coordinator: Option<Arc<RetrievalCoordinator>>,
     character_card_service: Option<Arc<CharacterCardService>>,
     narrative_service: Option<Arc<NarrativeService>>,
-    drive_engine: Option<Arc<DriveEngine>>,
+    drive_engine: Option<Arc<tokio::sync::Mutex<DriveEngine>>>,
     image_pipeline: Option<Arc<ImagePipeline<A, L>>>,
     style_policy: Option<crate::handlers::reply::style_policy::ReplyStylePolicy<L>>,
 }
@@ -150,7 +150,7 @@ impl<L: PromptTemplateLoader + 'static, A: AIClient + 'static> ConversationConte
     }
 
     /// 设置内驱力引擎（用于加载驱动力上下文）
-    pub fn with_drive_engine(mut self, engine: Arc<DriveEngine>) -> Self {
+    pub fn with_drive_engine(mut self, engine: Arc<tokio::sync::Mutex<DriveEngine>>) -> Self {
         self.drive_engine = Some(engine);
         self
     }
@@ -382,7 +382,7 @@ impl<L: PromptTemplateLoader + 'static, A: AIClient + 'static> ConversationConte
         });
 
         // 加载内驱力上下文
-        let drive_context = self.load_drive_context(&user_id);
+        let drive_context = self.load_drive_context(&user_id).await;
 
         // 加载软不确定性信号
         let soft_uncertainty_signals = self.load_soft_uncertainty_signals(&user_id).await;
@@ -404,7 +404,7 @@ impl<L: PromptTemplateLoader + 'static, A: AIClient + 'static> ConversationConte
 
         // 构建最终风格指引
         let style_guide = self
-            .build_style_guide(scope_type, _plan, soft_uncertainty_signals.as_deref())
+            .build_style_guide(scope_type, _plan, soft_uncertainty_signals.as_deref(), &[])
             .await;
 
         Ok(ConversationContext {
@@ -447,6 +447,7 @@ impl<L: PromptTemplateLoader + 'static, A: AIClient + 'static> ConversationConte
         scope_type: &str,
         plan: &ReplyPlan,
         uncertainty_signals: Option<&[SoftUncertaintySignal]>,
+        mood_tags: &[String],
     ) -> Option<FinalStyleGuide> {
         let policy = self.style_policy.as_ref()?;
 
@@ -471,6 +472,7 @@ impl<L: PromptTemplateLoader + 'static, A: AIClient + 'static> ConversationConte
                     reply_goal,
                     None,
                     uncertainty_signals,
+                    mood_tags,
                 )
                 .await,
         )
@@ -942,7 +944,7 @@ impl<L: PromptTemplateLoader + 'static, A: AIClient + 'static> ConversationConte
     // ─── Phase 2.2 增强 ──────────────────────────────────
 
     /// 加载内驱力上下文 — 从 DriveEngine 获取情绪/动机/关系状态
-    fn load_drive_context(&self, user_id: &str) -> Option<DriveContext> {
+    async fn load_drive_context(&self, user_id: &str) -> Option<DriveContext> {
         let engine = match &self.drive_engine {
             Some(e) => e,
             None => {
@@ -950,6 +952,7 @@ impl<L: PromptTemplateLoader + 'static, A: AIClient + 'static> ConversationConte
                 return None;
             }
         };
+        let engine = engine.lock().await;
         if !engine.enabled() {
             debug!("跳过内驱力上下文加载：DriveEngine 未启用");
             return None;

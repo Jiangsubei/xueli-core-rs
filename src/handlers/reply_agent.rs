@@ -18,6 +18,7 @@ use crate::memory::stores::person_fact::SqlitePersonFactStore;
 use crate::prelude::XueliResult;
 use crate::services::token_counter::TokenCounter;
 use crate::services::tool_calling_strategy::OpenAIToolCallingStrategy;
+use crate::signals::metacognition::MetacognitionMonitor;
 use crate::traits::ai_client::{AIClient, ChatCompletionRequest, ChatMessage};
 use crate::traits::prompt_template::PromptTemplateLoader;
 use crate::traits::tool_calling::{ToolCallingStrategy, ToolDefinition};
@@ -319,6 +320,8 @@ pub struct ReplyAgent<A: AIClient, L: PromptTemplateLoader + 'static> {
     deferred_tools: PlMutex<Vec<serde_json::Value>>,
     /// 工具调用策略
     tool_calling_strategy: Box<dyn ToolCallingStrategy>,
+    /// 元认知状态追踪器
+    metacognition_monitor: std::sync::Mutex<MetacognitionMonitor>,
 }
 
 /// 最大内部工具调用轮数（对应 Python MAX_INTERNAL_ROUNDS）
@@ -331,6 +334,21 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
         memory_manager: Arc<MemoryManager<L>>,
         person_fact_store: Arc<SqlitePersonFactStore>,
         prompt_builder: ReplyPromptBuilder<L>,
+    ) -> Self {
+        Self::with_metacognition_monitor(
+            config, ai_client, memory_manager, person_fact_store, prompt_builder,
+            MetacognitionMonitor::default(),
+        )
+    }
+
+    /// 创建 ReplyAgent，注入元认知监控器
+    pub fn with_metacognition_monitor(
+        config: Arc<XueliConfig>,
+        ai_client: Arc<A>,
+        memory_manager: Arc<MemoryManager<L>>,
+        person_fact_store: Arc<SqlitePersonFactStore>,
+        prompt_builder: ReplyPromptBuilder<L>,
+        metacognition_monitor: MetacognitionMonitor,
     ) -> Self {
         let mut end_tool_names = HashSet::new();
         end_tool_names.insert("reply".to_string());
@@ -362,6 +380,7 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
             plugin_handlers: HashMap::new(),
             deferred_tools: PlMutex::new(Vec::new()),
             tool_calling_strategy: Box::new(OpenAIToolCallingStrategy::new()),
+            metacognition_monitor: std::sync::Mutex::new(metacognition_monitor),
         }
     }
 
@@ -459,6 +478,13 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
         }
     }
 
+    /// 记录元认知快照（回复成功时调用）
+    fn record_metacognition_snapshot(&self, user_id: &str, caution_level: &str, reason_count: usize) {
+        if let Ok(mut monitor) = self.metacognition_monitor.lock() {
+            monitor.record_snapshot(user_id, caution_level, reason_count, 0, false, true);
+        }
+    }
+
     /// 生成回复文本（带 tool-calling 循环 + 中断机制）
     pub async fn generate_reply(
         &self,
@@ -493,6 +519,17 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
         // 构建 identity 文本
         let identity = format!("你的名字是「{sender_name}的好友」。你是一个友好的 AI 助手。");
 
+        // 获取元认知状态报告
+        let metacognition_state_report = {
+            let monitor = self.metacognition_monitor.lock().unwrap();
+            monitor.get_self_state_report(&user_id)
+        };
+        let metacognition_state_report = if metacognition_state_report.is_empty() {
+            None
+        } else {
+            Some(metacognition_state_report.as_str())
+        };
+
         // 构建系统提示词
         let system_prompt = self
             .prompt_builder
@@ -514,7 +551,7 @@ impl<A: AIClient, L: PromptTemplateLoader + 'static> ReplyAgent<A, L> {
                 context.user_emotion_label.as_deref(),
                 context.soft_uncertainty_signals.as_deref(),
                 context.caution_signal.as_ref(),
-                None, // metacognition_state_report
+                metacognition_state_report,
                 None, // user_profile_signal
                 if reply_reference.is_empty() {
                     None

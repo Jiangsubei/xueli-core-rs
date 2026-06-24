@@ -12,6 +12,7 @@ use crate::core::config::XueliConfig;
 use crate::core::context_recorder::ContextRecorder;
 use crate::core::drive::engine::DriveEngine;
 use crate::core::drive::store::DriveStore;
+use crate::core::drive::style_selector::StyleSelector;
 use crate::core::message_trace::{build_trace_id, get_execution_key};
 use crate::core::metrics::RuntimeMetrics;
 use crate::core::mood_engine::MoodEngine;
@@ -115,6 +116,12 @@ pub struct MessageHandler<
     rate_limit_lock: TokioMutex<()>,
 
     platform: Arc<P>,
+
+    /// 内驱力引擎（写操作）
+    drive_engine: Arc<tokio::sync::Mutex<DriveEngine>>,
+
+    /// 风格选择器（语气标签）
+    style_selector: std::sync::Mutex<StyleSelector>,
 }
 
 impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'static>
@@ -298,7 +305,7 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         ));
 
         let drive_store = DriveStore::new(&config.memory.data_dir);
-        let drive_engine = Arc::new(DriveEngine::new(drive_store, "global", true));
+        let drive_engine = Arc::new(tokio::sync::Mutex::new(DriveEngine::new(drive_store, "global", true)));
 
         let style_policy = crate::handlers::reply::style_policy::ReplyStylePolicy::new(
             template_loader.clone(),
@@ -387,6 +394,8 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
             pending_waits: DashMap::new(),
             rate_limit_lock: TokioMutex::new(()),
             platform,
+            drive_engine,
+            style_selector: std::sync::Mutex::new(StyleSelector::new(0.35)),
         }
     }
 
@@ -407,6 +416,19 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
 
         // 记录收到消息指标
         self._record_metrics_message_received();
+
+        // 通知内驱力系统消息到达
+        if let Some(msg) = &event.message {
+            self.drive_engine
+                .lock()
+                .await
+                .on_event(crate::core::drive::DriveEvent::MessageProcessed {
+                    user_id: msg.sender_id.clone(),
+                    message: msg.text.clone(),
+                    timestamp: chrono::Utc::now(),
+                })
+                .await;
+        }
 
         // 收集群聊消息到缓冲区
         let _ = self.collect_group_message(event).await;
@@ -792,13 +814,31 @@ impl<A: AIClient + 'static, P: PlatformAdapter, L: PromptTemplateLoader + 'stati
         }
 
         // 视觉分析现在由 ContextBuilder 在 build() 中统一注入
-        let context = match prebuilt_context {
+        let mut context = match prebuilt_context {
             Some(ctx) => ctx,
             None => {
                 self.build_message_context(event, plan, trace_id, true)
                     .await?
             }
         };
+
+        // 从内驱力上下文计算语气标签，注入风格指引
+        let mood_tags: Vec<String> = if let Some(ref dc) = context.drive_context {
+            let scope_key = match &context.scope {
+                ChatScope::Group(gid) => gid.as_str(),
+                ChatScope::Private => "private",
+            };
+            let mut selector = self.style_selector.lock().unwrap();
+            let tags = selector.select(Some(dc), scope_key, &context.user_id);
+            tags.into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        if !mood_tags.is_empty() {
+            if let Some(ref mut style_guide) = context.style_guide {
+                style_guide.mood_tags = mood_tags;
+            }
+        }
 
         let reply_reference = plan.map(|p| p.reply_reference.as_str()).unwrap_or("");
 

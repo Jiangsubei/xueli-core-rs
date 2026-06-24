@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::character::card_service::CharacterCardSnapshot;
 use crate::core::scope::ChatScope;
+use crate::handlers::reply::pipeline::dedupe_memory_lines;
 use crate::handlers::reply::style_policy::{FinalStyleGuide, SoftUncertaintySignal};
 use crate::prelude::XueliResult;
 use crate::signals::label_mapper::{conversation_window_label, mood_decision_label};
@@ -132,6 +133,8 @@ impl<L: PromptTemplateLoader> ReplyPromptBuilder<L> {
         reply_reference: Option<&str>,
     ) -> String {
         let mut parts: Vec<String> = Vec::new();
+        // 累计已披露的内容行，用于 section 间去重
+        let mut disclosed_lines: Vec<String> = Vec::new();
 
         // 1. 回复风格指引
         if let Some(guide) = style_guide {
@@ -144,11 +147,16 @@ impl<L: PromptTemplateLoader> ReplyPromptBuilder<L> {
         // 2. 用户已知信息 / 人物事实
         if !person_facts.is_empty() {
             parts.push(format!("【用户已知信息】\n{}", person_facts.join("\n")));
+            disclosed_lines.extend(person_facts.iter().cloned());
         }
 
-        // 3. 长期记忆
+        // 3. 长期记忆（已去重）
         if !memories.is_empty() {
-            parts.push(format!("【长期记忆】\n{}", memories.join("\n")));
+            let deduped = dedupe_memory_lines(memories, &disclosed_lines);
+            if !deduped.is_empty() {
+                parts.push(format!("【长期记忆】\n{}", deduped.join("\n")));
+                disclosed_lines.extend(deduped);
+            }
         }
 
         // 4. 角色卡快照 → 关系状态
@@ -458,6 +466,10 @@ impl<L: PromptTemplateLoader> ReplyPromptBuilder<L> {
             for a in &guide.anti_patterns {
                 parts.push(format!("  - {}", a));
             }
+        }
+
+        if !guide.mood_tags.is_empty() {
+            parts.push(format!("语气标签: {}", guide.mood_tags.join(", ")));
         }
 
         parts.join("\n")
