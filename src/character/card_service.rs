@@ -143,6 +143,7 @@ struct EmotionEntry {
 pub struct RelationshipProfileInternal {
     intimacy_level: f64,
     total_interactions: u64,
+    interactions_last_week: u64,
     reply_positive_count: u64,
     reply_negative_count: u64,
     reply_repair_count: u64,
@@ -352,18 +353,23 @@ impl CharacterCardService {
         &self,
         user_id: &str,
         category: &str,
+        text: &str,
     ) -> XueliResult<()> {
         if !self.config.enabled {
             return Ok(());
         }
-        let normalized = category.trim();
-        if normalized.is_empty() {
+        let normalized_category = category.trim();
+        if normalized_category.is_empty() {
             return Ok(());
         }
         let mut payload = self.load_payload(user_id);
         payload.explicit_feedback.push(FeedbackEntry {
-            text: format!("[llm]{}", normalized),
-            category: normalized.to_string(),
+            text: if text.trim().is_empty() {
+                format!("[llm]{}", normalized_category)
+            } else {
+                text.trim().to_string()
+            },
+            category: normalized_category.to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
         });
         self.save_payload(user_id, &payload);
@@ -484,6 +490,7 @@ impl CharacterCardService {
         };
         profile.intimacy_level = (profile.intimacy_level + delta).clamp(0.0, 1.0);
         profile.total_interactions += 1;
+        profile.interactions_last_week += 1;
         let now = chrono::Utc::now().to_rfc3339();
         profile.last_interaction_at = now.clone();
         profile.last_intimacy_change = now;
@@ -847,6 +854,7 @@ impl CharacterCardService {
         style_label: &str,
         emotion_label: &str,
         expected_effect: &str,
+        actual_effect: &str,
         prediction_met: Option<bool>,
     ) -> XueliResult<()> {
         if !self.config.enabled {
@@ -896,6 +904,7 @@ impl CharacterCardService {
         }
 
         let normalized_expected = Self::normalize_expected_effect(expected_effect, false);
+        let normalized_actual = Self::normalize_expected_effect(actual_effect, true);
         if !normalized_expected.is_empty() {
             if let Some(met) = prediction_met {
                 let suffix = if met { "met" } else { "failed" };
@@ -905,6 +914,16 @@ impl CharacterCardService {
                     created_at: now.clone(),
                 });
             }
+        }
+        if !normalized_expected.is_empty() && !normalized_actual.is_empty() {
+            payload.stable_signals.push(SignalEntry {
+                signal: format!(
+                    "expected_actual:{}:{}",
+                    normalized_expected, normalized_actual
+                ),
+                weight: 1,
+                created_at: now.clone(),
+            });
         }
 
         if let Some(met) = prediction_met {
@@ -944,6 +963,7 @@ impl CharacterCardService {
             if delta != 0.0 {
                 profile.intimacy_level = (profile.intimacy_level + delta).clamp(0.0, 1.0);
                 profile.total_interactions += 1;
+                profile.interactions_last_week += 1;
                 profile.last_interaction_at = now.clone();
                 profile.last_intimacy_change = now.clone();
                 if is_friction {
@@ -1211,9 +1231,9 @@ mod tests {
     #[test]
     fn test_record_explicit_feedback_category() {
         let (svc, _dir) = make_svc();
-        svc.record_explicit_feedback_category("u1", "喜欢轻松语气")
+        svc.record_explicit_feedback_category("u1", "喜欢轻松语气", "")
             .unwrap();
-        svc.record_explicit_feedback_category("u1", "讨厌长篇大论")
+        svc.record_explicit_feedback_category("u1", "讨厌长篇大论", "")
             .unwrap();
 
         let snapshot = svc.refresh_snapshot("u1");
@@ -1324,6 +1344,7 @@ mod tests {
             "俏皮",
             "开心",
             "continue",
+            "continue",
             Some(true),
         )
         .unwrap();
@@ -1335,6 +1356,7 @@ mod tests {
             "问候",
             "幽默",
             "喜欢",
+            "continue",
             "continue",
             Some(true),
         )
@@ -1357,6 +1379,7 @@ mod tests {
             "回复不当",
             "",
             "生气",
+            "clarify",
             "clarify",
             Some(false),
         )
