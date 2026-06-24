@@ -169,11 +169,18 @@ pub struct SessionRecord {
     pub metadata: HashMap<String, String>,
     #[serde(default)]
     pub dirty_turns: i64,
+    /// 持久化到数据库的 turn_count，用于 get_conversations 等不加载 turns 的场景
+    #[serde(default)]
+    pub turn_count: i64,
 }
 
 impl SessionRecord {
     pub fn turn_count(&self) -> i64 {
-        self.turns.len() as i64
+        if self.turns.is_empty() && self.turn_count > 0 {
+            self.turn_count
+        } else {
+            self.turns.len() as i64
+        }
     }
 }
 
@@ -581,6 +588,7 @@ impl SqliteConversationStore {
                     turns: Vec::new(),
                     metadata: HashMap::new(),
                     dirty_turns: 0,
+                    turn_count: 0,
                 }
             });
 
@@ -1305,6 +1313,7 @@ impl SqliteConversationStore {
                 turns: Vec::new(),
                 metadata: HashMap::new(),
                 dirty_turns: 0,
+                turn_count: 0,
             };
 
             by_dialogue.insert(dialogue_key.to_string(), new_sid.clone());
@@ -1392,6 +1401,7 @@ impl SqliteConversationStore {
                     let metadata_str: String = row.get(8).unwrap_or_else(|_| "{}".to_string());
                     let metadata_map: HashMap<String, String> =
                         serde_json::from_str(&metadata_str).unwrap_or_default();
+                    let tc: i64 = row.get(7).unwrap_or(0);
                     Ok(SessionRecord {
                         session_id: row.get(0)?,
                         dialogue_key: row.get(1)?,
@@ -1404,6 +1414,7 @@ impl SqliteConversationStore {
                         turns: Vec::new(),
                         metadata: metadata_map,
                         dirty_turns: 0,
+                        turn_count: tc,
                     })
                 })
                 .map_err(|e| format!("查询失败: {e}"))?
@@ -1443,6 +1454,7 @@ impl SqliteConversationStore {
                     let metadata_str: String = row.get(8).unwrap_or_else(|_| "{}".to_string());
                     let metadata_map: HashMap<String, String> =
                         serde_json::from_str(&metadata_str).unwrap_or_default();
+                    let tc: i64 = row.get(7).unwrap_or(0);
                     Ok(SessionRecord {
                         session_id: row.get(0)?,
                         dialogue_key: row.get(1)?,
@@ -1455,6 +1467,7 @@ impl SqliteConversationStore {
                         turns: Vec::new(),
                         metadata: metadata_map,
                         dirty_turns: 0,
+                        turn_count: tc,
                     })
                 })
                 .map_err(|e| format!("查询失败: {e}"))?

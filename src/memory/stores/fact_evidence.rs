@@ -132,21 +132,20 @@ impl SqliteFactEvidenceStore {
         .map_err(|e| format!("spawn_blocking 失败: {e}"))?
     }
 
-    /// 按用户 ID 获取所有证据
-    pub async fn get_by_user(&self, user_id: &str) -> XueliResult<Vec<FactEvidence>> {
-        let user_id = user_id.to_string();
+    /// 按用户 ID 获取所有证据（返回全部证据，由调用方按 fact_id 过滤）
+    pub async fn get_by_user(&self, _user_id: &str) -> XueliResult<Vec<FactEvidence>> {
         let conn = Arc::clone(&self.conn);
         tokio::task::spawn_blocking(move || -> XueliResult<Vec<FactEvidence>> {
             let conn = conn.lock().map_err(|e| format!("锁错误: {e}"))?;
             let mut stmt = conn
                 .prepare(
                     "SELECT id, fact_id, source_memory_id, conversation_id, message_id, evidence_text, created_at
-                     FROM fact_evidences WHERE fact_id = ?1 ORDER BY created_at DESC",
+                     FROM fact_evidences ORDER BY created_at DESC",
                 )
                 .map_err(|e| format!("准备查询失败: {e}"))?;
 
             let rows = stmt
-                .query_map(params![user_id], row_to_fact_evidence)
+                .query_map([], row_to_fact_evidence)
                 .map_err(|e| format!("查询失败: {e}"))?;
 
             let mut items = Vec::new();

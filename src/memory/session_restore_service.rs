@@ -1,9 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::memory::extraction::chat_summary::ChatSummaryService;
-use crate::memory::stores::conversation::{ConversationRecord, SqliteConversationStore};
+use crate::memory::stores::conversation::{SessionRecord, SqliteConversationStore};
 use crate::prelude::XueliResult;
 use crate::traits::ai_client::AIClient;
 
@@ -27,7 +26,6 @@ pub struct SessionRestoreMeta {
 /// 对应 Python 版 `src/memory/session_restore_service.py`
 pub struct SessionRestoreService<A: AIClient> {
     conversation_store: Arc<SqliteConversationStore>,
-    #[allow(dead_code)]
     summary_service: ChatSummaryService<A>,
     recent_session_limit: usize,
     restore_entry_limit: usize,
@@ -63,6 +61,9 @@ impl<A: AIClient> SessionRestoreService<A> {
     }
 
     /// 构建会话恢复条目列表
+    ///
+    /// 匹配 Python 版 build_restore_entries：从 conversation_sessions
+    /// 获取已关闭会话，按 dialogue_key 过滤，取最近的 N 条。
     pub async fn build_restore_entries(
         &self,
         user_id: &str,
@@ -70,162 +71,218 @@ impl<A: AIClient> SessionRestoreService<A> {
         scope_id: &str,
         platform: &str,
     ) -> XueliResult<Vec<SessionRestoreEntry>> {
-        let dialogue_key = Self::build_dialogue_key(user_id, scope_type, scope_id, platform);
+        let resolved_dialogue_key = self.conversation_store.build_dialogue_key(
+            user_id,
+            None,
+            scope_type,
+            if scope_id.is_empty() {
+                None
+            } else {
+                Some(scope_id)
+            },
+            platform,
+        );
 
         let is_group = scope_type == "group" && !scope_id.is_empty();
 
-        // 获取最近消息，按会话分组
-        let recent_messages = if is_group {
+        let sessions = if is_group {
             self.conversation_store
-                .get_recent_by_scope("group", scope_id, self.recent_session_limit * 20)
-                .await
+                .get_conversations_by_group_id(scope_id, self.recent_session_limit.max(1))
+                .await?
         } else {
             self.conversation_store
-                .get_recent_by_user(user_id, self.recent_session_limit * 20)
-                .await
-        }
-        .map_err(|e| format!("获取最近消息失败: {}", e))?;
+                .get_conversations(user_id, self.recent_session_limit.max(1))
+                .await?
+        };
 
-        // 按 session_id 分组聚合
-        let sessions = self.group_by_session(&recent_messages, &dialogue_key, user_id);
+        let matched: Vec<SessionRecord> = sessions
+            .into_iter()
+            .filter(|s| {
+                s.dialogue_key == resolved_dialogue_key
+                    && !s.closed_at.trim().is_empty()
+                    && s.turn_count() > 0
+            })
+            .collect();
 
         let mut entries: Vec<SessionRestoreEntry> = Vec::new();
-        let mut count = 0;
+        for (index, record) in matched
+            .iter()
+            .take(self.restore_entry_limit.max(1))
+            .enumerate()
+        {
+            let messages = self
+                .conversation_store
+                .load_session(&record.session_id)
+                .await?;
+            let text_msgs: Vec<String> = messages.iter().map(|m| m.message_text.clone()).collect();
 
-        for (session_id, messages) in &sessions {
-            if count >= self.restore_entry_limit {
-                break;
-            }
-            if messages.is_empty() {
+            let summary = self.summary_service.summarize(&text_msgs).await?;
+
+            if summary.is_empty() {
                 continue;
             }
 
-            let turn_count = messages.len() as i64;
-            let text_msgs: Vec<String> = messages.iter().map(|m| m.text.clone()).collect();
-            let summary =
-                ChatSummaryService::<crate::services::ai_client::DefaultAIClient>::summarize_simple(
-                    &text_msgs,
-                );
-
-            let last_msg = messages.last().unwrap();
-            // 使用最后一条消息时间作为 closed_at
-            let closed_at = format!("{:.0}", last_msg.event_time);
-
             entries.push(SessionRestoreEntry {
-                content: self.format_restore_entry(
-                    count + 1,
-                    session_id,
-                    &closed_at,
-                    turn_count,
-                    &summary,
-                ),
+                content: self.format_restore_entry(index + 1, record, &summary),
                 metadata: SessionRestoreMeta {
-                    session_id: session_id.clone(),
-                    dialogue_key: dialogue_key.clone(),
-                    closed_at,
-                    turn_count,
+                    session_id: record.session_id.clone(),
+                    dialogue_key: record.dialogue_key.clone(),
+                    closed_at: record.closed_at.clone(),
+                    turn_count: record.turn_count(),
                 },
             });
-
-            count += 1;
         }
 
         Ok(entries)
     }
 
-    /// 按 session_id 分组消息，过滤出与目标对话键匹配的会话
-    fn group_by_session(
-        &self,
-        messages: &[ConversationRecord],
-        dialogue_key: &str,
-        _user_id: &str,
-    ) -> HashMap<String, Vec<ConversationRecord>> {
-        let mut sessions: HashMap<String, Vec<ConversationRecord>> = HashMap::new();
-        for msg in messages {
-            let sid = if msg.session_id.is_empty() {
-                dialogue_key.to_string()
-            } else {
-                msg.session_id.clone()
-            };
-            sessions.entry(sid).or_default().push(msg.clone());
-        }
-        // 按时间排序每组内的消息
-        for msgs in sessions.values_mut() {
-            msgs.sort_by(|a, b| {
-                a.event_time
-                    .partial_cmp(&b.event_time)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
-        sessions
-    }
-
-    /// 格式化恢复条目文本
-    fn format_restore_entry(
-        &self,
-        index: usize,
-        _session_id: &str,
-        closed_at: &str,
-        turn_count: i64,
-        summary: &str,
-    ) -> String {
+    /// 格式化恢复条目文本（匹配 Python _format_restore_entry）
+    fn format_restore_entry(&self, index: usize, record: &SessionRecord, summary: &str) -> String {
         let label = if index == 1 {
-            "上一轮会话"
+            "上一轮会话".to_string()
         } else {
-            "更早一轮会话"
+            format!("更早一轮会话{}", index - 1)
         };
-        let t = if !closed_at.is_empty() {
-            format!("（{}，{}轮）", closed_at, turn_count)
+        let closed_at = if record.closed_at.is_empty() {
+            record.updated_at.replace('T', " ")
         } else {
-            format!("（{}轮）", turn_count)
+            record.closed_at.replace('T', " ")
         };
-        format!("{}{}：{}", label, t, summary)
+        let closed_at: String = closed_at.chars().take(16).collect();
+        let suffix = if closed_at.is_empty() {
+            format!("（{}轮）", record.turn_count())
+        } else {
+            format!("（{}，{}轮）", closed_at, record.turn_count())
+        };
+        format!("{}{}：{}", label, suffix, summary)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::stores::conversation::SqliteConversationStore;
+    use crate::memory::stores::conversation::{ConversationTurnData, SqliteConversationStore};
+    use crate::traits::ai_client::{AIClient, ChatCompletionRequest, ChatCompletionResponse};
+    use async_trait::async_trait;
+    use std::collections::HashMap;
     use std::sync::Arc;
+
+    struct StubAIClient;
+
+    #[async_trait]
+    impl AIClient for StubAIClient {
+        async fn chat_completion(
+            &self,
+            _request: &ChatCompletionRequest,
+        ) -> XueliResult<ChatCompletionResponse> {
+            Ok(ChatCompletionResponse {
+                content: "测试摘要内容".to_string(),
+                segments: None,
+                reasoning_content: String::new(),
+                finish_reason: "stop".to_string(),
+                usage: None,
+                model: "test".to_string(),
+                tool_calls: None,
+                raw_content: String::new(),
+                raw_response: None,
+            })
+        }
+    }
 
     fn setup() -> (
         Arc<SqliteConversationStore>,
         tempfile::TempDir,
-        SessionRestoreService<crate::services::ai_client::DefaultAIClient>,
+        SessionRestoreService<StubAIClient>,
     ) {
         let dir = tempfile::TempDir::new().expect("临时目录");
         let store = Arc::new(SqliteConversationStore::open(dir.path()).expect("打开数据库"));
-        let client = crate::services::ai_client::DefaultAIClient::new(Arc::new(
-            crate::core::config::ModelConfig {
-                primary_model: "test-model".to_string(),
-                light_model: "test-model".to_string(),
-                ..Default::default()
-            },
-        ))
-        .expect("创建 AI 客户端");
+        let client = StubAIClient;
         let summary = ChatSummaryService::new(Arc::new(client), "test-model");
         let svc = SessionRestoreService::new(store.clone(), summary, 6, 2);
         (store, dir, svc)
     }
 
-    async fn insert_msgs(store: &SqliteConversationStore, sid: &str, user_id: &str, count: usize) {
-        for i in 0..count {
-            let rec = ConversationRecord {
-                id: 0,
-                session_id: sid.to_string(),
-                user_id: user_id.to_string(),
-                sender_name: format!("User{}", user_id),
-                text: format!("消息{}", i),
-                is_bot: false,
-                scope_type: "private".to_string(),
-                scope_id: String::new(),
-                event_time: 100.0 + i as f64,
-                message_id: format!("m{}", i),
-                platform: "qq".to_string(),
-            };
-            store.insert_message(&rec).await.unwrap();
+    fn make_session_record(
+        sid: &str,
+        dk: &str,
+        user: &str,
+        closed: &str,
+        turns: i64,
+    ) -> SessionRecord {
+        let now = chrono::Utc::now().to_rfc3339();
+        let turn_data: Vec<ConversationTurnData> = (0..turns)
+            .map(|i| ConversationTurnData {
+                turn_id: i + 1,
+                user_message: format!("用户消息{}", i),
+                assistant_message: format!("回复{}", i),
+                timestamp: now.clone(),
+                source_message_id: String::new(),
+                source_group_id: String::new(),
+                source_platform: "qq".to_string(),
+                owner_user_id: user.to_string(),
+                source_message_type: "private".to_string(),
+                dialogue_key: dk.to_string(),
+                image_description: String::new(),
+            })
+            .collect();
+        SessionRecord {
+            session_id: sid.to_string(),
+            dialogue_key: dk.to_string(),
+            user_id: user.to_string(),
+            message_type: "private".to_string(),
+            group_id: String::new(),
+            started_at: now.clone(),
+            updated_at: now,
+            closed_at: closed.to_string(),
+            turns: turn_data,
+            metadata: HashMap::new(),
+            dirty_turns: 0,
+            turn_count: 0,
         }
+    }
+
+    fn make_sid(user: &str, dk: &str, stamp: &str) -> String {
+        format!(
+            "session_{}_{}_{}_0000000a",
+            user,
+            dk.replace(':', "_"),
+            stamp
+        )
+    }
+
+    async fn insert_session(
+        store: &SqliteConversationStore,
+        sid: &str,
+        dk: &str,
+        user: &str,
+        _closed: &str,
+        turn_count: i64,
+    ) {
+        let stamp = if sid == "sid1" {
+            "20240101000000"
+        } else {
+            "20240102000000"
+        };
+        let full_sid = make_sid(user, dk, stamp);
+        let session = make_session_record(&full_sid, dk, user, "", turn_count);
+        for turn in &session.turns {
+            let user_msg = crate::memory::stores::conversation::MessageRecord::user(
+                &turn.owner_user_id,
+                &turn.owner_user_id,
+                &turn.user_message,
+                1000,
+                &turn.source_message_id,
+            );
+            let assistant_msg = crate::memory::stores::conversation::MessageRecord::assistant(
+                &turn.assistant_message,
+                1001,
+            );
+            store
+                .add_turn(&full_sid, &user_msg, &assistant_msg)
+                .await
+                .unwrap();
+        }
+        store.close_session(user, dk).await.unwrap();
     }
 
     #[test]
@@ -247,7 +304,8 @@ mod tests {
     #[test]
     fn test_format_restore_entry() {
         let svc = setup().2;
-        let entry = svc.format_restore_entry(1, "sid1", "100", 3, "摘要内容");
+        let session = make_session_record("sid1", "qq:private:u1", "u1", "2024-01-01T00:00:00", 3);
+        let entry = svc.format_restore_entry(1, &session, "摘要内容");
         assert!(entry.contains("上一轮会话"));
         assert!(entry.contains("摘要内容"));
         assert!(entry.contains("3轮"));
@@ -256,8 +314,9 @@ mod tests {
     #[tokio::test]
     async fn test_build_restore_entries() {
         let (store, _dir, svc) = setup();
-        insert_msgs(&store, "sid1", "user1", 3).await;
-        insert_msgs(&store, "sid2", "user1", 2).await;
+        let dk = "qq:private:user1";
+        insert_session(&store, "sid1", dk, "user1", "2024-01-01T00:00:00", 3).await;
+        insert_session(&store, "sid2", dk, "user1", "2024-01-02T00:00:00", 2).await;
 
         let entries = svc
             .build_restore_entries("user1", "private", "", "qq")
@@ -281,32 +340,43 @@ mod tests {
     async fn test_build_restore_entries_group() {
         let dir = tempfile::TempDir::new().expect("临时目录");
         let store = Arc::new(SqliteConversationStore::open(dir.path()).expect("打开数据库"));
-        let client = crate::services::ai_client::DefaultAIClient::new(Arc::new(
-            crate::core::config::ModelConfig {
-                primary_model: "test-model".to_string(),
-                light_model: "test-model".to_string(),
-                ..Default::default()
-            },
-        ))
-        .expect("创建 AI 客户端");
+        let client = StubAIClient;
         let summary = ChatSummaryService::new(Arc::new(client), "test-model");
         let svc = SessionRestoreService::new(store.clone(), summary, 6, 2);
 
+        let group_sid = "session_u1_qq_group_g123_20240101000000_abcdefgh";
         for i in 0..5 {
-            let rec = ConversationRecord {
-                id: 0,
-                session_id: "g123_session".to_string(),
-                user_id: format!("u{}", i),
-                sender_name: format!("User{}", i),
-                text: format!("群消息{}", i),
-                is_bot: false,
-                scope_type: "group".to_string(),
-                scope_id: "g123".to_string(),
-                event_time: 100.0 + i as f64,
-                message_id: format!("gm{}", i),
-                platform: "qq".to_string(),
-            };
-            store.insert_message(&rec).await.unwrap();
+            let user_msg = crate::memory::stores::conversation::MessageRecord::user(
+                &format!("u{}", i),
+                &format!("User{}", i),
+                &format!("群消息{}", i),
+                1000 + i as i64,
+                &format!("gm{}", i),
+            );
+            let assistant_msg = crate::memory::stores::conversation::MessageRecord::assistant(
+                &format!("回复{}", i),
+                1001,
+            );
+            store
+                .add_turn(group_sid, &user_msg, &assistant_msg)
+                .await
+                .unwrap();
+        }
+        // Patch group_id, closed_at and message_type in DB since add_turn always creates private sessions
+        let db_path = dir.path().join("conversations.db");
+        let closed_at_str = chrono::Utc::now().to_rfc3339();
+        {
+            let db_path_clone = db_path.clone();
+            let gid = "g123".to_string();
+            let sid = group_sid.to_string();
+            let closed = closed_at_str.clone();
+            tokio::task::spawn_blocking(move || {
+                let conn = rusqlite::Connection::open(&db_path_clone).unwrap();
+                conn.execute(
+                    "UPDATE conversation_sessions SET group_id = ?1, message_type = 'group', closed_at = ?2 WHERE session_id = ?3",
+                    rusqlite::params![gid, closed, sid],
+                ).unwrap();
+            }).await.unwrap();
         }
 
         let entries = svc

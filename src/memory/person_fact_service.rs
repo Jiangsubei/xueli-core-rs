@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::core::types::{MemoryItem, MemoryType};
+use crate::core::types::MemoryItem;
 use crate::memory::stores::important::{ImportantMemory, ImportantMemoryStore};
 use crate::memory::stores::memory_item::SqliteMemoryItemStore;
 use crate::memory::stores::person_fact::{PersonFact, SqlitePersonFactStore};
@@ -38,39 +38,20 @@ impl PersonFactService {
 
     /// 同步用户的重要记忆到人物事实
     pub async fn sync_user_facts(&self, user_id: &str) -> XueliResult<Vec<PersonFact>> {
-        // 获取用户的重要记忆标记
-        let important_entries = self.important_store.get_important(user_id, 100).await?;
+        let important_memories = self.important_store.get_memories(user_id, 1).await?;
 
-        let mut memories = Vec::new();
-        for entry in &important_entries {
-            let memory = MemoryItem {
-                id: entry.id.clone(),
-                user_id: entry.user_id.clone(),
-                content: entry.content.clone(),
-                memory_type: MemoryType::Fact,
-                importance: entry.score,
-                created_at: entry.created_at,
-                last_accessed_at: entry.updated_at,
-                access_count: entry.recall_count as u64,
-            };
-            memories.push((entry.clone(), memory));
-        }
-
-        let generated = self.build_facts_from_memories(user_id, &memories);
+        let generated = self.build_facts_from_important_memories(user_id, &important_memories);
 
         let existing = self.fact_store.get_by_user(user_id).await?;
 
-        // 如果内容相同则跳过更新
         if facts_equal(&existing, &generated) {
             return Ok(existing);
         }
 
-        // 替换该用户的全部事实
         for fact in &generated {
             self.fact_store.store(fact.clone()).await?;
         }
 
-        // 清理已不存在的事实
         let generated_ids: HashSet<String> = generated.iter().map(|f| f.id.clone()).collect();
         for old in &existing {
             if !generated_ids.contains(&old.id) {
@@ -165,13 +146,12 @@ impl PersonFactService {
             });
         }
 
-        // 按更新时间和置信度排序
+        // 按更新时间降序、创建时间降序、事实文本降序（匹配 Python 语义）
         facts.sort_by(|a, b| {
-            b.updated_at.cmp(&a.updated_at).then_with(|| {
-                b.confidence
-                    .partial_cmp(&a.confidence)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.fact_text.cmp(&a.fact_text))
         });
 
         facts
@@ -247,13 +227,12 @@ impl PersonFactService {
             });
         }
 
-        // 按更新时间和置信度排序
+        // 按更新时间降序、创建时间降序、事实文本降序（匹配 Python 语义）
         facts.sort_by(|a, b| {
-            b.updated_at.cmp(&a.updated_at).then_with(|| {
-                b.confidence
-                    .partial_cmp(&a.confidence)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.fact_text.cmp(&a.fact_text))
         });
 
         facts
@@ -299,13 +278,20 @@ pub struct PersonFactEntry {
     pub source: String,
 }
 
-/// 比较两组事实是否相等
+/// 比较两组事实是否相等（匹配 Python to_dict() 的全字段比较语义）
 fn facts_equal(left: &[PersonFact], right: &[PersonFact]) -> bool {
     if left.len() != right.len() {
         return false;
     }
     left.iter().zip(right.iter()).all(|(a, b)| {
-        a.fact_text == b.fact_text && a.category == b.category && a.confidence == b.confidence
+        a.id == b.id
+            && a.user_id == b.user_id
+            && a.fact_text == b.fact_text
+            && a.category == b.category
+            && (a.confidence - b.confidence).abs() < f64::EPSILON
+            && a.source_conversation_id == b.source_conversation_id
+            && a.created_at == b.created_at
+            && a.updated_at == b.updated_at
     })
 }
 
